@@ -163,9 +163,9 @@ int command_init(void)
 
 		command_add("keyring", "Displays target's keyring items.", AccountStatus::EQSupport, command_keyring) ||
 		command_add("kick", "[charname] - Disconnect charname.", AccountStatus::EQSupport, command_kick) ||
-		command_add("kill", "Kill your target.", AccountStatus::GMLeadAdmin, command_kill) ||
+		command_add("kill", "[entityid] - Kills the specified entity ID or your current target", AccountStatus::GMLeadAdmin, command_kill) ||
 
-		command_add("list", "[npc] [name|all] - Search entities", AccountStatus::SeniorGuide, command_list) ||
+		command_add("list", "[corpses|doors|npcs|objects|players] [search] - Search entities", AccountStatus::SeniorGuide, command_list) ||
 		command_add("load_shared_memory", "[shared_memory_name] - Reloads shared memory and uses the input as output", AccountStatus::GMImpossible, command_load_shared_memory) ||
 		command_add("loc", "Print out your or your target's current location and heading.", AccountStatus::Player, command_loc) ||
 		command_add("logs", "Manage anything to do with logs.", AccountStatus::GMCoder, command_logs) ||
