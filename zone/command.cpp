@@ -165,7 +165,6 @@ int command_init(void)
 		command_add("kick", "[charname] - Disconnect charname.", AccountStatus::EQSupport, command_kick) ||
 		command_add("kill", "Kill your target.", AccountStatus::GMLeadAdmin, command_kill) ||
 
-		command_add("listnpcs", "[name/range] - Search NPCs.", AccountStatus::EQSupport, command_listnpcs) ||
 		command_add("list", "[npc] [name|all] - Search entities", AccountStatus::SeniorGuide, command_list) ||
 		command_add("load_shared_memory", "[shared_memory_name] - Reloads shared memory and uses the input as output", AccountStatus::GMImpossible, command_load_shared_memory) ||
 		command_add("loc", "Print out your or your target's current location and heading.", AccountStatus::Player, command_loc) ||
@@ -880,7 +879,6 @@ void command_clearsaylink(Client *c, const Seperator *sep) {
 #include "gm_commands/kick.cpp"
 #include "gm_commands/kill.cpp"
 #include "gm_commands/list.cpp"
-#include "gm_commands/listnpcs.cpp"
 #include "gm_commands/loc.cpp"
 #include "gm_commands/logs.cpp"
 #include "gm_commands/logtest.cpp"

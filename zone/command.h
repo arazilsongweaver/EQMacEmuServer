@@ -107,7 +107,6 @@ void command_keyring(Client *c, const Seperator *sep);
 void command_kick(Client *c, const Seperator *sep);
 void command_kill(Client *c, const Seperator *sep);
 void command_list(Client *c, const Seperator *sep);
-void command_listnpcs(Client *c, const Seperator *sep);
 void command_load_shared_memory(Client *c, const Seperator *sep);
 void command_loc(Client *c, const Seperator *sep);
 void command_logs(Client *c, const Seperator *sep);
