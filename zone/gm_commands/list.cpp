@@ -259,6 +259,6 @@ void command_list(Client *c, const Seperator *sep)
 	else {
 		c->Message(0, "Usage of #list");
 		c->Message(0, "- #list [npcs|players|corpses|doors|objects] [search]");
-		c->Message(0, "- Example: #list npc (Blank for all)");
+		c->Message(0, "- Example: #list npcs (Blank for all)");
 	}
 }
