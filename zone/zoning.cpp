@@ -504,8 +504,7 @@ void Client::ProcessMovePC(uint32 zoneID, float x, float y, float z, float headi
 			ZonePC(zoneID, x, y, z, heading, ignorerestrictions, zm);
 			break;
 		case GMSummon:
-			if (!GetGM())
-				Message(Chat::Yellow, "You have been summoned by a GM!");
+			Message_StringID(Chat::Yellow, StringID::BEEN_SUMMONED);
 			ZonePC(zoneID, x, y, z, heading, ignorerestrictions, zm);
 			break;
 		case ZoneToBindPoint:
@@ -515,8 +514,7 @@ void Client::ProcessMovePC(uint32 zoneID, float x, float y, float z, float headi
 			ZonePC(zoneID, x, y, z, heading, ignorerestrictions, zm);
 			break;
 		case SummonPC:
-			if(!GetGM())
-				Message_StringID(Chat::Yellow, StringID::BEEN_SUMMONED);
+			Message_StringID(Chat::Yellow, StringID::BEEN_SUMMONED);
 			ZonePC(zoneID, x, y, z, heading, ignorerestrictions, zm);
 			break;
 		case Rewind:

@@ -326,6 +326,8 @@ namespace StringID {
 	const uint16 DUEL_DECLINE                   = 1383; //%1 has declined your challenge to duel to the death.
 	const uint16 DUEL_ACCEPTED                  = 1384; //%1 has already accepted a duel with someone else.
 	const uint16 DUEL_CONSIDERING               = 1385; //%1 is considering a duel with someone else.
+	const uint16 BEEN_GMKILLED                  = 1391; //%1 HAS BEEN STRUCK DOWN BY THE GODS.
+	const uint16 BEEN_KICKED                    = 1392; //Thou hast been expelled by the gods!
 	const uint16 BEEN_SUMMONED                  = 1393; //You have been summoned!
 	const uint16 PLAYER_REGAIN                  = 1394; //You have control of yourself again.
 	const uint16 BIND_WOUND_COMPLETE            = 1398; //The bandaging is complete.

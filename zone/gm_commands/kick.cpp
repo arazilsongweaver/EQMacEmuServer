@@ -25,12 +25,7 @@ void command_kick(Client *c, const Seperator *sep){
 		}
 		if (client) {
 			if (client->Admin() <= c->Admin()) {
-				client->Message(Chat::White, 
-					fmt::format(
-						"You have been kicked by {} ", 
-						c->GetName()
-					).c_str()
-				);
+				client->Message_StringID(Chat::Red, StringID::BEEN_KICKED);
 				client->WorldKick();
 				c->Message(Chat::White, 
 					fmt::format(
