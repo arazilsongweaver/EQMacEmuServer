@@ -163,7 +163,7 @@ int command_init(void)
 
 		command_add("keyring", "Displays target's keyring items.", AccountStatus::EQSupport, command_keyring) ||
 		command_add("kick", "[name] - Forcibly disconnects the specified character.", AccountStatus::EQSupport, command_kick) ||
-		command_add("kill", "[name|entityid] - Kills your current target or name or entity ID if specified.", AccountStatus::GMLeadAdmin, command_kill) ||
+		command_add("kill", "[name|entityid] - Instantly kills the specified name, entity ID, or current target.", AccountStatus::GMLeadAdmin, command_kill) ||
 
 		command_add("list", "[corpses|doors|npcs|objects|players] [search] - Search entities", AccountStatus::SeniorGuide, command_list) ||
 		command_add("load_shared_memory", "[shared_memory_name] - Reloads shared memory and uses the input as output", AccountStatus::GMImpossible, command_load_shared_memory) ||

@@ -30,7 +30,7 @@ void command_kill(Client *c, const Seperator *sep)
 	}
         else
         {
-                c->Message(Chat::White, "Usage: #kill [name|entityid] - Kills your current target or name or entity ID if specified.");
+                c->Message(Chat::White, "Usage: #kill [name|entityid] - Instantly kills the specified name, entity ID, or current target.");
                 return;
         }
 

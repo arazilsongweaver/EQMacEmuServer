@@ -496,14 +496,14 @@ void Client::ProcessMovePC(uint32 zoneID, float x, float y, float z, float headi
 	}
 
 	switch(zm) {
+		case Rewind:
+			Message(Chat::Yellow, "Rewinding to previous location.");
 		case GateToBindPoint:
 		case EvacToSafeCoords:
 		case ZoneToSafeCoords:
 		case GMSummon:
 		case ZoneToBindPoint:
 		case ZoneSolicited:
-		case Rewind:
-			Message(Chat::Yellow, "Rewinding to previous location.");
 		case SummonPC:
 			ZonePC(zoneID, x, y, z, heading, ignorerestrictions, zm);
 			break;
