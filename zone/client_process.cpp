@@ -1884,7 +1884,7 @@ void Client::OPGMSummon(const EQApplicationPacket *app)
 
 			Message(Chat::White, "Local: Summoning %s to %f, %f, %f", gms->charname, (float)gms->x, (float)gms->y, (float)gms->z);
 			if (st->IsClient() && (st->CastToClient()->GetAnon() != 1 || this->Admin() >= st->CastToClient()->Admin()))
-				st->CastToClient()->MovePC(zone->GetZoneID(), (float)gms->x, (float)gms->y, (float)gms->z, this->GetHeading(), true);
+				st->CastToClient()->MovePC(zone->GetZoneID(), (float)gms->x, (float)gms->y, (float)gms->z, this->GetHeading(), 2, GMSummon);
 			else
 				st->GMMove(this->GetX(), this->GetY(), this->GetZ(),this->GetHeading());
 		}

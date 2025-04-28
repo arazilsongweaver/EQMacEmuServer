@@ -4199,7 +4199,7 @@ void Client::Handle_OP_GMKick(const EQApplicationPacket *app)
 	}
 	else {
 		entity_list.QueueClients(this, app);
-		//client->Kick();
+		client->Kick();
 	}
 	return;
 }

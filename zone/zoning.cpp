@@ -504,7 +504,7 @@ void Client::ProcessMovePC(uint32 zoneID, float x, float y, float z, float headi
 			ZonePC(zoneID, x, y, z, heading, ignorerestrictions, zm);
 			break;
 		case GMSummon:
-			Message_StringID(Chat::Yellow, StringID::BEEN_SUMMONED);
+			// Message_StringID(Chat::Yellow, StringID::BEEN_SUMMONED);
 			ZonePC(zoneID, x, y, z, heading, ignorerestrictions, zm);
 			break;
 		case ZoneToBindPoint:
@@ -514,7 +514,7 @@ void Client::ProcessMovePC(uint32 zoneID, float x, float y, float z, float headi
 			ZonePC(zoneID, x, y, z, heading, ignorerestrictions, zm);
 			break;
 		case SummonPC:
-			Message_StringID(Chat::Yellow, StringID::BEEN_SUMMONED);
+			// Message_StringID(Chat::Yellow, StringID::BEEN_SUMMONED);
 			ZonePC(zoneID, x, y, z, heading, ignorerestrictions, zm);
 			break;
 		case Rewind:
@@ -706,6 +706,23 @@ void Client::ZonePC(uint32 zoneID, float x, float y, float z, float heading, uin
 
 			// we hide the real zoneid we want to evac/succor to here
 			zonesummon_id = zoneID;
+
+			outapp->priority = 6;
+			FastQueuePacket(&outapp);
+		}
+		else if(zm == GMSummon)
+		{
+			Log(Logs::Detail, Logs::EQMac, "Zoning packet about to be sent (GMSummon). We are headed to zone: %i, at %f, %f, %f", zoneID, x, y, z);
+			auto outapp = new EQApplicationPacket(OP_GMSummon, sizeof(GMSummon_Struct));
+			GMSummon_Struct* gmg = (GMSummon_Struct*) outapp->pBuffer;
+
+
+			strcpy(gmg->charname,this->name);
+			strcpy(gmg->gmname,this->name);
+			gmg->zoneID = zoneID;
+			gmg->x = x;
+			gmg->y = y;
+			gmg->z = z;
 
 			outapp->priority = 6;
 			FastQueuePacket(&outapp);

@@ -2,40 +2,48 @@
 
 void command_kill(Client *c, const Seperator *sep)
 {
-	if (!sep->IsNumber(1) && !c->GetTarget()) {
-		c->Message(Chat::White, "#kill - Kills your target");
-		c->Message(Chat::White, "#kill [entity_id] - Kills the entity ID you provided");
-		return;
-	}
 
 	Mob* t = nullptr;
 	uint16 entity_id = 0;
-
-	if (sep->IsNumber(1)) {
-		entity_id = static_cast<uint16>(Strings::ToUnsignedInt(sep->arg[1]));
-		t         = entity_list.GetMob(entity_id);
-	} else {
-		t = c->GetTarget();
+	const char* npc_name;
+        if (sep->arg[1][0] != 0)                // arg specified
+        {
+		// Number = Entity ID
+		if (sep->IsNumber(1)) {
+			entity_id = static_cast<uint16>(Strings::ToUnsignedInt(sep->arg[1]));
+			t = entity_list.GetMob(entity_id);
+			npc_name = t->GetName();
+		}
+		// String = NPC Name
+		else {
+			npc_name = sep->arg[1];
+			t = entity_list.GetMob(npc_name);
+			if(!t) {
+				c->Message(Chat::Red, fmt::format("ERROR: {} not found.", npc_name).c_str());
+				return;
+			}
+		}
+        }
+        else if (c->GetTarget()) {               // have target
+                t = c->GetTarget();
+		npc_name = t->GetName();
 	}
+        else
+        {
+                c->Message(Chat::White, "Usage: #kill [name or entity_id] - Target required if not specified in command.");
+                return;
+        }
 
-	if (!t) {
-		c->Message(Chat::White, "You must have a target or supply an entity ID to use this command.");
-		return;
-	}
+        if (!t || !npc_name)
+                return;
 
 	if (!t->IsClient() || t->CastToClient()->Admin() <= c->Admin()) {
-		if (c != t) {
-			c->Message(
-				Chat::White,
-				fmt::format(
-					"Killing {}{}.",
-					c->GetTargetDescription(t),
-					entity_id ? " by entity id" : ""
-				).c_str()
-			);
+		c->Message(Chat::Red, fmt::format("Killing {}.", npc_name).c_str());
+		if(t->IsClient()) {
+			t->CastToClient()->GMKill();
+		} else {
+			t->Kill();
 		}
-
-		t->Kill();
 	}
 }
 
