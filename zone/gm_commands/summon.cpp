@@ -44,7 +44,7 @@ void command_summon(Client *c, const Seperator *sep){
 		/*if(c->Admin() < 150)
 		c->Message(Chat::White, "You need a NPC/corpse target for this command");
 		else*/
-		c->Message(Chat::White, "Usage: #summon [charname] Either target or charname is required");
+		c->Message(Chat::White, "Usage: #summon [Character Name] - Target required if character name is not specified.");
 		return;
 	}
 

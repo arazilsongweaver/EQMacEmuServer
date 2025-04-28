@@ -162,8 +162,8 @@ int command_init(void)
 		command_add("iteminfo", "Get information about the item on your cursor.", AccountStatus::Guide, command_iteminfo) ||
 
 		command_add("keyring", "Displays target's keyring items.", AccountStatus::EQSupport, command_keyring) ||
-		command_add("kick", "[charname] - Disconnect charname.", AccountStatus::EQSupport, command_kick) ||
-		command_add("kill", "[entityid] - Kills the specified entity ID or your current target", AccountStatus::GMLeadAdmin, command_kill) ||
+		command_add("kick", "[name] - Forcibly disconnects the specified character.", AccountStatus::EQSupport, command_kick) ||
+		command_add("kill", "[name|entityid] - Kills your current target or name or entity ID if specified.", AccountStatus::GMLeadAdmin, command_kill) ||
 
 		command_add("list", "[corpses|doors|npcs|objects|players] [search] - Search entities", AccountStatus::SeniorGuide, command_list) ||
 		command_add("load_shared_memory", "[shared_memory_name] - Reloads shared memory and uses the input as output", AccountStatus::GMImpossible, command_load_shared_memory) ||
@@ -249,7 +249,7 @@ int command_init(void)
 		command_add("spellinfo", "[spellid] - Get detailed info about a spell.", AccountStatus::Guide, command_spellinfo) ||
 		command_add("starve", "Sets hunger and thirst to 0.", AccountStatus::GMCoder, command_starve) ||
 		command_add("stun", "[duration] - Stuns you or your target for duration.", AccountStatus::QuestMaster, command_stun) ||
-		command_add("summon", "[charname] - Summons your player/npc/corpse target, or charname if specified.", AccountStatus::EQSupport, command_summon) ||
+		command_add("summon", "[name] - Summons your player/npc/corpse target, or name if specified.", AccountStatus::EQSupport, command_summon) ||
 		command_add("summonitem", "[itemid] [charges] - Summon an item onto your cursor. Charges are optional.", AccountStatus::QuestMaster, command_summonitem) ||
 		command_add("suspend", "[name][days][reason] - Suspend by character name and for specificed number of days.", AccountStatus::EQSupport, command_suspend) ||
 		command_add("synctod", "Send a time of day update to every client in zone.", AccountStatus::GMAdmin, command_synctod) ||
