@@ -1314,55 +1314,63 @@ void Mob::SetSpawnUpdate(SpawnPositionUpdate_Struct* incoming, SpawnPositionUpda
 void Mob::ShowStats(Client* client)
 {
 	if (IsClient()) {
+		client->Message(Chat::White, "=== CLIENT - %s ===", GetName());
 		CastToClient()->SendStats(client);
 	}
 	else if (IsCorpse()) {
 		if (IsPlayerCorpse()) {
-			client->Message(Chat::White, "  CharID: %i  PlayerCorpse: %i Empty: %i Rezed: %i Exp: %i GMExp: %i KilledBy: %i Rez Time: %d Owner Online: %i", CastToCorpse()->GetCharID(), CastToCorpse()->GetCorpseDBID(), CastToCorpse()->IsEmpty(), CastToCorpse()->IsRezzed(), CastToCorpse()->GetRezExp(), CastToCorpse()->GetGMRezExp(), CastToCorpse()->GetKilledBy(), CastToCorpse()->GetRemainingRezTime(), CastToCorpse()->GetOwnerOnline());
-			client->Message(Chat::White, "  Race: %i Texture: %i Gender: %i Size: %0.2f Timestamp: %d", CastToCorpse()->GetRace(), CastToCorpse()->GetTexture(), CastToCorpse()->GetGender(), CastToCorpse()->GetSize(), CastToCorpse()->GetToD());
+			client->Message(Chat::White, "=== PC CORPSE - %s ===", GetName());
+			client->Message(Chat::White, "CharID: %i  PlayerCorpse: %i Empty: %i Rezed: %i Exp: %i GMExp: %i KilledBy: %i Rez Time: %d Owner Online: %i", CastToCorpse()->GetCharID(), CastToCorpse()->GetCorpseDBID(), CastToCorpse()->IsEmpty(), CastToCorpse()->IsRezzed(), CastToCorpse()->GetRezExp(), CastToCorpse()->GetGMRezExp(), CastToCorpse()->GetKilledBy(), CastToCorpse()->GetRemainingRezTime(), CastToCorpse()->GetOwnerOnline());
+			client->Message(Chat::White, "Race: %i Texture: %i Gender: %i Size: %0.2f Timestamp: %d", CastToCorpse()->GetRace(), CastToCorpse()->GetTexture(), CastToCorpse()->GetGender(), CastToCorpse()->GetSize(), CastToCorpse()->GetToD());
 		}
 		else {
-			client->Message(Chat::White, "  NPCCorpse %i X: %0.2f Y: %0.2f Z: %0.2f", GetID(), GetX(), GetY(), GetZ());
+			client->Message(Chat::White, "=== NPC CORPSE - %s ===", GetName());
+			client->Message(Chat::White, "NPCCorpse %i X: %0.2f Y: %0.2f Z: %0.2f", GetID(), GetX(), GetY(), GetZ());
 		}
 	}
 	else {
-		client->Message(Chat::White, "  Level: %i  AC: %i  Class: %i  Size: %1.1f  ModelSize: %1.1f  BaseSize: %1.1f Z-Offset %1.1f Haste: %i (cap %i)", GetLevel(), GetAC(), GetClass(), GetSize(), GetModelSize(), GetBaseSize(), GetZOffset(), GetHaste(), GetHasteCap());
-		client->Message(Chat::White, "  HP: %i  Max HP: %i Per: %0.2f",GetHP(), GetMaxHP(), GetHPRatio());
-		client->Message(Chat::White, "  Mana: %i  Max Mana: %i", GetMana(), GetMaxMana());
-		client->Message(Chat::White, "  X: %0.2f Y: %0.2f Z: %0.2f", GetX(), GetY(), GetZ());
-		client->Message(Chat::White, "  Offense: %i  To-Hit: %i  Mitigation: %i  Avoidance: %i", GetOffenseByHand(), GetToHitByHand(), GetMitigation(), GetAvoidance());
-		client->Message(Chat::White, "  Displayed ATK: %i  Worn +ATK: %i (Cap %i)  Spell +ATK: %i", GetATK(), GetATKBonusItem(), RuleI(Character, ItemATKCap), GetATKBonusSpell());
-		client->Message(Chat::White, "  STR: %i  STA: %i  DEX: %i  AGI: %i  INT: %i  WIS: %i  CHA: %i", GetSTR(), GetSTA(), GetDEX(), GetAGI(), GetINT(), GetWIS(), GetCHA());
-		client->Message(Chat::White, "  MR: %i  PR: %i  FR: %i  CR: %i  DR: %i", GetMR(), GetPR(), GetFR(), GetCR(), GetDR());
-		client->Message(Chat::White, "  Race: %i  BaseRace: %i Gender: %i  BaseGender: %i BodyType: %i", GetRace(), GetBaseRace(), GetGender(), GetBaseGender(), GetBodyType());
-		client->Message(Chat::White, "  Face: % i Beard: %i  BeardColor: %i  Hair: %i  HairColor: %i Light: %i ActiveLight: %i ", GetLuclinFace(), GetBeard(), GetBeardColor(), GetHairStyle(), GetHairColor(), GetInnateLightType(), GetActiveLightType());
-		client->Message(Chat::White, "  Texture: %i  HelmTexture: %i  Chest: %i Arms: %i Bracer: %i Hands: %i Legs: %i Feet: %i ", GetTexture(), GetHelmTexture(), GetChestTexture(), GetArmTexture(), GetBracerTexture(), GetHandTexture(), GetLegTexture(), GetFeetTexture());
-		client->Message(Chat::White, "  IsPet: %i PetID: %i  OwnerID: %i SummonerID: %i IsFamiliar: %i IsCharmed: %i IsDireCharm: %i IsZomm: %i TypeofPet: %d", IsPet(), GetPetID(), GetOwnerID(), GetSummonerID(), IsFamiliar(), IsCharmedPet(), IsDireCharmed(), iszomm, typeofpet);
+		client->Message(Chat::White, "=== BASE STATS -  %s ===", GetName());
+		client->Message(Chat::White, "[%i %s] %s (%s)", GetLevel(), GetClassIDName(GetClass()), GetName(), GetRaceIDName(GetRace()));
+		client->Message(Chat::White, "[Level: %i] [Race: %s (%i)] [Class: %s (%i)] [Gender: %s (%i)]", GetLevel(), GetRaceIDName(GetRace()), GetRace(), GetClassIDName(GetClass()), GetClass(), GetGenderName(GetGender()), GetGender());
+		client->Message(Chat::White, "[Current HP: %i]  [Max HP: %i] [HP Percentage: %0.2f]", GetHP(), GetMaxHP(), GetHPRatio());
+		client->Message(Chat::White, "[Current Mana: %i] [Max Mana: %i]", GetMana(), GetMaxMana());
+		client->Message(Chat::White, "[AC: %i] [Haste: %i (cap %i)]", GetAC(), GetHaste(), GetHasteCap());
+		client->Message(Chat::White, "[Coords (XYZ): %0.2f, %0.2f, %0.2f] [Size: %1.1f] [Model Size: %1.1f] [Base Size: %1.1f] [Z-Offset: %1.1f]", GetX(), GetY(), GetZ(), GetSize(), GetModelSize(), GetBaseSize(), GetZOffset());
+		client->Message(Chat::White, "[Base Race: %s (%i)] [Base Gender: %s (%i)] [Body Type: %i]", GetRaceIDName(GetBaseRace()), GetBaseRace(), GetGenderName(GetBaseGender()), GetBaseGender(), GetBodyType());
+		client->Message(Chat::White, "[Offense: %i] [To Hit: %i] [Mitigation: %i] [Avoidance: %i]", GetOffenseByHand(), GetToHitByHand(), GetMitigation(), GetAvoidance());
+		client->Message(Chat::White, "[Displayed ATK: %i] [Worn +ATK: %i (cap %i)] [Spell +ATK: %i]", GetATK(), GetATKBonusItem(), RuleI(Character, ItemATKCap), GetATKBonusSpell());
+		client->Message(Chat::White, "[STR: %i] [STA: %i] [DEX: %i] [AGI: %i] [INT: %i] [WIS: %i] [CHA: %i]", GetSTR(), GetSTA(), GetDEX(), GetAGI(), GetINT(), GetWIS(), GetCHA());
+		client->Message(Chat::White, "[MR: %i] [PR: %i] [FR: %i] [CR: %i] [DR: %i]", GetMR(), GetPR(), GetFR(), GetCR(), GetDR());
+		client->Message(Chat::White, "[Face: %i] [Beard: %i]  [Beard Color: %i]  [Hair: %i]  [Hair Color: %i] [Light: %i] [Active Light: %i] ", GetLuclinFace(), GetBeard(), GetBeardColor(), GetHairStyle(), GetHairColor(), GetInnateLightType(), GetActiveLightType());
+		client->Message(Chat::White, "[Texture: %i] [HelmTexture: %i] [Chest: %i] [Arms: %i] [Bracer: %i] [Hands: %i] [Legs: %i] [Feet: %i]", GetTexture(), GetHelmTexture(), GetChestTexture(), GetArmTexture(), GetBracerTexture(), GetHandTexture(), GetLegTexture(), GetFeetTexture());
+		client->Message(Chat::White, "[Is Pet: %i] [PetID: %i] [Owner ID: %i] [Summoner ID: %i] [Is Familiar: %i] [Is Charmed: %i] [Is Dire Charm: %i] [Is Zomm: %i] [Type Of Pet: %d]", IsPet(), GetPetID(), GetOwnerID(), GetSummonerID(), IsFamiliar(), IsCharmedPet(), IsDireCharmed(), iszomm, typeofpet);
 		if (client->Admin() >= AccountStatus::GMAdmin)
-			client->Message(Chat::White, "  EntityID: %i AIControlled: %i Targetted: %i", GetID(), IsAIControlled(), targeted);
+			client->Message(Chat::White, "[EntityID: %i] [AIControlled: %i] [Targetted: %i]", GetID(), IsAIControlled(), targeted);
 
 		if (IsNPC()) {
 			NPC *n = CastToNPC();
 			uint32 spawngroupid = 0;
 			if(n->respawn2 != 0)
 				spawngroupid = n->respawn2->SpawnGroupID();
-			client->Message(Chat::White, "  NPCID: %u  SpawnGroupID: %u Grid: %i FactionID: %i PreCharmFactionID: %i PrimaryFaction: %i", GetNPCTypeID(),spawngroupid, n->GetGrid(), n->GetNPCFactionID(), n->GetPreCharmNPCFactionID(), GetPrimaryFaction());
-			client->Message(Chat::White, "  HP Regen: %i Mana Regen: %i Magic Atk: %i Immune to Melee: %i", n->GetHPRegen(), n->GetManaRegen(), GetLevel() >= MAGIC_ATTACK_LEVEL ? 1 : GetSpecialAbility(SpecialAbility::MagicalAttack), GetSpecialAbility(SpecialAbility::MeleeImmunityExceptMagical));
-			client->Message(Chat::White, "  Accuracy: %i BonusAvoidance: %i LootTable: %u SpellsID: %u", n->GetAccuracyRating(), bonusAvoidance, n->GetLoottableID(), n->GetNPCSpellsID());
+			client->Message(Chat::White, "=== NPC SPECIFIC STATS - %s ===", GetName());
+			client->Message(Chat::White, "[NPC ID: %u] [Spawn Group ID: %u] [Grid: %i] [NPC Faction: %s (%i)] [Pre-Charm Faction: %s (%i)] [Primary Faction: %s (%i)]", GetNPCTypeID(),spawngroupid, n->GetGrid(), database.GetFactionName(n->GetNPCFactionID()).c_str(),n->GetNPCFactionID(), database.GetFactionName(n->GetPreCharmNPCFactionID()).c_str(), n->GetPreCharmNPCFactionID(), database.GetFactionName(GetPrimaryFaction()).c_str(), GetPrimaryFaction());
+			client->Message(Chat::White, "[HP Regen: %i] [Mana Regen: %i] [Magic Atk: %i] [Immune to Melee: %i]", n->GetHPRegen(), n->GetManaRegen(), GetLevel() >= MAGIC_ATTACK_LEVEL ? 1 : GetSpecialAbility(SpecialAbility::MagicalAttack), GetSpecialAbility(SpecialAbility::MeleeImmunityExceptMagical));
+			client->Message(Chat::White, "[Accuracy: %i] [Bonus Avoidance: %i] [Loot Table: %u] [Spells ID: %u]", n->GetAccuracyRating(), bonusAvoidance, n->GetLoottableID(), n->GetNPCSpellsID());
 			n->DisplayAttackTimer(client);
-			client->Message(Chat::White, "  EmoteID: %i SeeInvis/Hide: %i SeeInvUndead: %i SeeSneak: %i SeeImpHide: %i", n->GetEmoteID(), n->SeeInvisible(), n->SeeInvisibleUndead(), n->SeeSneak(), n->SeeImprovedHide());
-			client->Message(Chat::White, "  CanDualWield: %i  IsDualWielding: %i  HasShield: %i", n->CanDualWield(), n->IsDualWielding(), n->HasShieldEquiped());
-			client->Message(Chat::White, "  PriSkill: %i SecSkill: %i PriMelee: %i SecMelee: %i Double Attack: %i%% Dual Wield: %i%%", n->GetPrimSkill(), n->GetSecSkill(), n->GetPrimaryMeleeTexture(), n->GetSecondaryMeleeTexture(), n->GetDoubleAttackChance(), n->GetDualWieldChance());
-			client->Message(Chat::White, "  Runspeed: %f Walkspeed: %f RunSpeedAnim: %i CurrentSpeed: %f Rooted: %d PermaRooted: %d", GetRunspeed(), GetWalkspeed(), GetRunAnimSpeed(), GetCurrentSpeed(), rooted, permarooted);
-			client->Message(Chat::White, "  AssistAggroMode: %d  IgnoreDistance: %0.2f  IgnoreDespawn: %d",  n->IsAssisting(), n->GetIgnoreDistance(), n->IgnoreDespawn());
-			client->Message(Chat::White, "  Fleespeed: %f CurFP: %i IsFleeing: %i IsBlind: %i IsFeared: %i", n->GetFearSpeed(), curfp, IsFleeing(), IsBlind(), IsFearedNoFlee());
-			client->Message(Chat::White, "  MerchantID: %i Shop Count: %d Greed: %d%% ", n->MerchantType, n->shop_count, n->GetGreedPercent());
-			client->Message(Chat::White, "  Primary Weapon: %i Secondary Weapon: %d", n->GetEquipment(EQ::textures::weaponPrimary), n->GetEquipment(EQ::textures::weaponSecondary));
+			client->Message(Chat::White, "[EmoteID: %i] [See Invisible: %i] [See Invis V Undead: %i] [See Sneak: %i] [See Improved Hide: %i]", n->GetEmoteID(), n->SeeInvisible(), n->SeeInvisibleUndead(), n->SeeSneak(), n->SeeImprovedHide());
+			client->Message(Chat::White, "[Can Dual Wield: %i] [Is Dual Wielding: %i] [Has A Shield: %i]", n->CanDualWield(), n->IsDualWielding(), n->HasShieldEquiped());
+			client->Message(Chat::White, "[Primary Melee Skill: %i] [Secondary Melee Skill: %i] [Primary Melee Texture: %i] [Secondary Melee Texture: %i] [Double Attack: %i%%] [Dual Wield: %i%%]", n->GetPrimSkill(), n->GetSecSkill(), n->GetPrimaryMeleeTexture(), n->GetSecondaryMeleeTexture(), n->GetDoubleAttackChance(), n->GetDualWieldChance());
+			client->Message(Chat::White, "[Run Speed: %f] [Walk Speed: %f] [Run Animation Speed: %i] [Current Speed: %f] [Rooted: %d] [Perma-Rooted: %d]", GetRunspeed(), GetWalkspeed(), GetRunAnimSpeed(), GetCurrentSpeed(), rooted, permarooted);
+			client->Message(Chat::White, "[Assist Aggro Mode: %d] [Ignore Distance: %0.2f] [Ignore Despawn: %d]",  n->IsAssisting(), n->GetIgnoreDistance(), n->IgnoreDespawn());
+			client->Message(Chat::White, "[Flee Speed: %f] [CurFP: %i] [Is Fleeing: %i] [Is Blind: %i] [Is Feared: %i]", n->GetFearSpeed(), curfp, IsFleeing(), IsBlind(), IsFearedNoFlee());
+			client->Message(Chat::White, "[Merchant ID: %i] [Shop Count: %d] [Greed: %d]", n->MerchantType, n->shop_count, n->GetGreedPercent());
+			client->Message(Chat::White, "[Primary Weapon: %i] [Secondary Weapon: %i]", n->GetEquipment(EQ::textures::weaponPrimary), n->GetEquipment(EQ::textures::weaponSecondary));
 			n->QueryLoot(client);
 		}
 		if (IsAIControlled()) {
-			client->Message(Chat::White, "  AggroRange: %1.0f  AssistRange: %1.0f", GetAggroRange(), GetAssistRange());
+			client->Message(Chat::White, "[AI Aggro Range: %1.0f] [AI Assist Range: %1.0f]", GetAggroRange(), GetAssistRange());
 		}
+		client->Message(Chat::White, "=== [%i %s] %s (%s) ===", GetLevel(), GetClassIDName(GetClass()), GetName(), GetRaceIDName(GetRace()));
 	}
 }
 

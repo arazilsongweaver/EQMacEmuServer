@@ -4293,7 +4293,7 @@ void NPC::DisplayAttackTimer(Client* sender)
 		}
 	}
 
-	sender->Message(Chat::White, "Attack Delays: Main-hand: %d  Off-hand: %d  Ranged: %d", primary, dualwield, ranged);
+	sender->Message(Chat::White, "[Main Hand Delay: %d] [Off-Hand Delay: %d] [Ranged Delay: %d]", primary, dualwield, ranged);
 }
 
 // This will provide reasonable estimates for NPC offense.  based on many parsed logs.

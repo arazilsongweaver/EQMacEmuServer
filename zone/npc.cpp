@@ -2979,7 +2979,7 @@ bool NPC::IsBoat()
 void NPC::ShowQuickStats(Client* c)
 {
 	//This is just #npcstats, but accessible using #showstats 1
-	c->Message(Chat::White, "NPC Stats:");
+	c->Message(Chat::White, "=== STATS - [%i %s] %s (%s) ===", GetLevel(), GetClassIDName(GetClass()), GetName(), GetRaceIDName(GetRace()));
 	c->Message(
 		Chat::White, 
 		fmt::format(
@@ -3007,7 +3007,7 @@ void NPC::ShowQuickStats(Client* c)
 	c->Message(
 		Chat::White,
 		fmt::format(
-			"[Current HP: {}]  [Max HP: {}] [Per: {:.2f}]",
+			"[Current HP: {}]  [Max HP: {}] [HP Percentage: {:.2f}]",
 			GetHP(),
 			GetMaxHP(),
 			GetHPRatio()
@@ -3037,7 +3037,7 @@ void NPC::ShowQuickStats(Client* c)
 	c->Message(
 		Chat::White,
 		fmt::format(
-			"[Runspeed: {:.2f}] [Walkspeed: {:.2f}] [FlyMode: {}]", 
+			"[Run Speed: {:.2f}] [Walk Speed: {:.2f}] [Fly Mode: {}]", 
 			GetRunspeed(), 
 			GetWalkspeed(), 
 			static_cast<int>(GetFlyMode())
@@ -3113,6 +3113,7 @@ void NPC::ShowQuickStats(Client* c)
 			).c_str()
 		);
 	}
+	c->Message(Chat::White, "=== [%i %s] %s (%s) ===", GetLevel(), GetClassIDName(GetClass()), GetName(), GetRaceIDName(GetRace()));
 }
 
 void NPC::ClearPathing()
