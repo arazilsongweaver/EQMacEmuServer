@@ -1,10 +1,10 @@
-## EQ Mac - The Al'kabor Project
+## EverQuest Mac - ScruffyHammer Legends
 
-EQMacEmu is an EverQuest server emulating the original Macintosh version called Al`kabor.
+EQMacEmu is an EverQuest server emulating the original Macintosh version called Al`kabor. ScruffyHammer Legends extends the original The Al'Kabor Project experience with fixes and enhanced functionality.
 
-- [Project Website](https://www.takproject.net/)
-- [Project Wiki](https://wiki.takp.info/index.php/Main_Page)
-- [How to play](https://wiki.takp.info/index.php/Getting_Started)
+- [TAKP Project Website](https://www.takproject.net/)
+- [TAKP Project Wiki](https://wiki.takp.info/index.php/Main_Page)
+- [TAKP How to play](https://wiki.takp.info/index.php/Getting_Started)
 
 ---
 
