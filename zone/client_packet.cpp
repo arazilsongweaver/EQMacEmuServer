@@ -3425,31 +3425,9 @@ void Client::Handle_OP_Damage(const EQApplicationPacket *app)
 	}
 
 	if (damage < 0)
-		damage = 31337;
+		damage = 32767;
 
-	if ((GetGM() && admin >= minStatusToAvoidFalling) || GetGMInvul())
-	{
-				std::string damagetype = "Unknown";
-				switch (ed->type)
-				{
-				case 246:
-					damagetype = "Freezing";
-					break;
-				case 250:
-					damagetype = "Burning";
-					break;
-				case 251:
-					damagetype = "Drowning/Suffocating";
-					break;
-				case 252:
-					damagetype = "Falling";
-					break;
-				}
-				Message(Chat::Red, "Your GM status protects you from %i points of %i environmental damage.", ed->damage, ed->type);
-		SendHPUpdate();
-		return;
-	}
-	else if (GetInvul())
+	else if (GetGMInvul() || GetInvul())
 	{
 		// This client handles Divine Aura for us, but just in case send the HP packet.
 		SendHPUpdate();

@@ -1329,7 +1329,7 @@ void Mob::ShowStats(Client* client)
 		}
 	}
 	else {
-		client->Message(Chat::White, "=== BASE STATS -  %s ===", GetName());
+		client->Message(Chat::White, "=== BASE STATS - %s ===", GetName());
 		client->Message(Chat::White, "[%i %s] %s (%s)", GetLevel(), GetClassIDName(GetClass()), GetName(), GetRaceIDName(GetRace()));
 		client->Message(Chat::White, "[Level: %i] [Race: %s (%i)] [Class: %s (%i)] [Gender: %s (%i)]", GetLevel(), GetRaceIDName(GetRace()), GetRace(), GetClassIDName(GetClass()), GetClass(), GetGenderName(GetGender()), GetGender());
 		client->Message(Chat::White, "[Current HP: %i]  [Max HP: %i] [HP Percentage: %0.2f]", GetHP(), GetMaxHP(), GetHPRatio());
