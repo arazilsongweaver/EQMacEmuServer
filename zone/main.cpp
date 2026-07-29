@@ -100,7 +100,7 @@ char        errorname[32];
 extern Zone *zone;
 
 TimeoutManager        timeout_manager;
-EQStreamFactory       eqsf(ZoneStream);
+EQStreamFactory       eqsf;
 TitleManager          title_manager;
 QueryServ             *QServ = 0;
 QuestParserCollection *parse = 0;
@@ -392,7 +392,6 @@ int main(int argc, char** argv) {
 
 	Timer quest_timers(100);
 	UpdateWindowTitle(nullptr);
-	std::shared_ptr<EQStream> eqss;
 	std::shared_ptr<EQOldStream> eqoss;
 	EQStreamInterface *eqsi;
 	std::chrono::time_point<std::chrono::steady_clock> frame_prev = std::chrono::steady_clock::now();
@@ -428,17 +427,6 @@ int main(int argc, char** argv) {
 					ZoneConfig::SetZonePort(0);
 					worldwasconnected = false;
 				}
-			}
-
-			//check the factory for any new incoming streams.
-			while ((eqss = eqsf.Pop())) {
-				//pull the stream out of the factory and give it to the stream identifier
-				//which will figure out what patch they are running, and set up the dynamic
-				//structures and opcodes for that patch.
-				struct in_addr	in;
-				in.s_addr = eqss->GetRemoteIP();
-				LogInfo("New connection from [{0}]:[{1}]", inet_ntoa(in), ntohs(eqss->GetRemotePort()));
-				stream_identifier.AddStream(eqss);	//takes the stream
 			}
 
 			//check the factory for any new incoming streams.

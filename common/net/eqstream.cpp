@@ -46,6 +46,10 @@ void EQ::Net::EQStreamManager::ReliableStreamPacketRecv(std::shared_ptr<Reliable
 {
 	auto iter = m_streams.find(connection);
 	if (iter != m_streams.end()) {
+		if (m_options.opcode_size <= 0 || p.Length() < static_cast<size_t>(m_options.opcode_size)) {
+			return;
+		}
+
 		auto &stream = iter->second;
 		std::unique_ptr<EQ::Net::Packet> t(new EQ::Net::DynamicPacket());
 		t->PutPacket(0, p);

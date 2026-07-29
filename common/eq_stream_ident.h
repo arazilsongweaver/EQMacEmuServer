@@ -17,34 +17,13 @@ public:
 	~EQStreamIdentifier();
 
 	//registration interface.
-	void RegisterPatch(const EQStreamInterface::Signature &sig, const char *name, OpcodeManager ** opcodes, const StructStrategy *structs);
 	void RegisterOldPatch(const EQStreamInterface::Signature &sig, const char *name, OpcodeManager ** opcodes, const StructStrategy *structs);
 	//main processing interface
 	void Process();
-	void AddStream(std::shared_ptr<EQStream> eqs);
 	void AddOldStream(std::shared_ptr<EQOldStream>);
 	EQStreamInterface *PopIdentified();
 
 protected:
-
-	//registered patches..
-	class Patch {
-	public:
-		std::string				name;
-		EQStreamInterface::Signature		signature;
-		OpcodeManager **		opcodes;
-		const StructStrategy *structs;
-	};
-	std::vector<Patch *> m_patches;	//we own these objects.
-
-	//pending streams..
-	class Record {
-	public:
-		Record(std::shared_ptr<EQStream> s);
-		std::shared_ptr<EQStream> stream;		//we own this
-		Timer expire;
-	};
-	std::vector<Record *> m_streams;	//we own these objects, and the streams contained in them.
 	std::queue<EQStreamInterface *> m_identified;	//we own these objects
 
 	//oldstreams

@@ -5,15 +5,6 @@
 #include "struct_strategy.h"
 
 
-EQStreamProxy::EQStreamProxy(std::shared_ptr<EQStream> &stream, const StructStrategy *structs, OpcodeManager **opcodes)
-:	m_stream(stream),
-	m_structs(structs),
-	m_opcodes(opcodes)
-{
-	stream = nullptr;	//take the stream.
-	m_stream->SetOpcodeManager(m_opcodes);
-}
-
 EQStreamProxy::EQStreamProxy(std::shared_ptr<EQOldStream> &stream, const StructStrategy *structs, OpcodeManager **opcodes)
 :	m_stream(stream),
 	m_structs(structs),

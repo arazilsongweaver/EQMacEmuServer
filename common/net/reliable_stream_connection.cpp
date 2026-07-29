@@ -4,10 +4,85 @@
 #include "crc32.h"
 #include <zlib.h>
 #include <fmt/format.h>
+#include <algorithm>
+#include <cstring>
+#include <limits>
+#include <vector>
 
-// observed client receive window is 300 packets, 140KB
-constexpr size_t MAX_CLIENT_RECV_PACKETS_PER_WINDOW = 300;
-constexpr size_t MAX_CLIENT_RECV_BYTES_PER_WINDOW   = 140 * 1024;
+// Legacy per-pass resend throttle. Per-stream outstanding limits are enforced separately.
+constexpr size_t MAX_RESEND_PACKETS_PER_PASS = 300;
+constexpr size_t MAX_RESEND_BYTES_PER_PASS   = 140 * 1024;
+constexpr size_t MIN_RAW_PACKET_SIZE         = 64;
+constexpr int MAX_RELIABLE_SEQUENCE_DISTANCE = 30000; // UdpManager::cHardMaxOutstandingPackets in Sony's original UdpLibrary.
+
+namespace
+{
+	bool IsSupportedProtocolVersion(uint32_t protocol_version)
+	{
+		// The EQMac UdpLibrary uses version 2.
+		return protocol_version == 2 || protocol_version == 3;
+	}
+
+	bool IsValidEncodeType(EQ::Net::ReliableStreamEncodeType encode_type)
+	{
+		return encode_type == EQ::Net::EncodeNone || encode_type == EQ::Net::EncodeCompression || encode_type == EQ::Net::EncodeXOR;
+	}
+
+	bool IsValidCrcLength(size_t crc_length)
+	{
+		// Sony's UdpLibrary supports every truncated CRC length from zero through four bytes.
+		return crc_length <= 4;
+	}
+
+	size_t EncodeExpansionBytes(const EQ::Net::ReliableStreamEncodeType *encode_passes)
+	{
+		size_t expansion = 0;
+		for (int pass = 0; pass < 2; ++pass) {
+			if (encode_passes[pass] == EQ::Net::EncodeCompression) {
+				++expansion;
+			}
+		}
+
+		return expansion;
+	}
+
+	void NormalizeOptions(EQ::Net::ReliableStreamConnectionManagerOptions &options)
+	{
+		options.max_packet_size = EQ::Clamp(options.max_packet_size, MIN_RAW_PACKET_SIZE, UDP_BUFFER_SIZE);
+		options.hold_size = std::min(options.hold_size, options.max_packet_size);
+
+		if (options.tic_rate_hertz <= 0.0) {
+			options.tic_rate_hertz = 60.0;
+		}
+
+		if (!IsValidCrcLength(options.crc_length)) {
+			options.crc_length = 0;
+		}
+
+		if (!IsSupportedProtocolVersion(options.protocol_version)) {
+			options.protocol_version = 3;
+		}
+
+		for (auto &encode_pass : options.encode_passes) {
+			if (!IsValidEncodeType(encode_pass)) {
+				encode_pass = EQ::Net::EncodeNone;
+			}
+		}
+
+		if (options.resend_delay_factor < 0.0) {
+			options.resend_delay_factor = 0.0;
+		}
+
+		options.resend_delay_max = std::max<size_t>(1, options.resend_delay_max);
+		options.resend_delay_min = std::min(options.resend_delay_min, options.resend_delay_max);
+
+		for (int stream = 0; stream < 4; ++stream) {
+			options.max_instanding_packets[stream] = EQ::Clamp<size_t>(options.max_instanding_packets[stream], 1, MAX_RELIABLE_SEQUENCE_DISTANCE);
+			options.max_outstanding_packets[stream] = EQ::Clamp<size_t>(options.max_outstanding_packets[stream], 1, MAX_RELIABLE_SEQUENCE_DISTANCE);
+			options.max_outstanding_bytes[stream] = std::max<size_t>(1, options.max_outstanding_bytes[stream]);
+		}
+	}
+}
 
 // buffer pools
 SendBufferPool send_buffer_pool;
@@ -15,6 +90,7 @@ SendBufferPool send_buffer_pool;
 EQ::Net::ReliableStreamConnectionManager::ReliableStreamConnectionManager()
 {
 	m_attached = nullptr;
+	NormalizeOptions(m_options);
 	memset(&m_timer, 0, sizeof(uv_timer_t));
 	memset(&m_socket, 0, sizeof(uv_udp_t));
 
@@ -25,6 +101,7 @@ EQ::Net::ReliableStreamConnectionManager::ReliableStreamConnectionManager(const 
 {
 	m_attached = nullptr;
 	m_options = opts;
+	NormalizeOptions(m_options);
 	memset(&m_timer, 0, sizeof(uv_timer_t));
 	memset(&m_socket, 0, sizeof(uv_udp_t));
 
@@ -42,7 +119,7 @@ void EQ::Net::ReliableStreamConnectionManager::Attach(uv_loop_t *loop)
 		uv_timer_init(loop, &m_timer);
 		m_timer.data = this;
 
-		auto update_rate = (uint64_t)(1000.0 / m_options.tic_rate_hertz);
+		auto update_rate = std::max<uint64_t>(1, (uint64_t)(1000.0 / m_options.tic_rate_hertz));
 
 		uv_timer_start(&m_timer, [](uv_timer_t *handle) {
 			ReliableStreamConnectionManager *c = (ReliableStreamConnectionManager*)handle->data;
@@ -71,15 +148,13 @@ void EQ::Net::ReliableStreamConnectionManager::Attach(uv_loop_t *loop)
 				buf->len  = 65536;
 			},
 			[](uv_udp_t* handle, ssize_t nread, const uv_buf_t* buf, const struct sockaddr* addr, unsigned flags) {
-			ReliableStreamConnectionManager *c = (ReliableStreamConnectionManager*)handle->data;
-			if (nread < 0 || addr == nullptr) {
-				return;
+			if (nread >= 0 && addr != nullptr) {
+				ReliableStreamConnectionManager *c = (ReliableStreamConnectionManager*)handle->data;
+				char endpoint[16];
+				uv_ip4_name((const sockaddr_in*)addr, endpoint, 16);
+				auto port = ntohs(((const sockaddr_in*)addr)->sin_port);
+				c->ProcessPacket(endpoint, port, buf->base, nread);
 			}
-
-			char endpoint[16];
-			uv_ip4_name((const sockaddr_in*)addr, endpoint, 16);
-			auto port = ntohs(((const sockaddr_in*)addr)->sin_port);
-			c->ProcessPacket(endpoint, port, buf->base, nread);
 
 			if (buf->len > 65536) {
 				delete[] buf->base;
@@ -124,8 +199,6 @@ void EQ::Net::ReliableStreamConnectionManager::Process()
 		if (status == StatusDisconnecting) {
 			auto time_since_close = std::chrono::duration_cast<std::chrono::milliseconds>(now - connection->m_close_time);
 			if (time_since_close.count() > m_options.connection_close_time) {
-				connection->FlushBuffer();
-				connection->SendDisconnect();
 				connection->ChangeStatus(StatusDisconnected);
 				iter = m_connections.erase(iter);
 				continue;
@@ -135,16 +208,16 @@ void EQ::Net::ReliableStreamConnectionManager::Process()
 		if (status == StatusConnecting) {
 			auto time_since_last_recv = std::chrono::duration_cast<std::chrono::milliseconds>(now - connection->m_last_recv);
 			if ((size_t)time_since_last_recv.count() > m_options.connect_stale_ms) {
-				iter = m_connections.erase(iter);
-				connection->ChangeStatus(StatusDisconnecting);
+				connection->Close();
+				iter++;
 				continue;
 			}
 		}
 		else if (status == StatusConnected) {
 			auto time_since_last_recv = std::chrono::duration_cast<std::chrono::milliseconds>(now - connection->m_last_recv);
 			if ((size_t)time_since_last_recv.count() > m_options.stale_connection_ms) {
-				iter = m_connections.erase(iter);
-				connection->ChangeStatus(StatusDisconnecting);
+				connection->Close();
+				iter++;
 				continue;
 			}
 		}
@@ -165,10 +238,12 @@ void EQ::Net::ReliableStreamConnectionManager::Process()
 						connection->SendKeepAlive();
 					}
 				}
-			}
-			case StatusDisconnecting:
 				connection->Process();
 				break;
+			}
+			case StatusDisconnecting: {
+				break;
+			}
 			default:
 				break;
 		}
@@ -184,7 +259,7 @@ void EQ::Net::ReliableStreamConnectionManager::UpdateDataBudget()
 		return;
 	}
 
-	auto update_rate = (uint64_t)(1000.0 / m_options.tic_rate_hertz);
+	auto update_rate = std::max<uint64_t>(1, (uint64_t)(1000.0 / m_options.tic_rate_hertz));
 	auto budget_add = update_rate * outgoing_data_rate / 1000.0;
 
 	auto iter = m_connections.begin();
@@ -206,7 +281,6 @@ void EQ::Net::ReliableStreamConnectionManager::ProcessResend()
 		switch (status)
 		{
 			case StatusConnected:
-			case StatusDisconnecting:
 				connection->ProcessResend();
 				break;
 			default:
@@ -238,8 +312,21 @@ void EQ::Net::ReliableStreamConnectionManager::ProcessPacket(const std::string &
 		}
 		else {
 			if (data[0] == 0 && data[1] == OP_SessionRequest) {
+				if (size < ReliableStreamConnect::size() || size > m_options.max_packet_size || m_options.max_packet_size < MIN_RAW_PACKET_SIZE) {
+					return;
+				}
+
 				StaticPacket p((void*)data, size);
 				auto request = p.GetSerialize<ReliableStreamConnect>(0);
+				auto protocol_version = NetworkToHost(request.protocol_version);
+				auto requested_max_packet_size = NetworkToHost(request.max_packet_size);
+				if (!IsSupportedProtocolVersion(protocol_version) || requested_max_packet_size < MIN_RAW_PACKET_SIZE || size > requested_max_packet_size) {
+					return;
+				}
+
+				if (m_options.max_connection_count != 0 && m_connections.size() >= m_options.max_connection_count) {
+					return;
+				}
 
 				connection = std::shared_ptr<ReliableStreamConnection>(new ReliableStreamConnection(this, request, endpoint, port));
 				connection->m_self = connection;
@@ -250,8 +337,8 @@ void EQ::Net::ReliableStreamConnectionManager::ProcessPacket(const std::string &
 				m_connections.emplace(std::make_pair(std::make_pair(endpoint, port), connection));
 				connection->ProcessPacket(p);
 			}
-			else if (data[1] != OP_OutOfSession) {
-				SendDisconnect(endpoint, port);
+			else if (data[1] != OP_UnreachableConnection && data[1] != OP_SessionDisconnect) {
+				SendUnreachableConnection(endpoint, port);
 			}
 		}
 	}
@@ -273,12 +360,13 @@ std::shared_ptr<EQ::Net::ReliableStreamConnection> EQ::Net::ReliableStreamConnec
 	return nullptr;
 }
 
-void EQ::Net::ReliableStreamConnectionManager::SendDisconnect(const std::string &addr, int port)
+void EQ::Net::ReliableStreamConnectionManager::SendUnreachableConnection(const std::string &addr, int port)
 {
-	ReliableStreamDisconnect header;
+	// UdpLibrary calls this an UnreachableConnection packet. It has no
+	// connection state, so it is deliberately only the unencoded header.
+	ReliableStreamHeader header;
 	header.zero = 0;
-	header.opcode = OP_OutOfSession;
-	header.connect_code = 0;
+	header.opcode = OP_UnreachableConnection;
 
 	DynamicPacket out;
 	out.PutSerialize(0, header);
@@ -297,6 +385,10 @@ void EQ::Net::ReliableStreamConnectionManager::SendDisconnect(const std::string 
 		delete[](char*)req->data;
 		delete req;
 	});
+	if (ret < 0) {
+		delete[] data;
+		delete send_req;
+	}
 }
 
 //new connection made as server
@@ -316,12 +408,14 @@ EQ::Net::ReliableStreamConnection::ReliableStreamConnection(ReliableStreamConnec
 	m_encode_passes[1] = owner->m_options.encode_passes[1];
 	m_hold_time = Clock::now();
 	m_buffered_packets_length = 0;
-	m_rolling_ping = 500;
-	m_combined.reset(new char[512]);
+	m_rolling_ping = 800; // UdpReliableChannel starts conservatively until it has measured RTT samples.
+	m_combined.reset(new char[m_max_packet_size]);
 	m_combined[0] = 0;
 	m_combined[1] = OP_Combined;
 	m_last_session_stats = Clock::now();
 	m_outgoing_budget = owner->m_options.outgoing_data_rate;
+	m_silent_disconnect = false;
+	InitializeReliableStreams();
 
 	LogNetClient("New session [{}] with encode key [{}]", m_connect_code, HostToNetwork(m_encode_key));
 }
@@ -339,32 +433,102 @@ EQ::Net::ReliableStreamConnection::ReliableStreamConnection(ReliableStreamConnec
 	m_encode_key = 0;
 	m_max_packet_size = (uint32_t)owner->m_options.max_packet_size;
 	m_crc_bytes = 0;
+	m_encode_passes[0] = EncodeNone;
+	m_encode_passes[1] = EncodeNone;
 	m_hold_time = Clock::now();
 	m_buffered_packets_length = 0;
-	m_rolling_ping = 500;
-	m_combined.reset(new char[512]);
+	m_rolling_ping = 800;
+	m_combined.reset(new char[m_max_packet_size]);
 	m_combined[0] = 0;
 	m_combined[1] = OP_Combined;
 	m_last_session_stats = Clock::now();
 	m_outgoing_budget = owner->m_options.outgoing_data_rate;
+	m_silent_disconnect = false;
+	InitializeReliableStreams();
 }
 
 EQ::Net::ReliableStreamConnection::~ReliableStreamConnection()
 {
 }
 
-void EQ::Net::ReliableStreamConnection::Close()
+void EQ::Net::ReliableStreamConnection::InitializeReliableStreams()
 {
-	if (m_status != StatusDisconnected && m_status != StatusDisconnecting) {
-		FlushBuffer();
-		SendDisconnect();
+	size_t encode_expansion = EncodeExpansionBytes(m_encode_passes);
+	size_t max_reliable_data_size = m_max_packet_size - m_crc_bytes - ReliableStreamReliableHeader::size() - encode_expansion;
+
+	for (int stream_id = 0; stream_id < 4; ++stream_id) {
+		auto stream = &m_streams[stream_id];
+		stream->max_reliable_data_size = max_reliable_data_size;
+		stream->congestion_window_minimum = std::max(max_reliable_data_size, m_owner->m_options.congestion_window_minimum[stream_id]);
+		stream->congestion_window_start = std::min(4 * max_reliable_data_size, std::max(2 * max_reliable_data_size, static_cast<size_t>(4380)));
+		stream->congestion_window_start = std::max(stream->congestion_window_start, stream->congestion_window_minimum);
+		stream->congestion_slow_start_threshold = std::min(
+			m_owner->m_options.max_outstanding_packets[stream_id] * max_reliable_data_size,
+			m_owner->m_options.max_outstanding_bytes[stream_id]);
+		stream->congestion_window_size = stream->congestion_window_start;
+		stream->congestion_window_largest = stream->congestion_window_start;
+		stream->maxed_out_current_window = false;
+	}
+}
+
+void EQ::Net::ReliableStreamConnection::ResetCongestionWindowIfIdle(ReliableStream *stream)
+{
+	if (stream->sent_packets.empty() && stream->pending_packets.empty()) {
+		stream->congestion_window_size = stream->congestion_window_start;
+		stream->congestion_slow_start_threshold = stream->congestion_window_largest;
+		stream->maxed_out_current_window = false;
+	}
+}
+
+void EQ::Net::ReliableStreamConnection::DiscardTransportQueues()
+{
+	m_buffered_packets.clear();
+	m_buffered_packets_length = 0;
+
+	for (auto &stream : m_streams) {
+		stream.packet_queue.clear();
+		stream.ResetFragment();
+
+		while (!stream.pending_packets.empty()) {
+			stream.pending_packets.pop();
+		}
+
+		stream.sent_packets.clear();
+		stream.pending_bytes = 0;
+		stream.outstanding_bytes = 0;
+		stream.sequence_out_pending = stream.sequence_out;
+		stream.maxed_out_current_window = false;
+	}
+}
+
+size_t EQ::Net::ReliableStreamConnection::TotalPendingReliableBytes() const
+{
+	size_t total = 0;
+	for (const auto &stream : m_streams) {
+		total += stream.pending_bytes + stream.outstanding_bytes;
 	}
 
-	if (m_status != StatusDisconnecting) {
-		m_close_time = Clock::now();
+	return total;
+}
+
+void EQ::Net::ReliableStreamConnection::Close()
+{
+	auto status = m_status;
+	if (status == StatusDisconnected || status == StatusDisconnecting) {
+		return;
+	}
+
+	m_close_time = Clock::now();
+	if (status == StatusConnecting) {
+		m_silent_disconnect = true;
 	}
 
 	ChangeStatus(StatusDisconnecting);
+	DiscardTransportQueues();
+
+	if (status == StatusConnected && !m_silent_disconnect) {
+		SendDisconnect();
+	}
 }
 
 void EQ::Net::ReliableStreamConnection::QueuePacket(Packet &p)
@@ -379,6 +543,10 @@ void EQ::Net::ReliableStreamConnection::QueuePacket(Packet &p, int stream)
 
 void EQ::Net::ReliableStreamConnection::QueuePacket(Packet &p, int stream, bool reliable)
 {
+	if (p.Length() == 0 || stream < 0 || stream >= 4 || m_status != StatusConnected) {
+		return;
+	}
+
 	if (*(char*)p.Data() == 0) {
 		DynamicPacket packet;
 		packet.PutUInt8(0, 0);
@@ -407,10 +575,12 @@ void EQ::Net::ReliableStreamConnection::ResetStats()
 void EQ::Net::ReliableStreamConnection::Process()
 {
 	try {
-		auto now = Clock::now();
-		auto time_since_hold = (size_t)std::chrono::duration_cast<std::chrono::milliseconds>(now - m_hold_time).count();
-		if (time_since_hold >= m_owner->m_options.hold_length_ms) {
-			FlushBuffer();
+		if (!m_buffered_packets.empty()) {
+			auto now = Clock::now();
+			auto time_since_hold = (size_t)std::chrono::duration_cast<std::chrono::milliseconds>(now - m_hold_time).count();
+			if (time_since_hold >= m_owner->m_options.hold_length_ms) {
+				FlushBuffer();
+			}
 		}
 
 		ProcessQueue();
@@ -424,21 +594,25 @@ void EQ::Net::ReliableStreamConnection::Process()
 
 void EQ::Net::ReliableStreamConnection::ProcessPacket(Packet &p)
 {
-	m_last_recv = Clock::now();
+	if (p.Length() < ReliableStreamHeader::size() || p.Length() > m_max_packet_size) {
+		return;
+	}
+
 	m_stats.recv_packets++;
 	m_stats.recv_bytes += p.Length();
 
-	if (p.Length() < 1) {
+	bool packet_can_be_encoded = PacketCanBeEncoded(p);
+	if (m_status == StatusConnecting && packet_can_be_encoded) {
+		// Encryption, compression, and CRC settings are not known until OP_SessionResponse arrives.
 		return;
 	}
 
-	auto opcode = p.GetInt8(1);
-	if (p.GetInt8(0) == 0 && (opcode == OP_KeepAlive || opcode == OP_OutboundPing)) {
-		m_stats.bytes_after_decode += p.Length();
-		return;
-	}
+	if (packet_can_be_encoded) {
+		size_t clear_header_size = p.GetInt8(0) == 0 ? ReliableStreamHeader::size() : 1;
+		if (p.Length() < clear_header_size + m_crc_bytes) {
+			return;
+		}
 
-	if (PacketCanBeEncoded(p)) {
 		if (!ValidateCRC(p)) {
 			if (m_owner->m_on_error_message) {
 				m_owner->m_on_error_message(fmt::format("Tossed packet that failed CRC of type {0:#x}", p.Length() >= 2 ? p.GetInt8(1) : 0));
@@ -457,10 +631,14 @@ void EQ::Net::ReliableStreamConnection::ProcessPacket(Packet &p)
 			for (int i = 1; i >= 0; --i) {
 				switch (m_encode_passes[i]) {
 					case EncodeCompression:
-						if(temp.GetInt8(0) == 0)
-							Decompress(temp, ReliableStreamHeader::size(), temp.Length() - ReliableStreamHeader::size());
-						else
-							Decompress(temp, 1, temp.Length() - 1);
+						if (temp.GetInt8(0) == 0) {
+							if (!Decompress(temp, ReliableStreamHeader::size(), temp.Length() - ReliableStreamHeader::size())) {
+								return;
+							}
+						}
+						else if (!Decompress(temp, 1, temp.Length() - 1)) {
+							return;
+						}
 						break;
 					case EncodeXOR:
 						if (temp.GetInt8(0) == 0)
@@ -473,6 +651,7 @@ void EQ::Net::ReliableStreamConnection::ProcessPacket(Packet &p)
 				}
 			}
 
+			m_last_recv = Clock::now();
 			m_stats.bytes_after_decode += temp.Length();
 			ProcessDecodedPacket(StaticPacket(temp.Data(), temp.Length()));
 		}
@@ -492,11 +671,13 @@ void EQ::Net::ReliableStreamConnection::ProcessPacket(Packet &p)
 				}
 			}
 
+			m_last_recv = Clock::now();
 			m_stats.bytes_after_decode += temp.Length();
 			ProcessDecodedPacket(StaticPacket(temp.Data(), temp.Length()));
 		}
 	}
 	else {
+		m_last_recv = Clock::now();
 		m_stats.bytes_after_decode += p.Length();
 		ProcessDecodedPacket(p);
 	}
@@ -513,10 +694,9 @@ void EQ::Net::ReliableStreamConnection::ProcessQueue()
 				break;
 			}
 
-			auto packet = iter->second;
+			DynamicPacket packet(std::move(iter->second));
 			stream->packet_queue.erase(iter);
-			ProcessDecodedPacket(*packet);
-			delete packet;
+			ProcessDecodedPacket(packet);
 		}
 	}
 }
@@ -524,12 +704,7 @@ void EQ::Net::ReliableStreamConnection::ProcessQueue()
 void EQ::Net::ReliableStreamConnection::RemoveFromQueue(int stream, uint16_t seq)
 {
 	auto s = &m_streams[stream];
-	auto iter = s->packet_queue.find(seq);
-	if (iter != s->packet_queue.end()) {
-		auto packet = iter->second;
-		s->packet_queue.erase(iter);
-		delete packet;
-	}
+	s->packet_queue.erase(seq);
 }
 
 void EQ::Net::ReliableStreamConnection::AddToQueue(int stream, uint16_t seq, const Packet &p)
@@ -537,24 +712,52 @@ void EQ::Net::ReliableStreamConnection::AddToQueue(int stream, uint16_t seq, con
 	auto s = &m_streams[stream];
 	auto iter = s->packet_queue.find(seq);
 	if (iter == s->packet_queue.end()) {
-		DynamicPacket *out = new DynamicPacket();
-		out->PutPacket(0, p);
-
-		s->packet_queue.emplace(std::make_pair(seq, out));
+		DynamicPacket out;
+		out.PutPacket(0, p);
+		s->packet_queue.emplace(seq, std::move(out));
 	}
+}
+
+void EQ::Net::ReliableStreamConnection::RejectInvalidFragment(ReliableStream *stream, const char *reason)
+{
+	if (m_owner->m_on_error_message) {
+		m_owner->m_on_error_message(fmt::format("Invalid fragment: {}", reason));
+	}
+
+	stream->ResetFragment();
+	Close();
 }
 
 void EQ::Net::ReliableStreamConnection::ProcessDecodedPacket(const Packet &p)
 {
+	if (p.Length() == 0) {
+		return;
+	}
+
 	if (p.GetInt8(0) == 0) {
 		if (p.Length() < 2) {
 			return;
 		}
 
-		switch (p.GetInt8(1)) {
+			switch (p.GetInt8(1)) {
+			case OP_KeepAlive:
+			case OP_OutboundPing:
+				break;
+
+			case OP_UnreachableConnection:
+				// Port remapping is not enabled here, so use UdpLibrary's normal fallback and end the stale connection.
+				Close();
+				break;
+
+			case OP_RequestRemap:
+				// If this reached an existing connection, its endpoint mapping is already correct.
+				break;
+
 			case OP_Combined: {
 				if (m_status == StatusDisconnecting) {
-					SendDisconnect();
+					if (!m_silent_disconnect) {
+						SendDisconnect();
+					}
 					return;
 				}
 
@@ -564,7 +767,7 @@ void EQ::Net::ReliableStreamConnection::ProcessDecodedPacket(const Packet &p)
 					uint8_t subpacket_length = *(uint8_t*)current;
 					current += 1;
 
-					if (end < current + subpacket_length) {
+					if (subpacket_length == 0 || subpacket_length > static_cast<size_t>(end - current)) {
 						return;
 					}
 
@@ -577,7 +780,9 @@ void EQ::Net::ReliableStreamConnection::ProcessDecodedPacket(const Packet &p)
 			case OP_AppCombined:
 			{
 				if (m_status == StatusDisconnecting) {
-					SendDisconnect();
+					if (!m_silent_disconnect) {
+						SendDisconnect();
+					}
 					return;
 				}
 
@@ -586,36 +791,34 @@ void EQ::Net::ReliableStreamConnection::ProcessDecodedPacket(const Packet &p)
 
 				while (current < end) {
 					uint32_t subpacket_length = 0;
-					if (*current == 0xFF)
-					{
-						if (end < current + 3) {
-							throw std::out_of_range("Error in OP_AppCombined, end < current + 3");
+					size_t remaining = static_cast<size_t>(end - current);
+
+					if (*current == 0xFF) {
+						if (remaining < 3) {
+							throw std::out_of_range("OP_AppCombined has an incomplete length field");
 						}
 
-						if (*(current + 1) == 0xFF && *(current + 2) == 0xFF) {
-							if (end < current + 7) {
-								throw std::out_of_range("Error in OP_AppCombined, end < current + 7");
+						if (current[1] == 0xFF && current[2] == 0xFF) {
+							if (remaining < 7) {
+								throw std::out_of_range("OP_AppCombined has an incomplete extended length field");
 							}
 
-							subpacket_length = (uint32_t)(
-								(*(current + 3) << 24) |
-								(*(current + 4) << 16) |
-								(*(current + 5) << 8) |
-								(*(current + 6))
-								);
+							subpacket_length = (static_cast<uint32_t>(current[3]) << 24) | (static_cast<uint32_t>(current[4]) << 16) | (static_cast<uint32_t>(current[5]) << 8) | static_cast<uint32_t>(current[6]);
 							current += 7;
 						}
 						else {
-							subpacket_length = (uint32_t)(
-								(*(current + 1) << 8) |
-								(*(current + 2))
-								);
+							subpacket_length = (static_cast<uint32_t>(current[1]) << 8) | static_cast<uint32_t>(current[2]);
 							current += 3;
 						}
 					}
 					else {
-						subpacket_length = (uint32_t)((*(current + 0)));
+						subpacket_length = static_cast<uint32_t>(current[0]);
 						current += 1;
+					}
+
+					remaining = static_cast<size_t>(end - current);
+					if (subpacket_length == 0 || subpacket_length > remaining) {
+						throw std::out_of_range("OP_AppCombined subpacket exceeds the remaining packet data");
 					}
 
 					ProcessDecodedPacket(StaticPacket(current, subpacket_length));
@@ -627,10 +830,21 @@ void EQ::Net::ReliableStreamConnection::ProcessDecodedPacket(const Packet &p)
 
 			case OP_SessionRequest:
 			{
+				if (p.Length() < ReliableStreamConnect::size()) {
+					return;
+				}
+
 				if (m_status == StatusConnected) {
 					auto request = p.GetSerialize<ReliableStreamConnect>(0);
+					auto protocol_version = NetworkToHost(request.protocol_version);
+					auto requested_max_packet_size = NetworkToHost(request.max_packet_size);
+
+					if (!IsSupportedProtocolVersion(protocol_version) || requested_max_packet_size < MIN_RAW_PACKET_SIZE || p.Length() > requested_max_packet_size) {
+						return;
+					}
 
 					if (NetworkToHost(request.connect_code) != m_connect_code) {
+						Close();
 						return;
 					}
 
@@ -655,16 +869,28 @@ void EQ::Net::ReliableStreamConnection::ProcessDecodedPacket(const Packet &p)
 
 			case OP_SessionResponse:
 			{
+				if (p.Length() < ReliableStreamConnectReply::size()) {
+					return;
+				}
+
 				if (m_status == StatusConnecting) {
 					auto reply = p.GetSerialize<ReliableStreamConnectReply>(0);
+					auto connect_code = NetworkToHost(reply.connect_code);
+					auto max_packet_size = NetworkToHost(reply.max_packet_size);
 
-					if (m_connect_code == reply.connect_code) {
-						m_encode_key = reply.encode_key;
+					bool valid_crc = IsValidCrcLength(reply.crc_bytes);
+					bool valid_encode_passes = IsValidEncodeType(static_cast<ReliableStreamEncodeType>(reply.encode_pass1)) && IsValidEncodeType(static_cast<ReliableStreamEncodeType>(reply.encode_pass2));
+					if (m_connect_code == connect_code && max_packet_size >= MIN_RAW_PACKET_SIZE && valid_crc && valid_encode_passes) {
+						m_encode_key = NetworkToHost(reply.encode_key);
 						m_crc_bytes = reply.crc_bytes;
 						m_encode_passes[0] = (ReliableStreamEncodeType)reply.encode_pass1;
 						m_encode_passes[1] = (ReliableStreamEncodeType)reply.encode_pass2;
-						m_max_packet_size = reply.max_packet_size;
+						m_max_packet_size = static_cast<uint32_t>(std::min(m_owner->m_options.max_packet_size, static_cast<size_t>(max_packet_size)));
+						InitializeReliableStreams();
 						ChangeStatus(StatusConnected);
+						for (int stream_id = 0; stream_id < 4; ++stream_id) {
+							SendPendingPackets(stream_id);
+						}
 
 						LogNetClient(
 							"[OP_SessionResponse] Session [{}] refresh with encode key [{}]",
@@ -681,8 +907,14 @@ void EQ::Net::ReliableStreamConnection::ProcessDecodedPacket(const Packet &p)
 			case OP_Packet3:
 			case OP_Packet4:
 			{
+				if (p.Length() <= ReliableStreamReliableHeader::size()) {
+					return;
+				}
+
 				if (m_status == StatusDisconnecting) {
-					SendDisconnect();
+					if (!m_silent_disconnect) {
+						SendDisconnect();
+					}
 					return;
 				}
 
@@ -693,13 +925,23 @@ void EQ::Net::ReliableStreamConnection::ProcessDecodedPacket(const Packet &p)
 
 				auto order = CompareSequence(stream->sequence_in, sequence);
 				if (order == SequenceFuture) {
-					SendOutOfOrderAck(stream_id, sequence);
+					auto sequence_distance = static_cast<uint16_t>(sequence - stream->sequence_in);
+					if (sequence_distance >= m_owner->m_options.max_instanding_packets[stream_id]) {
+						return;
+					}
+
 					AddToQueue(stream_id, sequence, p);
+					SendOutOfOrderAck(stream_id, sequence);
 				}
 				else if (order == SequencePast) {
 					SendAck(stream_id, stream->sequence_in - 1);
 				}
 				else {
+					if (stream->fragment_total_bytes != 0) {
+						RejectInvalidFragment(stream, "received a normal reliable packet while reassembly was in progress");
+						return;
+					}
+
 					RemoveFromQueue(stream_id, sequence);
 					SendAck(stream_id, stream->sequence_in);
 					stream->sequence_in++;
@@ -715,6 +957,17 @@ void EQ::Net::ReliableStreamConnection::ProcessDecodedPacket(const Packet &p)
 			case OP_Fragment3:
 			case OP_Fragment4:
 			{
+				if (p.Length() <= ReliableStreamReliableHeader::size()) {
+					return;
+				}
+
+				if (m_status == StatusDisconnecting) {
+					if (!m_silent_disconnect) {
+						SendDisconnect();
+					}
+					return;
+				}
+
 				auto header = p.GetSerialize<ReliableStreamReliableHeader>(0);
 				auto sequence = NetworkToHost(header.sequence);
 				auto stream_id = header.opcode - OP_Fragment;
@@ -723,41 +976,65 @@ void EQ::Net::ReliableStreamConnection::ProcessDecodedPacket(const Packet &p)
 				auto order = CompareSequence(stream->sequence_in, sequence);
 
 				if (order == SequenceFuture) {
-					SendOutOfOrderAck(stream_id, sequence);
+					auto sequence_distance = static_cast<uint16_t>(sequence - stream->sequence_in);
+					if (sequence_distance >= m_owner->m_options.max_instanding_packets[stream_id]) {
+						return;
+					}
+
 					AddToQueue(stream_id, sequence, p);
+					SendOutOfOrderAck(stream_id, sequence);
 				}
 				else if (order == SequencePast) {
 					SendAck(stream_id, stream->sequence_in - 1);
 				}
 				else {
+					bool first_fragment = stream->fragment_total_bytes == 0;
+					size_t payload_offset = ReliableStreamReliableHeader::size();
+					uint32_t total_bytes = stream->fragment_total_bytes;
+
+					if (first_fragment) {
+						if (p.Length() < ReliableStreamReliableFragmentHeader::size()) {
+							RejectInvalidFragment(stream, "first fragment is shorter than its header");
+							return;
+						}
+
+						auto fragheader = p.GetSerialize<ReliableStreamReliableFragmentHeader>(0);
+						total_bytes = NetworkToHost(fragheader.total_size);
+						payload_offset = ReliableStreamReliableFragmentHeader::size();
+
+						if (total_bytes == 0 || total_bytes > m_owner->m_options.max_reassembled_packet_size) {
+							RejectInvalidFragment(stream, "declared packet size is invalid");
+							return;
+						}
+					}
+					if (stream->fragment_current_bytes > total_bytes) {
+						RejectInvalidFragment(stream, "reassembly position exceeds the declared packet size");
+						return;
+					}
+
+					size_t payload_size = p.Length() - payload_offset;
+					size_t remaining = total_bytes - stream->fragment_current_bytes;
+					if (payload_size > remaining) {
+						RejectInvalidFragment(stream, "fragment data exceeds the declared packet size");
+						return;
+					}
+
+					if (first_fragment) {
+						stream->fragment_total_bytes = total_bytes;
+						stream->fragment_packet.Reserve(total_bytes);
+					}
+
+					stream->fragment_packet.PutData(stream->fragment_current_bytes, (char*)p.Data() + payload_offset, payload_size);
+					stream->fragment_current_bytes += static_cast<uint32_t>(payload_size);
+
 					RemoveFromQueue(stream_id, sequence);
 					SendAck(stream_id, stream->sequence_in);
 					stream->sequence_in++;
 
-					if (stream->fragment_total_bytes == 0) {
-						auto fragheader = p.GetSerialize<ReliableStreamReliableFragmentHeader>(0);
-						stream->fragment_total_bytes = NetworkToHost(fragheader.total_size);
-						stream->fragment_current_bytes = 0;
-						stream->fragment_packet.Reserve(stream->fragment_total_bytes);
-						stream->fragment_packet.PutData(
-							stream->fragment_current_bytes,
-							(char*)p.Data() + ReliableStreamReliableFragmentHeader::size(), p.Length() - ReliableStreamReliableFragmentHeader::size());
-
-						stream->fragment_current_bytes += (uint32_t)(p.Length() - ReliableStreamReliableFragmentHeader::size());
-					}
-					else {
-						stream->fragment_packet.PutData(
-							stream->fragment_current_bytes,
-							(char*)p.Data() + ReliableStreamReliableHeader::size(), p.Length() - ReliableStreamReliableHeader::size());
-
-						stream->fragment_current_bytes += (uint32_t)(p.Length() - ReliableStreamReliableHeader::size());
-
-						if (stream->fragment_current_bytes >= stream->fragment_total_bytes) {
-							ProcessDecodedPacket(stream->fragment_packet);
-							stream->fragment_packet.Clear();
-							stream->fragment_total_bytes = 0;
-							stream->fragment_current_bytes = 0;
-						}
+					if (stream->fragment_current_bytes == stream->fragment_total_bytes) {
+						DynamicPacket completed(std::move(stream->fragment_packet));
+						stream->ResetFragment();
+						ProcessDecodedPacket(completed);
 					}
 				}
 
@@ -769,6 +1046,10 @@ void EQ::Net::ReliableStreamConnection::ProcessDecodedPacket(const Packet &p)
 			case OP_Ack3:
 			case OP_Ack4:
 			{
+				if (p.Length() < ReliableStreamReliableHeader::size()) {
+					return;
+				}
+
 				auto header = p.GetSerialize<ReliableStreamReliableHeader>(0);
 				auto sequence = NetworkToHost(header.sequence);
 				auto stream_id = header.opcode - OP_Ack;
@@ -781,6 +1062,10 @@ void EQ::Net::ReliableStreamConnection::ProcessDecodedPacket(const Packet &p)
 			case OP_OutOfOrderAck3:
 			case OP_OutOfOrderAck4:
 			{
+				if (p.Length() < ReliableStreamReliableHeader::size()) {
+					return;
+				}
+
 				auto header = p.GetSerialize<ReliableStreamReliableHeader>(0);
 				auto sequence = NetworkToHost(header.sequence);
 				auto stream_id = header.opcode - OP_OutOfOrderAck;
@@ -790,18 +1075,27 @@ void EQ::Net::ReliableStreamConnection::ProcessDecodedPacket(const Packet &p)
 
 			case OP_SessionDisconnect:
 			{
-				if (m_status == StatusConnected || m_status == StatusDisconnecting) {
-					FlushBuffer();
-					SendDisconnect();
+				if (p.Length() < ReliableStreamDisconnect::size()) {
+					return;
 				}
+
+				auto disconnect = p.GetSerialize<ReliableStreamDisconnect>(0);
+				if (NetworkToHost(disconnect.connect_code) != m_connect_code) {
+					return;
+				}
+
+				m_silent_disconnect = true;
+				if (m_status != StatusDisconnecting) {
+					m_close_time = Clock::now();
+					ChangeStatus(StatusDisconnecting);
+				}
+				DiscardTransportQueues();
 
 				LogNetClient(
 					"[OP_SessionDisconnect] Session [{}] disconnect with encode key [{}]",
 					m_connect_code,
 					HostToNetwork(m_encode_key)
 				);
-
-				ChangeStatus(StatusDisconnecting);
 				break;
 			}
 
@@ -815,6 +1109,10 @@ void EQ::Net::ReliableStreamConnection::ProcessDecodedPacket(const Packet &p)
 			}
 			case OP_SessionStatRequest:
 			{
+				if (p.Length() < ReliableStreamSessionStatRequest::size()) {
+					return;
+				}
+
 				auto request = p.GetSerialize<ReliableStreamSessionStatRequest>(0);
 				m_stats.sync_remote_sent_packets = EQ::Net::NetworkToHost(request.packets_sent);
 				m_stats.sync_remote_recv_packets = EQ::Net::NetworkToHost(request.packets_recv);
@@ -836,6 +1134,10 @@ void EQ::Net::ReliableStreamConnection::ProcessDecodedPacket(const Packet &p)
 				break;
 			}
 			case OP_SessionStatResponse: {
+				if (p.Length() < ReliableStreamSessionStatResponse::size()) {
+					return;
+				}
+
 				auto response = p.GetSerialize<ReliableStreamSessionStatResponse>(0);
 				m_stats.sync_remote_sent_packets = EQ::Net::NetworkToHost(response.server_sent);
 				m_stats.sync_remote_recv_packets = EQ::Net::NetworkToHost(response.server_recv);
@@ -870,17 +1172,33 @@ bool EQ::Net::ReliableStreamConnection::ValidateCRC(Packet &p)
 	}
 
 	char *data = (char*)p.Data();
-	int calculated = 0;
-	int actual = 0;
+	uint32_t calculated = 0;
+	uint32_t actual = 0;
 	switch (m_crc_bytes) {
-		case 2:
-			actual = NetworkToHost(*(int16_t*)&data[p.Length() - (size_t)m_crc_bytes]) & 0xffff;
-			calculated = Crc32(data, (int)(p.Length() - (size_t)m_crc_bytes), m_encode_key) & 0xffff;
+		case 1:
+			actual = static_cast<uint8_t>(data[p.Length() - 1]);
+			calculated = static_cast<uint32_t>(Crc32(data, static_cast<int>(p.Length() - 1), m_encode_key)) & 0xff;
 			break;
-		case 4:
-			actual = NetworkToHost(*(int32_t*)&data[p.Length() - (size_t)m_crc_bytes]);
-			calculated = Crc32(data, (int)(p.Length() - (size_t)m_crc_bytes), m_encode_key);
+		case 2: {
+			uint16_t wire_crc = 0;
+			memcpy(&wire_crc, &data[p.Length() - (size_t)m_crc_bytes], sizeof(wire_crc));
+			actual = NetworkToHost(wire_crc);
+			calculated = static_cast<uint32_t>(Crc32(data, (int)(p.Length() - (size_t)m_crc_bytes), m_encode_key)) & 0xffff;
 			break;
+		}
+		case 3: {
+			auto crc = reinterpret_cast<const uint8_t *>(&data[p.Length() - 3]);
+			actual = (static_cast<uint32_t>(crc[0]) << 16) | (static_cast<uint32_t>(crc[1]) << 8) | static_cast<uint32_t>(crc[2]);
+			calculated = static_cast<uint32_t>(Crc32(data, static_cast<int>(p.Length() - 3), m_encode_key)) & 0xffffff;
+			break;
+		}
+		case 4: {
+			uint32_t wire_crc = 0;
+			memcpy(&wire_crc, &data[p.Length() - (size_t)m_crc_bytes], sizeof(wire_crc));
+			actual = NetworkToHost(wire_crc);
+			calculated = static_cast<uint32_t>(Crc32(data, (int)(p.Length() - (size_t)m_crc_bytes), m_encode_key));
+			break;
+		}
 		default:
 			return false;
 	}
@@ -898,21 +1216,35 @@ void EQ::Net::ReliableStreamConnection::AppendCRC(Packet &p)
 		return;
 	}
 
-	int calculated = 0;
+	uint32_t calculated = static_cast<uint32_t>(Crc32(p.Data(), static_cast<int>(p.Length()), m_encode_key));
 	switch (m_crc_bytes) {
-		case 2:
-			calculated = Crc32(p.Data(), (int)p.Length(), m_encode_key) & 0xffff;
-			p.PutInt16(p.Length(), EQ::Net::HostToNetwork((int16_t)calculated));
+		case 1:
+			p.PutUInt8(p.Length(), static_cast<uint8_t>(calculated & 0xff));
 			break;
+		case 2:
+			p.PutUInt16(p.Length(), EQ::Net::HostToNetwork(static_cast<uint16_t>(calculated & 0xffff)));
+			break;
+		case 3: {
+			uint8_t crc[3] = {
+				static_cast<uint8_t>((calculated >> 16) & 0xff),
+				static_cast<uint8_t>((calculated >> 8) & 0xff),
+				static_cast<uint8_t>(calculated & 0xff)
+			};
+			p.PutData(p.Length(), crc, sizeof(crc));
+			break;
+		}
 		case 4:
-			calculated = Crc32(p.Data(), (int)p.Length(), m_encode_key);
-			p.PutInt32(p.Length(), EQ::Net::HostToNetwork(calculated));
+			p.PutUInt32(p.Length(), EQ::Net::HostToNetwork(calculated));
 			break;
 	}
 }
 
 void EQ::Net::ReliableStreamConnection::ChangeStatus(DbProtocolStatus new_status)
 {
+	if (new_status == m_status) {
+		return;
+	}
+
 	if (m_owner->m_on_connection_state_change) {
 		if (auto self = m_self.lock()) {
 			m_owner->m_on_connection_state_change(self, m_status, new_status);
@@ -934,7 +1266,7 @@ bool EQ::Net::ReliableStreamConnection::PacketCanBeEncoded(Packet &p) const
 	}
 
 	auto opcode = p.GetInt8(1);
-	if (opcode == OP_SessionRequest || opcode == OP_SessionResponse || opcode == OP_OutOfSession) {
+	if (opcode == OP_SessionRequest || opcode == OP_SessionResponse || opcode == OP_UnreachableConnection || opcode == OP_RequestRemap) {
 		return false;
 	}
 
@@ -943,15 +1275,17 @@ bool EQ::Net::ReliableStreamConnection::PacketCanBeEncoded(Packet &p) const
 
 void EQ::Net::ReliableStreamConnection::Decode(Packet &p, size_t offset, size_t length)
 {
-	int key = m_encode_key;
+	uint32_t key = m_encode_key;
 	char *buffer = (char*)p.Data() + offset;
 
 	size_t i = 0;
 	for (i = 0; i + 4 <= length; i += 4)
 	{
-		int pt = (*(int*)&buffer[i]) ^ (key);
-		key = (*(int*)&buffer[i]);
-		*(int*)&buffer[i] = pt;
+		uint32_t cipher_text = 0;
+		memcpy(&cipher_text, &buffer[i], sizeof(cipher_text));
+		uint32_t plain_text = cipher_text ^ key;
+		key = cipher_text;
+		memcpy(&buffer[i], &plain_text, sizeof(plain_text));
 	}
 
 	unsigned char KC = key & 0xFF;
@@ -963,15 +1297,17 @@ void EQ::Net::ReliableStreamConnection::Decode(Packet &p, size_t offset, size_t 
 
 void EQ::Net::ReliableStreamConnection::Encode(Packet &p, size_t offset, size_t length)
 {
-	int key = m_encode_key;
+	uint32_t key = m_encode_key;
 	char *buffer = (char*)p.Data() + offset;
 
 	size_t i = 0;
 	for (i = 0; i + 4 <= length; i += 4)
 	{
-		int pt = (*(int*)&buffer[i]) ^ (key);
-		key = pt;
-		*(int*)&buffer[i] = pt;
+		uint32_t plain_text = 0;
+		memcpy(&plain_text, &buffer[i], sizeof(plain_text));
+		uint32_t cipher_text = plain_text ^ key;
+		key = cipher_text;
+		memcpy(&buffer[i], &cipher_text, sizeof(cipher_text));
 	}
 
 	unsigned char KC = key & 0xFF;
@@ -981,8 +1317,8 @@ void EQ::Net::ReliableStreamConnection::Encode(Packet &p, size_t offset, size_t 
 	}
 }
 
-uint32_t Inflate(const uint8_t* in, uint32_t in_len, uint8_t* out, uint32_t out_len) {
-	if (!in) {
+static uint32_t Inflate(const uint8_t* in, uint32_t in_len, uint8_t* out, uint32_t out_len) {
+	if (!in || !out || out_len == 0) {
 		return 0;
 	}
 
@@ -998,30 +1334,18 @@ uint32_t Inflate(const uint8_t* in, uint32_t in_len, uint8_t* out, uint32_t out_
 	zstream.opaque = Z_NULL;
 
 	i = inflateInit2(&zstream, 15);
-
 	if (i != Z_OK) {
 		return 0;
 	}
 
 	zerror = inflate(&zstream, Z_FINISH);
-
-	if (zerror == Z_STREAM_END) {
-		inflateEnd(&zstream);
-		return zstream.total_out;
-	}
-	else {
-		if (zerror == Z_MEM_ERROR && !zstream.msg)
-		{
-			return 0;
-		}
-
-		zerror = inflateEnd(&zstream);
-		return 0;
-	}
+	uint32_t total_out = zerror == Z_STREAM_END ? static_cast<uint32_t>(zstream.total_out) : 0;
+	inflateEnd(&zstream);
+	return total_out;
 }
 
-uint32_t Deflate(const uint8_t* in, uint32_t in_len, uint8_t* out, uint32_t out_len) {
-	if (!in) {
+static uint32_t Deflate(const uint8_t* in, uint32_t in_len, uint8_t* out, uint32_t out_len) {
+	if (!in || !out || out_len == 0) {
 		return 0;
 	}
 
@@ -1033,68 +1357,170 @@ uint32_t Deflate(const uint8_t* in, uint32_t in_len, uint8_t* out, uint32_t out_
 	zstream.avail_in = in_len;
 	zstream.opaque = Z_NULL;
 
-	deflateInit(&zstream, Z_BEST_SPEED);
+	if (deflateInit(&zstream, Z_BEST_SPEED) != Z_OK) {
+		return 0;
+	}
 	zstream.next_out = out;
 	zstream.avail_out = out_len;
 
 	zerror = deflate(&zstream, Z_FINISH);
 
-	if (zerror == Z_STREAM_END)
-	{
-		deflateEnd(&zstream);
-		return zstream.total_out;
-	}
-	else {
-		zerror = deflateEnd(&zstream);
-		return 0;
-	}
+	uint32_t total_out = zerror == Z_STREAM_END ? static_cast<uint32_t>(zstream.total_out) : 0;
+	deflateEnd(&zstream);
+	return total_out;
 }
 
-void EQ::Net::ReliableStreamConnection::Decompress(Packet &p, size_t offset, size_t length)
+bool EQ::Net::ReliableStreamConnection::Decompress(Packet &p, size_t offset, size_t length)
 {
-	if (length < 2) {
-		return;
+	if (offset > p.Length() || length != p.Length() - offset || length == 0 || offset >= m_max_packet_size) {
+		return false;
 	}
 
-	static thread_local uint8_t new_buffer[4096];
+	size_t output_capacity = m_max_packet_size - offset;
+	std::vector<uint8_t> new_buffer(output_capacity);
 	uint8_t *buffer = (uint8_t*)p.Data() + offset;
 	uint32_t new_length = 0;
 
 	if (buffer[0] == 0x5a) {
-		new_length = Inflate(buffer + 1, (uint32_t)length - 1, new_buffer, 4096);
+		if (length < 2) {
+			return false;
+		}
+
+		new_length = Inflate(buffer + 1, static_cast<uint32_t>(length - 1), new_buffer.data(), static_cast<uint32_t>(output_capacity));
+		if (new_length == 0) {
+			return false;
+		}
 	}
 	else if (buffer[0] == 0xa5) {
-		memcpy(new_buffer, buffer + 1, length - 1);
-		new_length = (uint32_t)length - 1;
+		if (length - 1 > output_capacity) {
+			return false;
+		}
+
+		memcpy(new_buffer.data(), buffer + 1, length - 1);
+		new_length = static_cast<uint32_t>(length - 1);
 	}
 	else {
-		return;
+		return false;
 	}
 
 	p.Resize(offset);
-	p.PutData(offset, new_buffer, new_length);
+	p.PutData(offset, new_buffer.data(), new_length);
+	return true;
 }
 
-void EQ::Net::ReliableStreamConnection::Compress(Packet &p, size_t offset, size_t length)
+bool EQ::Net::ReliableStreamConnection::Compress(Packet &p, size_t offset, size_t length)
 {
-	static thread_local uint8_t new_buffer[2048] = { 0 };
+	if (offset > p.Length() || length != p.Length() - offset) {
+		return false;
+	}
+
+	size_t encoded_capacity = m_max_packet_size - m_crc_bytes;
+	if (offset > encoded_capacity || length + 1 > encoded_capacity - offset) {
+		return false;
+	}
+
+	std::vector<uint8_t> new_buffer(length + 1);
 	uint8_t *buffer = (uint8_t*)p.Data() + offset;
 	uint32_t new_length = 0;
 	bool send_uncompressed = true;
 
 	if (length > 30) {
-		new_length = Deflate(buffer, (uint32_t)length, new_buffer + 1, 2048) + 1;
-		new_buffer[0] = 0x5a;
-		send_uncompressed = (new_length > length);
+		uint32_t compressed_length = Deflate(buffer, static_cast<uint32_t>(length), new_buffer.data() + 1, static_cast<uint32_t>(length));
+		if (compressed_length != 0 && compressed_length < length) {
+			new_buffer[0] = 0x5a;
+			new_length = compressed_length + 1;
+			send_uncompressed = false;
+		}
 	}
 	if (send_uncompressed) {
-		memcpy(new_buffer + 1, buffer, length);
+		memcpy(new_buffer.data() + 1, buffer, length);
 		new_buffer[0] = 0xa5;
-		new_length = length + 1;
+		new_length = static_cast<uint32_t>(length + 1);
 	}
 
 	p.Resize(offset);
-	p.PutData(offset, new_buffer, new_length);
+	p.PutData(offset, new_buffer.data(), new_length);
+	return true;
+}
+
+void EQ::Net::ReliableStreamConnection::QueueReliablePacket(int stream_id, const Packet &p, size_t data_length)
+{
+	if (stream_id < 0 || stream_id >= 4 || p.Length() < ReliableStreamReliableHeader::size() || m_status != StatusConnected) {
+		return;
+	}
+
+	auto stream = &m_streams[stream_id];
+	ReliableStreamPendingPacket pending;
+	pending.packet.PutPacket(0, p);
+	pending.data_length = data_length;
+	stream->pending_bytes += data_length;
+	stream->pending_packets.push(std::move(pending));
+
+	if (m_owner->m_options.reliable_overflow_bytes != 0 && TotalPendingReliableBytes() >= m_owner->m_options.reliable_overflow_bytes) {
+		LogNetClient("Closing session [{}]: reliable queue reached [{}] bytes", m_connect_code, TotalPendingReliableBytes());
+		Close();
+		return;
+	}
+
+	SendPendingPackets(stream_id);
+}
+
+int64_t EQ::Net::ReliableStreamConnection::GetReliableOutgoingId(const ReliableStream *stream, uint16_t reliable_stamp) const
+{
+	// Sony sends only the low 16 bits and reconstructs the full reliable ID using the next outgoing ID.
+	int64_t reliable_id = static_cast<int64_t>(reliable_stamp) |
+		(stream->sequence_out & ~static_cast<int64_t>(0xffff));
+
+	if (reliable_id > stream->sequence_out) {
+		reliable_id -= 0x10000;
+	}
+
+	return reliable_id;
+}
+
+void EQ::Net::ReliableStreamConnection::AdvanceOutgoingWindow(ReliableStream *stream)
+{
+	while (stream->sequence_out_pending < stream->sequence_out &&
+		stream->sent_packets.find(stream->sequence_out_pending) == stream->sent_packets.end()) {
+		stream->sequence_out_pending++;
+	}
+}
+
+void EQ::Net::ReliableStreamConnection::SendPendingPackets(int stream_id)
+{
+	if (stream_id < 0 || stream_id >= 4 || m_status != StatusConnected) {
+		return;
+	}
+
+	auto stream = &m_streams[stream_id];
+	auto max_outstanding_packets = m_owner->m_options.max_outstanding_packets[stream_id];
+	auto max_outstanding_bytes = std::min(m_owner->m_options.max_outstanding_bytes[stream_id], stream->congestion_window_size);
+	auto now = Clock::now();
+
+	while (!stream->pending_packets.empty() &&
+		static_cast<size_t>(stream->sequence_out - stream->sequence_out_pending) < max_outstanding_packets &&
+		stream->outstanding_bytes < max_outstanding_bytes) {
+		ReliableStreamPendingPacket pending(std::move(stream->pending_packets.front()));
+		stream->pending_packets.pop();
+		stream->pending_bytes -= std::min(stream->pending_bytes, pending.data_length);
+
+		int64_t reliable_id = stream->sequence_out++;
+		auto wire_sequence = static_cast<uint16_t>(reliable_id & 0xffff);
+		pending.packet.PutUInt16(ReliableStreamHeader::size(), HostToNetwork(wire_sequence));
+
+		ReliableStreamSentPacket sent;
+		sent.packet.PutPacket(0, pending.packet);
+		sent.last_sent = now;
+		sent.first_sent = now;
+		sent.times_resent = 0;
+		sent.data_length = pending.data_length;
+		stream->outstanding_bytes += pending.data_length;
+
+		auto inserted = stream->sent_packets.emplace(reliable_id, std::move(sent));
+		InternalBufferedSend(inserted.first->second.packet);
+	}
+
+	stream->maxed_out_current_window = stream->outstanding_bytes >= max_outstanding_bytes;
 }
 
 void EQ::Net::ReliableStreamConnection::ProcessResend()
@@ -1106,101 +1532,75 @@ void EQ::Net::ReliableStreamConnection::ProcessResend()
 
 void EQ::Net::ReliableStreamConnection::ProcessResend(int stream)
 {
-	if (m_status == DbProtocolStatus::StatusDisconnected) {
+	if (stream < 0 || stream >= 4 || m_status == DbProtocolStatus::StatusDisconnected || m_silent_disconnect) {
 		return;
 	}
 
-	if (m_streams[stream].sent_packets.empty()) {
+	auto s = &m_streams[stream];
+	if (s->sent_packets.empty()) {
+		ResetCongestionWindowIfIdle(s);
 		return;
 	}
 
 	m_resend_packets_sent = 0;
 	m_resend_bytes_sent = 0;
 
-	auto now = Clock::now(); // Current time
-	auto s = &m_streams[stream];
-
-	// Get a reference resend delay (assume first packet represents the typical case)
-	if (!s->sent_packets.empty()) {
-		// Check if the first packet has timed out
-		auto &first_packet = s->sent_packets.begin()->second;
-		auto time_since_first_sent = std::chrono::duration_cast<std::chrono::milliseconds>(now - first_packet.first_sent).count();
-
-		if (time_since_first_sent >= m_owner->m_options.resend_timeout) {
-			auto now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(now.time_since_epoch()).count();
-			auto first_sent_ms = std::chrono::duration_cast<std::chrono::milliseconds>(first_packet.first_sent.time_since_epoch()).count();
-			LogNetClient(
-				"Closing connection for m_endpoint [{}] m_port [{}] time_since_first_sent [{}] >= m_owner->m_options.resend_timeout [{}] now [{}] first_packet.first_sent [{}]",
-				m_endpoint,
-				m_port,
-				time_since_first_sent,
-				m_owner->m_options.resend_timeout,
-				now_ms,
-				first_sent_ms
-			);
-			Close();
-			return;
-		}
-
-		if (m_last_ack - now > std::chrono::milliseconds(1000)) {
-			LogNetClient(
-				"Resetting m_acked_since_last_resend flag for m_endpoint [{}] m_port [{}]",
-				m_endpoint,
-				m_port
-			);
-			m_acked_since_last_resend = true;
-		}
-
-		// make sure that the first_packet in the list first_sent time is within the resend_delay and now
-		// if it is not, then we need to resend all packets in the list
-		if (time_since_first_sent <= first_packet.resend_delay && !m_acked_since_last_resend) {
-			LogNetClientDetail(
-				"Not resending packets for m_endpoint [{}] m_port [{}] packets [{}] time_first_sent [{}] resend_delay [{}] m_acked_since_last_resend [{}]",
-				m_endpoint,
-				m_port,
-				s->sent_packets.size(),
-				time_since_first_sent,
-				first_packet.resend_delay,
-				m_acked_since_last_resend
-			);
-			return;
-		}
+	auto now = Clock::now();
+	auto &oldest_packet = s->sent_packets.begin()->second;
+	auto oldest_age = std::chrono::duration_cast<std::chrono::milliseconds>(now - oldest_packet.first_sent).count();
+	if (m_owner->m_options.resend_timeout != 0 && oldest_age >= static_cast<int64_t>(m_owner->m_options.resend_timeout)) {
+		Close();
+		return;
 	}
 
-	if (LogSys.IsLogEnabled(Logs::General, Logs::NetClient)) {
-		size_t    total_size = 0;
-		for (auto &e: s->sent_packets) {
-			total_size += e.second.packet.Length();
+	size_t resend_delay = EQ::Clamp(
+		static_cast<size_t>((m_rolling_ping * m_owner->m_options.resend_delay_factor) + m_owner->m_options.resend_delay_ms),
+		m_owner->m_options.resend_delay_min,
+		m_owner->m_options.resend_delay_max);
+	auto resend_timestamp = now - std::chrono::milliseconds(resend_delay);
+	auto oldest_resend_timestamp = std::max(resend_timestamp, s->last_timestamp_acknowledged);
+	size_t resend_outstanding_bytes = 0;
+	for (const auto &entry : s->sent_packets) {
+		if (entry.second.last_sent >= oldest_resend_timestamp) {
+			resend_outstanding_bytes += entry.second.data_length;
 		}
-
-		LogNetClientDetail(
-			"Resending packets for m_endpoint [{}] m_port [{}] packet count [{}] total packet size [{}] m_acked_since_last_resend [{}]",
-			m_endpoint,
-			m_port,
-			s->sent_packets.size(),
-			total_size,
-			m_acked_since_last_resend
-		);
 	}
+	size_t resend_window_bytes = std::min(m_owner->m_options.max_outstanding_bytes[stream], s->congestion_window_size);
 
 	for (auto &e: s->sent_packets) {
-		if (m_resend_packets_sent >= MAX_CLIENT_RECV_PACKETS_PER_WINDOW ||
-			m_resend_bytes_sent >= MAX_CLIENT_RECV_BYTES_PER_WINDOW) {
+		auto &sp = e.second;
+		if (sp.last_sent >= oldest_resend_timestamp) {
+			continue;
+		}
+
+		if (m_resend_packets_sent >= MAX_RESEND_PACKETS_PER_PASS ||
+			m_resend_bytes_sent >= MAX_RESEND_BYTES_PER_PASS) {
 			LogNetClient(
-				"Stopping resend because we hit thresholds for m_endpoint [{}] m_port [{}]  m_resend_packets_sent [{}] max [{}] in_queue [{}] m_resend_bytes_sent [{}] max [{}]",
-				m_endpoint,
-				m_port,
+				"Stopping resend because we hit thresholds m_resend_packets_sent [{}] max [{}] m_resend_bytes_sent [{}] max [{}]",
 				m_resend_packets_sent,
-				MAX_CLIENT_RECV_PACKETS_PER_WINDOW,
-				s->sent_packets.size(),
+				MAX_RESEND_PACKETS_PER_PASS,
 				m_resend_bytes_sent,
-				MAX_CLIENT_RECV_BYTES_PER_WINDOW
+				MAX_RESEND_BYTES_PER_PASS
 			);
 			break;
 		}
+		if (resend_outstanding_bytes >= resend_window_bytes) {
+			break;
+		}
 
-		auto &sp = e.second;
 		auto &p  = sp.packet;
+		bool accelerated = sp.last_sent < s->last_timestamp_acknowledged;
+		if (accelerated) {
+			s->congestion_window_size = std::max(s->congestion_window_minimum, s->congestion_window_size * 2 / 3);
+			s->congestion_slow_start_threshold = s->congestion_window_size;
+		}
+		else {
+			s->congestion_slow_start_threshold = std::max(2 * s->max_reliable_data_size, resend_outstanding_bytes / 2);
+			s->congestion_window_size = s->congestion_window_start;
+			m_rolling_ping = std::min(m_owner->m_options.resend_delay_max, m_rolling_ping + 100);
+		}
+		resend_window_bytes = std::min(m_owner->m_options.max_outstanding_bytes[stream], s->congestion_window_size);
+
 		if (p.Length() >= ReliableStreamHeader::size()) {
 			if (p.GetInt8(0) == 0 && p.GetInt8(1) >= OP_Fragment && p.GetInt8(1) <= OP_Fragment4) {
 				m_stats.resent_fragments++;
@@ -1221,62 +1621,107 @@ void EQ::Net::ReliableStreamConnection::ProcessResend(int stream)
 		m_resend_bytes_sent += p.Length();
 		sp.last_sent = now;
 		sp.times_resent++;
-		sp.resend_delay = EQ::Clamp(
-			sp.resend_delay * 2,
-			m_owner->m_options.resend_delay_min,
-			m_owner->m_options.resend_delay_max
-		);
+		resend_outstanding_bytes += sp.data_length;
 	}
 
-	m_acked_since_last_resend = false;
-	m_last_ack = now;
+	s->maxed_out_current_window = resend_outstanding_bytes >= std::min(m_owner->m_options.max_outstanding_bytes[stream], s->congestion_window_size);
 }
 
 void EQ::Net::ReliableStreamConnection::Ack(int stream, uint16_t seq)
 {
+	if (stream < 0 || stream >= 4) {
+		return;
+	}
+
 	auto now = Clock::now();
 	auto s = &m_streams[stream];
+	auto reliable_id = GetReliableOutgoingId(s, seq);
+	bool packets_acked = false;
+
+	if (s->sequence_out_pending > reliable_id) {
+		m_rolling_ping = std::min(m_owner->m_options.resend_delay_max, m_rolling_ping + 400);
+		return;
+	}
+	if (reliable_id >= s->sequence_out) {
+		return;
+	}
+
 	auto iter = s->sent_packets.begin();
-	while (iter != s->sent_packets.end()) {
-		auto order = CompareSequence(seq, iter->first);
+	while (iter != s->sent_packets.end() && iter->first <= reliable_id) {
+		auto &packet = iter->second;
+		if (s->maxed_out_current_window) {
+			if (s->congestion_window_size < s->congestion_slow_start_threshold) {
+				s->congestion_window_size += s->max_reliable_data_size;
+			}
+			else {
+				s->congestion_window_size += std::max<size_t>(1, s->max_reliable_data_size * s->max_reliable_data_size / s->congestion_window_size);
+			}
 
-		if (order != SequenceFuture) {
-			uint64_t round_time = (uint64_t)std::chrono::duration_cast<std::chrono::milliseconds>(now - iter->second.last_sent).count();
+			s->congestion_window_largest = std::max(s->congestion_window_largest, s->congestion_window_size);
+		}
 
+		if (packet.times_resent == 0) {
+			uint64_t round_time = static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(now - packet.first_sent).count());
 			m_stats.max_ping = std::max(m_stats.max_ping, round_time);
 			m_stats.min_ping = std::min(m_stats.min_ping, round_time);
 			m_stats.last_ping = round_time;
-			m_rolling_ping = (m_rolling_ping * 2 + round_time) / 3;
+			m_rolling_ping = (m_rolling_ping * 3 + round_time) / 4;
+		}
 
-			iter = s->sent_packets.erase(iter);
-		}
-		else {
-			++iter;
-		}
+		s->last_timestamp_acknowledged = packet.first_sent;
+		s->outstanding_bytes -= std::min(s->outstanding_bytes, packet.data_length);
+
+		iter = s->sent_packets.erase(iter);
+		packets_acked = true;
 	}
 
-	m_acked_since_last_resend = true;
-	m_last_ack = now;
+	if (packets_acked) {
+		AdvanceOutgoingWindow(s);
+		SendPendingPackets(stream);
+		ResetCongestionWindowIfIdle(s);
+	}
 }
 
 void EQ::Net::ReliableStreamConnection::OutOfOrderAck(int stream, uint16_t seq)
 {
-	auto now = Clock::now();
-	auto s = &m_streams[stream];
-	auto iter = s->sent_packets.find(seq);
-	if (iter != s->sent_packets.end()) {
-		uint64_t round_time = (uint64_t)std::chrono::duration_cast<std::chrono::milliseconds>(now - iter->second.last_sent).count();
-
-		m_stats.max_ping = std::max(m_stats.max_ping, round_time);
-		m_stats.min_ping = std::min(m_stats.min_ping, round_time);
-		m_stats.last_ping = round_time;
-		m_rolling_ping = (m_rolling_ping * 2 + round_time) / 3;
-
-		s->sent_packets.erase(iter);
+	if (stream < 0 || stream >= 4) {
+		return;
 	}
 
-	m_acked_since_last_resend = true;
-	m_last_ack = now;
+	auto now = Clock::now();
+	auto s = &m_streams[stream];
+	auto reliable_id = GetReliableOutgoingId(s, seq);
+	auto iter = s->sent_packets.find(reliable_id);
+
+	if (iter != s->sent_packets.end()) {
+		auto &packet = iter->second;
+		if (s->maxed_out_current_window) {
+			if (s->congestion_window_size < s->congestion_slow_start_threshold) {
+				s->congestion_window_size += s->max_reliable_data_size;
+			}
+			else {
+				s->congestion_window_size += std::max<size_t>(1, s->max_reliable_data_size * s->max_reliable_data_size / s->congestion_window_size);
+			}
+
+			s->congestion_window_largest = std::max(s->congestion_window_largest, s->congestion_window_size);
+		}
+
+		if (packet.times_resent == 0) {
+			uint64_t round_time = static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(now - packet.first_sent).count());
+			m_stats.max_ping = std::max(m_stats.max_ping, round_time);
+			m_stats.min_ping = std::min(m_stats.min_ping, round_time);
+			m_stats.last_ping = round_time;
+			m_rolling_ping = (m_rolling_ping * 3 + round_time) / 4;
+		}
+
+		s->last_timestamp_acknowledged = packet.first_sent;
+		s->outstanding_bytes -= std::min(s->outstanding_bytes, packet.data_length);
+
+		s->sent_packets.erase(iter);
+		AdvanceOutgoingWindow(s);
+		SendPendingPackets(stream);
+		ResetCongestionWindowIfIdle(s);
+	}
 }
 
 void EQ::Net::ReliableStreamConnection::UpdateDataBudget(double budget_add)
@@ -1324,24 +1769,62 @@ void EQ::Net::ReliableStreamConnection::SendDisconnect()
 
 void EQ::Net::ReliableStreamConnection::InternalBufferedSend(Packet &p)
 {
+	if (p.Length() == 0) {
+		return;
+	}
+
+	size_t encode_expansion = EncodeExpansionBytes(m_encode_passes);
+	size_t encoded_overhead = PacketCanBeEncoded(p) ? m_crc_bytes + encode_expansion : 0;
+	if (p.Length() + encoded_overhead > m_max_packet_size) {
+		return;
+	}
+
 	if (p.Length() > 0xFFU) {
 		FlushBuffer();
 		InternalSend(p);
 		return;
 	}
 
+	if (p.Length() >= ReliableStreamReliableHeader::size() && p.GetInt8(0) == 0 && p.GetInt8(1) >= OP_Ack && p.GetInt8(1) <= OP_Ack4) {
+		int stream_id = p.GetInt8(1) - OP_Ack;
+		if (m_owner->m_options.ack_deduping[stream_id]) {
+			for (auto iter = m_buffered_packets.rbegin(); iter != m_buffered_packets.rend(); ++iter) {
+				auto &buffered = *iter;
+				if (buffered.Length() < ReliableStreamReliableHeader::size() || buffered.GetInt8(0) != 0) {
+					continue;
+				}
+
+				if (buffered.GetInt8(1) == OP_OutOfOrderAck + stream_id) {
+					break;
+				}
+
+				if (buffered.GetInt8(1) == OP_Ack + stream_id) {
+					m_buffered_packets_length -= buffered.Length();
+					buffered.Clear();
+					buffered.PutPacket(0, p);
+					m_buffered_packets_length += buffered.Length();
+					return;
+				}
+			}
+		}
+	}
+
 	//we could add this packet to a combined
-	size_t raw_size = ReliableStreamHeader::size() + (size_t)m_crc_bytes + m_buffered_packets_length + m_buffered_packets.size() + 1 + p.Length();
+	size_t raw_size = ReliableStreamHeader::size() + (size_t)m_crc_bytes + encode_expansion + m_buffered_packets_length + m_buffered_packets.size() + 1 + p.Length();
 	if (raw_size > m_max_packet_size) {
 		FlushBuffer();
 	}
 
+	if (m_buffered_packets.empty()) {
+		m_hold_time = Clock::now();
+	}
+
 	DynamicPacket copy;
 	copy.PutPacket(0, p);
-	m_buffered_packets.push_back(copy);
+	m_buffered_packets.push_back(std::move(copy));
 	m_buffered_packets_length += p.Length();
 
-	if (m_buffered_packets_length + m_buffered_packets.size() > m_owner->m_options.hold_size) {
+	if (m_owner->m_options.hold_length_ms == 0 || m_buffered_packets_length + m_buffered_packets.size() > m_owner->m_options.hold_size) {
 		FlushBuffer();
 	}
 }
@@ -1351,7 +1834,7 @@ void EQ::Net::ReliableStreamConnection::SendConnect()
 	ReliableStreamConnect connect;
 	connect.zero = 0;
 	connect.opcode = OP_SessionRequest;
-	connect.protocol_version = HostToNetwork(3U);
+	connect.protocol_version = HostToNetwork(m_owner->m_options.protocol_version);
 	connect.connect_code = (uint32_t)HostToNetwork(m_connect_code);
 	connect.max_packet_size = HostToNetwork((uint32_t)m_owner->m_options.max_packet_size);
 
@@ -1409,9 +1892,15 @@ void EQ::Net::ReliableStreamConnection::InternalSend(Packet &p) {
 			switch (m_encode_passe) {
 				case EncodeCompression:
 					if (out.GetInt8(0) == 0) {
-						Compress(out, ReliableStreamHeader::size(), out.Length() - ReliableStreamHeader::size());
+						if (!Compress(out, ReliableStreamHeader::size(), out.Length() - ReliableStreamHeader::size())) {
+							send_buffer_pool.release(ctx);
+							return;
+						}
 					} else {
-						Compress(out, 1, out.Length() - 1);
+						if (!Compress(out, 1, out.Length() - 1)) {
+							send_buffer_pool.release(ctx);
+							return;
+						}
 					}
 					break;
 				case EncodeXOR:
@@ -1427,14 +1916,24 @@ void EQ::Net::ReliableStreamConnection::InternalSend(Packet &p) {
 		}
 
 		AppendCRC(out);
+		if (out.Length() > m_max_packet_size || out.Length() > UDP_BUFFER_SIZE) {
+			send_buffer_pool.release(ctx);
+			return;
+		}
+
 		memcpy(data, out.Data(), out.Length());
 		send_buffers[0] = uv_buf_init(data, out.Length());
 	} else {
+		if (p.Length() > m_max_packet_size || p.Length() > UDP_BUFFER_SIZE) {
+			send_buffer_pool.release(ctx);
+			return;
+		}
+
 		memcpy(data, p.Data(), p.Length());
 		send_buffers[0] = uv_buf_init(data, p.Length());
 	}
 
-	m_stats.sent_bytes += p.Length();
+	m_stats.sent_bytes += send_buffers[0].len;
 	m_stats.sent_packets++;
 
 	if (m_owner->m_options.simulated_out_packet_loss &&
@@ -1468,8 +1967,17 @@ void EQ::Net::ReliableStreamConnection::InternalSend(Packet &p) {
 
 void EQ::Net::ReliableStreamConnection::InternalQueuePacket(Packet &p, int stream_id, bool reliable)
 {
+	if (stream_id < 0 || stream_id >= 4 || p.Length() == 0 || m_status != StatusConnected) {
+		return;
+	}
+
 	if (!reliable) {
-		auto max_raw_size = 0xFFU - m_crc_bytes;
+		if (m_status != StatusConnected) {
+			return;
+		}
+
+		size_t encode_expansion = EncodeExpansionBytes(m_encode_passes);
+		auto max_raw_size = m_max_packet_size - m_crc_bytes - encode_expansion;
 		if (p.Length() > max_raw_size) {
 			InternalQueuePacket(p, stream_id, true);
 			return;
@@ -1480,35 +1988,27 @@ void EQ::Net::ReliableStreamConnection::InternalQueuePacket(Packet &p, int strea
 	}
 
 	auto stream = &m_streams[stream_id];
-	auto max_raw_size = m_max_packet_size - m_crc_bytes - ReliableStreamReliableHeader::size() - 1; // -1 for compress flag
+	auto max_raw_size = stream->max_reliable_data_size;
 	size_t length = p.Length();
 	if (length > max_raw_size) {
+		if (length > std::numeric_limits<uint32_t>::max() || length > m_owner->m_options.max_reassembled_packet_size) {
+			return;
+		}
+
 		ReliableStreamReliableFragmentHeader first_header;
 		first_header.reliable.zero = 0;
 		first_header.reliable.opcode = OP_Fragment + stream_id;
-		first_header.reliable.sequence = HostToNetwork(stream->sequence_out);
+		first_header.reliable.sequence = 0;
 		first_header.total_size = (uint32_t)HostToNetwork((uint32_t)length);
 
 		size_t used = 0;
-		size_t sublen = m_max_packet_size - m_crc_bytes - ReliableStreamReliableFragmentHeader::size() - 1; // -1 for compress flag
+		size_t sublen = max_raw_size - sizeof(uint32_t);
 		DynamicPacket first_packet;
 		first_packet.PutSerialize(0, first_header);
 		first_packet.PutData(ReliableStreamReliableFragmentHeader::size(), (char*)p.Data() + used, sublen);
 		used += sublen;
 
-		ReliableStreamSentPacket sent;
-		sent.packet.PutPacket(0, first_packet);
-		sent.last_sent = Clock::now();
-		sent.first_sent = Clock::now();
-		sent.times_resent = 0;
-		sent.resend_delay = EQ::Clamp(
-			static_cast<size_t>((m_rolling_ping * m_owner->m_options.resend_delay_factor) + m_owner->m_options.resend_delay_ms),
-			m_owner->m_options.resend_delay_min,
-			m_owner->m_options.resend_delay_max);
-		stream->sent_packets.emplace(std::make_pair(stream->sequence_out, sent));
-		stream->sequence_out++;
-
-		InternalBufferedSend(first_packet);
+		QueueReliablePacket(stream_id, first_packet, sublen);
 
 		while (used < length) {
 			auto left = length - used;
@@ -1516,7 +2016,7 @@ void EQ::Net::ReliableStreamConnection::InternalQueuePacket(Packet &p, int strea
 			ReliableStreamReliableHeader header;
 			header.zero = 0;
 			header.opcode = OP_Fragment + stream_id;
-			header.sequence = HostToNetwork(stream->sequence_out);
+			header.sequence = 0;
 			packet.PutSerialize(0, header);
 
 			if (left > max_raw_size) {
@@ -1528,19 +2028,7 @@ void EQ::Net::ReliableStreamConnection::InternalQueuePacket(Packet &p, int strea
 				used += left;
 			}
 
-			ReliableStreamSentPacket sent;
-			sent.packet.PutPacket(0, packet);
-			sent.last_sent = Clock::now();
-			sent.first_sent = Clock::now();
-			sent.times_resent = 0;
-			sent.resend_delay = EQ::Clamp(
-				static_cast<size_t>((m_rolling_ping * m_owner->m_options.resend_delay_factor) + m_owner->m_options.resend_delay_ms),
-				m_owner->m_options.resend_delay_min,
-				m_owner->m_options.resend_delay_max);
-			stream->sent_packets.emplace(std::make_pair(stream->sequence_out, sent));
-			stream->sequence_out++;
-
-			InternalBufferedSend(packet);
+			QueueReliablePacket(stream_id, packet, std::min(left, max_raw_size));
 		}
 	}
 	else {
@@ -1548,23 +2036,11 @@ void EQ::Net::ReliableStreamConnection::InternalQueuePacket(Packet &p, int strea
 		ReliableStreamReliableHeader header;
 		header.zero = 0;
 		header.opcode = OP_Packet + stream_id;
-		header.sequence = HostToNetwork(stream->sequence_out);
+		header.sequence = 0;
 		packet.PutSerialize(0, header);
 		packet.PutPacket(ReliableStreamReliableHeader::size(), p);
 
-		ReliableStreamSentPacket sent;
-		sent.packet.PutPacket(0, packet);
-		sent.last_sent = Clock::now();
-		sent.first_sent = Clock::now();
-		sent.times_resent = 0;
-		sent.resend_delay = EQ::Clamp(
-			static_cast<size_t>((m_rolling_ping * m_owner->m_options.resend_delay_factor) + m_owner->m_options.resend_delay_ms),
-			m_owner->m_options.resend_delay_min,
-			m_owner->m_options.resend_delay_max);
-		stream->sent_packets.emplace(std::make_pair(stream->sequence_out, sent));
-		stream->sequence_out++;
-
-		InternalBufferedSend(packet);
+		QueueReliablePacket(stream_id, packet, length);
 	}
 }
 
@@ -1575,7 +2051,7 @@ void EQ::Net::ReliableStreamConnection::FlushBuffer()
 	}
 
 	if (m_buffered_packets.size() > 1) {
-		StaticPacket out(m_combined.get(), 512);
+		StaticPacket out(m_combined.get(), m_max_packet_size);
 		size_t length = 2;
 		for (auto &p : m_buffered_packets) {
 			out.PutUInt8(length, (uint8_t)p.Length());
@@ -1604,14 +2080,14 @@ EQ::Net::SequenceOrder EQ::Net::ReliableStreamConnection::CompareSequence(uint16
 	}
 
 	if (diff > 0) {
-		if (diff > 10000) {
+		if (diff > MAX_RELIABLE_SEQUENCE_DISTANCE) {
 			return SequencePast;
 		}
 
 		return SequenceFuture;
 	}
 
-	if (diff < -10000) {
+	if (diff < -MAX_RELIABLE_SEQUENCE_DISTANCE) {
 		return SequenceFuture;
 	}
 

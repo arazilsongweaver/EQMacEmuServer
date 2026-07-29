@@ -85,7 +85,7 @@
 #include "../common/ip_util.h"
 
 TimeoutManager      timeout_manager;
-EQStreamFactory     eqsf(WorldStream,9000);
+EQStreamFactory     eqsf(9000);
 LauncherList        launcher_list; 
 volatile bool       RunLoops = true;
 uint32              numclients = 0;
@@ -338,7 +338,6 @@ int main(int argc, char** argv) {
 	Timer InterserverTimer(INTERSERVER_TIMER); // does MySQL pings and auto-reconnect
 	InterserverTimer.Trigger();
 	uint8                        ReconnectCounter = 100;
-	std::shared_ptr<EQStream>    eqs;
 	std::shared_ptr<EQOldStream> eqos;
 	EQStreamInterface            *eqsi;
 
@@ -357,22 +356,7 @@ int main(int argc, char** argv) {
 		//give the stream identifier a chance to do its work....
 		stream_identifier.Process();
 
-		int i = 5;
-		//check the factory for any new incoming streams.
-		while ((eqs = eqsf.Pop())) {
-			//pull the stream out of the factory and give it to the stream identifier
-			//which will figure out what patch they are running, and set up the dynamic
-			//structures and opcodes for that patch.
-			struct in_addr	in{};
-			in.s_addr = eqs->GetRemoteIP();
-			LogInfo("New connection from {0}:{1}", inet_ntoa(in),ntohs(eqs->GetRemotePort()));
-			stream_identifier.AddStream(eqs);	//takes the stream
-			i++;
-			if (i == 5)
-				break;
-		}
-
-		i = 0;
+		int i = 0;
 		//check the factory for any new incoming streams.
 		while ((eqos = eqsf.PopOld())) {
 			//pull the stream out of the factory and give it to the stream identifier
@@ -401,7 +385,7 @@ int main(int argc, char** argv) {
 					ClientList::Instance()->Add(client);
 				} else {
 					LogInfo("Connection from [{0}] FAILED banned IPs check. Closing connection.", inet_ntoa(in));
-					eqsi->Close(); //Lieka: If the inbound IP is on the banned table, close the EQStream.
+					eqsi->Close(); //Lieka: If the inbound IP is on the banned table, close the stream.
 				}
 			}
 			if (!RuleB(World, UseBannedIPsTable)){

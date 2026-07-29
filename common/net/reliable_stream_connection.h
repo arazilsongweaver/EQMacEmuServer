@@ -44,7 +44,9 @@ namespace EQ
 			OP_Ack4 = 0x18,
 			OP_AppCombined = 0x19,
 			OP_OutboundPing = 0x1c,
-			OP_OutOfSession = 0x1d
+			OP_UnreachableConnection = 0x1d,
+			OP_OutOfSession = OP_UnreachableConnection, // Legacy EQEmu name.
+			OP_RequestRemap = 0x1e
 		};
 
 		enum DbProtocolStatus
@@ -86,6 +88,7 @@ namespace EQ
 				min_ping = 0xFFFFFFFFFFFFFFFFUL;
 				max_ping = 0;
 				avg_ping = 0;
+				last_ping = 0;
 				created = Clock::now();
 				dropped_datarate_packets = 0;
 				resent_packets = 0;
@@ -102,6 +105,7 @@ namespace EQ
 				min_ping = 0xFFFFFFFFFFFFFFFFUL;
 				max_ping = 0;
 				avg_ping = 0;
+				last_ping = 0;
 				created = Clock::now();
 				dropped_datarate_packets = 0;
 				resent_packets = 0;
@@ -181,12 +185,11 @@ namespace EQ
 			size_t m_rolling_ping;
 			Timestamp m_close_time;
 			double m_outgoing_budget;
+			bool m_silent_disconnect;
 
 			// resend tracking
 			size_t m_resend_packets_sent = 0;
 			size_t m_resend_bytes_sent = 0;
-			bool m_acked_since_last_resend = false;
-			Timestamp m_last_ack;
 
 			struct ReliableStreamSentPacket
 			{
@@ -194,7 +197,13 @@ namespace EQ
 				Timestamp last_sent;
 				Timestamp first_sent;
 				size_t times_resent;
-				size_t resend_delay;
+				size_t data_length;
+			};
+
+			struct ReliableStreamPendingPacket
+			{
+				DynamicPacket packet;
+				size_t data_length;
 			};
 
 			struct ReliableStream
@@ -202,19 +211,46 @@ namespace EQ
 				ReliableStream() {
 					sequence_in = 0;
 					sequence_out = 0;
+					sequence_out_pending = 0;
+					pending_bytes = 0;
+					outstanding_bytes = 0;
+					max_reliable_data_size = 0;
+					congestion_window_minimum = 0;
+					congestion_window_start = 0;
+					congestion_window_size = 0;
+					congestion_window_largest = 0;
+					congestion_slow_start_threshold = 0;
+					maxed_out_current_window = false;
+					ResetFragment();
+				}
+
+				void ResetFragment() {
+					fragment_packet.Clear();
 					fragment_current_bytes = 0;
 					fragment_total_bytes = 0;
 				}
 
 				uint16_t sequence_in;
-				uint16_t sequence_out;
-				std::map<uint16_t, Packet*> packet_queue;
+				int64_t sequence_out;
+				int64_t sequence_out_pending;
+				std::map<uint16_t, DynamicPacket> packet_queue;
 
 				DynamicPacket fragment_packet;
 				uint32_t fragment_current_bytes;
 				uint32_t fragment_total_bytes;
 
-				std::map<uint16_t, ReliableStreamSentPacket> sent_packets;
+				std::queue<ReliableStreamPendingPacket> pending_packets;
+				std::map<int64_t, ReliableStreamSentPacket> sent_packets;
+				size_t pending_bytes;
+				size_t outstanding_bytes;
+				size_t max_reliable_data_size;
+				size_t congestion_window_minimum;
+				size_t congestion_window_start;
+				size_t congestion_window_size;
+				size_t congestion_window_largest;
+				size_t congestion_slow_start_threshold;
+				bool maxed_out_current_window;
+				Timestamp last_timestamp_acknowledged;
 			};
 
 			ReliableStream m_streams[4];
@@ -226,18 +262,27 @@ namespace EQ
 			void RemoveFromQueue(int stream, uint16_t seq);
 			void AddToQueue(int stream, uint16_t seq, const Packet &p);
 			void ProcessDecodedPacket(const Packet &p);
+			void RejectInvalidFragment(ReliableStream *stream, const char *reason);
 			void ChangeStatus(DbProtocolStatus new_status);
 			bool ValidateCRC(Packet &p);
 			void AppendCRC(Packet &p);
 			bool PacketCanBeEncoded(Packet &p) const;
 			void Decode(Packet &p, size_t offset, size_t length);
 			void Encode(Packet &p, size_t offset, size_t length);
-			void Decompress(Packet &p, size_t offset, size_t length);
-			void Compress(Packet &p, size_t offset, size_t length);
+			bool Decompress(Packet &p, size_t offset, size_t length);
+			bool Compress(Packet &p, size_t offset, size_t length);
 			void ProcessResend();
 			void ProcessResend(int stream);
 			void Ack(int stream, uint16_t seq);
 			void OutOfOrderAck(int stream, uint16_t seq);
+			void QueueReliablePacket(int stream, const Packet &p, size_t data_length);
+			void SendPendingPackets(int stream);
+			void AdvanceOutgoingWindow(ReliableStream *stream);
+			int64_t GetReliableOutgoingId(const ReliableStream *stream, uint16_t reliable_stamp) const;
+			void InitializeReliableStreams();
+			void ResetCongestionWindowIfIdle(ReliableStream *stream);
+			void DiscardTransportQueues();
+			size_t TotalPendingReliableBytes() const;
 			void UpdateDataBudget(double budget_add);
 
 			void SendConnect();
@@ -258,6 +303,28 @@ namespace EQ
 		{
 			ReliableStreamConnectionManagerOptions() {
 				max_connection_count = 0;
+				max_reassembled_packet_size = 20 * 1024 * 1024;
+				reliable_overflow_bytes = 0;
+				max_instanding_packets[0] = 400;
+				max_instanding_packets[1] = 400;
+				max_instanding_packets[2] = 400;
+				max_instanding_packets[3] = 400;
+				max_outstanding_packets[0] = 400;
+				max_outstanding_packets[1] = 400;
+				max_outstanding_packets[2] = 400;
+				max_outstanding_packets[3] = 400;
+				max_outstanding_bytes[0] = 200 * 1024;
+				max_outstanding_bytes[1] = 200 * 1024;
+				max_outstanding_bytes[2] = 200 * 1024;
+				max_outstanding_bytes[3] = 200 * 1024;
+				congestion_window_minimum[0] = 0;
+				congestion_window_minimum[1] = 0;
+				congestion_window_minimum[2] = 0;
+				congestion_window_minimum[3] = 0;
+				ack_deduping[0] = true;
+				ack_deduping[1] = true;
+				ack_deduping[2] = true;
+				ack_deduping[3] = true;
 				keepalive_delay_ms = 9000;
 				resend_delay_ms = 30;
 				resend_delay_factor = 1.25;
@@ -267,6 +334,7 @@ namespace EQ
 				stale_connection_ms = 60000;
 				connect_stale_ms = 5000;
 				crc_length = 2;
+				protocol_version = 3;
 				max_packet_size = 512;
 				encode_passes[0] = ReliableStreamEncodeType::EncodeNone;
 				encode_passes[1] = ReliableStreamEncodeType::EncodeNone;
@@ -283,6 +351,13 @@ namespace EQ
 
 			size_t max_packet_size;
 			size_t max_connection_count;
+			size_t max_reassembled_packet_size;
+			size_t reliable_overflow_bytes;
+			size_t max_instanding_packets[4]; // "instanding" is the name used in Sony's original UdpLibrary.
+			size_t max_outstanding_packets[4];
+			size_t max_outstanding_bytes[4];
+			size_t congestion_window_minimum[4];
+			bool ack_deduping[4];
 			size_t keepalive_delay_ms;
 			double resend_delay_factor;
 			size_t resend_delay_ms;
@@ -292,6 +367,7 @@ namespace EQ
 			size_t connect_stale_ms;
 			size_t stale_connection_ms;
 			size_t crc_length;
+			uint32_t protocol_version;
 			size_t hold_size;
 			size_t hold_length_ms;
 			size_t simulated_in_packet_loss;
@@ -338,7 +414,7 @@ namespace EQ
 
 			void ProcessPacket(const std::string &endpoint, int port, const char *data, size_t size);
 			std::shared_ptr<ReliableStreamConnection> FindConnectionByEndpoint(std::string addr, int port);
-			void SendDisconnect(const std::string &addr, int port);
+			void SendUnreachableConnection(const std::string &addr, int port);
 
 			friend class ReliableStreamConnection;
 		};

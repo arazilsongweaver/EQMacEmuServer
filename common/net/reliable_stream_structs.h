@@ -70,7 +70,9 @@ namespace EQ
 
 		struct ReliableStreamDisconnect
 		{
-			static size_t size() { return 8; }
+			// The disconnect reason added by later UdpLibrary versions is optional.
+			// This structure is the original six-byte, backward-compatible form.
+			static size_t size() { return 6; }
 			uint8_t zero;
 			uint8_t opcode;
 			uint32_t connect_code;

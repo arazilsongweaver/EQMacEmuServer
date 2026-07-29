@@ -60,7 +60,6 @@ struct FRAGMENT_INFO
 };
 
 class EQPacket : public BasePacket {
-	friend class EQStream;
 	friend class EQOldStream;
 public:
 	virtual ~EQPacket() {}
@@ -90,18 +89,10 @@ protected:
 class EQRawApplicationPacket;
 
 class EQProtocolPacket : public BasePacket {
-	friend class EQStream;
 	friend class EQOldStream;
 	friend class EQStreamPair;
 public:
-	EQProtocolPacket(uint16 op, const unsigned char *buf, uint32 len) : BasePacket(buf,len), opcode(op) { acked = false; }
-//	EQProtocolPacket(const unsigned char *buf, uint32 len);
-	bool combine(const EQProtocolPacket *rhs);
-	uint32 serialize (unsigned char *dest) const;
-	EQProtocolPacket *Copy() { return new EQProtocolPacket(opcode,pBuffer,size); }
-	EQRawApplicationPacket *MakeAppPacket() const;
-
-	bool acked;
+	EQProtocolPacket(uint16 op, const unsigned char *buf, uint32 len) : BasePacket(buf,len), opcode(op) {}
 
 	virtual void build_raw_header_dump(char *buffer, uint16 seq=0xffff) const;
 	virtual void build_header_dump(char *buffer) const;
@@ -111,22 +102,12 @@ public:
 	uint16 GetRawOpcode() const { return(opcode); }
 
 protected:
-
-	static bool ValidateCRC(const unsigned char *buffer, int length, uint32 Key);
-	static uint32 Decompress(const unsigned char *buffer, const uint32 length, unsigned char *newbuf, uint32 newbufsize);
-	static uint32 Compress(const unsigned char *buffer, const uint32 length, unsigned char *newbuf, uint32 newbufsize);
-	static void ChatDecode(unsigned char *buffer, int size, int DecodeKey);
-	static void ChatEncode(unsigned char *buffer, int size, int EncodeKey);
-
-	uint32 Size() const { return size+2; }
-
 	//the actual raw EQ opcode
 	uint16 opcode;
 };
 
 //Old (2001-era) packet
 class EQOldPacket {
-	friend class EQStream;
 	friend class EQStreamPair;
 public:
 	EQOldPacket();
@@ -193,7 +174,6 @@ private:
 };
 
 class EQApplicationPacket : public EQPacket {
-	friend class EQStream;
 public:
 	EQApplicationPacket() : EQPacket(OP_Unknown, nullptr, 0), opcode_bypass(0)
 		{ app_opcode_size = GetExecutablePlatform() == ExePlatformUCS ? 1 : 2; }
@@ -204,7 +184,6 @@ public:
 	EQApplicationPacket(const EmuOpcode op, const unsigned char *buf, const uint32 len) : EQPacket(op, buf, len), opcode_bypass(0)
 		{ app_opcode_size = GetExecutablePlatform() == ExePlatformUCS ? 1 : 2; }
 	bool combine(const EQApplicationPacket *rhs);
-	uint32 serialize (uint16 opcode, unsigned char *dest) const;
 	uint32 Size() const { return size+app_opcode_size; }
 
 	virtual EQApplicationPacket *Copy() const;
@@ -230,7 +209,6 @@ private:
 };
 
 class EQRawApplicationPacket : public EQApplicationPacket {
-	friend class EQStream;
 public:
 	EQRawApplicationPacket(uint16 opcode, const unsigned char *buf, const uint32 len);
 	uint16 GetRawOpcode() const { return(opcode); }
@@ -244,8 +222,6 @@ protected:
 
 	//the actual raw EQ opcode
 	uint16 opcode;
-
-	EQRawApplicationPacket(const unsigned char *buf, const uint32 len);
 };
 
 extern void DumpPacket(const EQApplicationPacket* app, bool iShowInfo = true);

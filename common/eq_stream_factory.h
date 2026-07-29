@@ -13,10 +13,8 @@
 #include "../common/condition.h"
 #include "../common/timeoutmgr.h"
 
-class EQStream;
 class Timer;
 
-using EQStreamIterator = std::map<std::pair<uint32, uint16>, std::shared_ptr<EQStream>>::iterator;
 using EQOldStreamIterator = std::map<std::pair<uint32, uint16>, std::shared_ptr<EQOldStream>>::iterator;
 
 class RecvBuffer {
@@ -47,22 +45,13 @@ class EQStreamFactory : private Timeoutable {
 
 		bool ReaderRunning;
 		std::mutex MReaderRunning;
-		bool WriterRunningNew;
 		bool WriterRunningOld;
-		std::mutex MWriterRunningNew;
 		std::mutex MWriterRunningOld;
 
-		std::condition_variable WriterWorkNew;
 		std::condition_variable WriterWorkOld;
 
-		EQStreamType StreamType;
-
-		std::queue<std::shared_ptr<EQStream>> NewStreams;
-		std::mutex MNewStreams;
 		std::mutex MNewOldStreams;
 
-		std::map<std::pair<uint32, uint16>, std::shared_ptr<EQStream>> Streams;
-		std::mutex MStreams;
 		std::mutex MOldStreams;
 
 		std::queue<std::shared_ptr<EQOldStream>> NewOldStreams;
@@ -70,21 +59,21 @@ class EQStreamFactory : private Timeoutable {
 		std::map<std::pair<uint32, uint16>, std::shared_ptr<EQOldStream>> OldStreams;
 
 		std::thread ReaderThread;
-		std::thread WriterNewThread;
 		std::thread WriterOldThread;
 
 		virtual void CheckTimeout();
 
-		Timer *DecayTimer;
-
 		uint32 stream_timeout;
 
 	public:
-		EQStreamFactory(EQStreamType type, uint32 timeout = 61000) : Timeoutable(5000), stream_timeout(timeout) { ReaderRunning=false; WriterRunningNew=false; WriterRunningOld=false; StreamType=type; sock=-1; }
-		EQStreamFactory(EQStreamType type, int port, uint32 timeout = 61000);
-
-		std::shared_ptr<EQStream> Pop();
-		void Push(std::shared_ptr<EQStream> s);
+		EQStreamFactory() : Timeoutable(5000), stream_timeout(61000)
+		{
+			ReaderRunning = false;
+			WriterRunningOld = false;
+			Port = 0;
+			sock = -1;
+		}
+		EQStreamFactory(int port, uint32 timeout = 61000);
 
 		std::shared_ptr<EQOldStream> PopOld();
 		void PushOld(std::shared_ptr<EQOldStream> s);
@@ -94,15 +83,11 @@ class EQStreamFactory : private Timeoutable {
 		bool IsOpen() { return sock!=-1; }
 		void Close();
 		void ReaderLoop();
-		void ProcessLoopNew(const RecvBuffer& recvBuffer, EQStreamIterator iterator);
 		void ProcessLoopOld(const RecvBuffer& recvBuffer, EQOldStreamIterator iterator);
-		void WriterLoopNew();
 		void WriterLoopOld();
 		void Stop();
 		void StopReader();
-		void StopWriterNew();
 		void StopWriterOld();
-		void SignalWriterNew();
 		void SignalWriterOld();
 };
 

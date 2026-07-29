@@ -36,7 +36,7 @@ void CheckOldOpcodeFile(const std::string& path) {
 ClientManager::ClientManager()
 {
 	int old_port = server.config.GetVariableInt("Old", "port", 6000);
-	old_stream = new EQStreamFactory(OldStream, old_port);
+	old_stream = new EQStreamFactory(old_port);
 	old_ops = new RegularOpcodeManager;
 
 	std::string opcodes_path = fmt::format(

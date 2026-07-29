@@ -8,7 +8,6 @@ SET(common_sources
     condition.cpp
     content/world_content_service.cpp
     crash.cpp
-    crc16.cpp
     crc32.cpp
     database/database_dump_service.cpp
     database.cpp
@@ -367,7 +366,6 @@ SET(common_headers
     condition.h
     content/world_content_service.h
     crash.h
-    crc16.h
     crc32.h
     data_verification.h
     database.h

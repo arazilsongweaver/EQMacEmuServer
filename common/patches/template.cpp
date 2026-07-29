@@ -31,17 +31,17 @@ void Register(EQStreamIdentifier &into) {
 
 	//ok, now we have what we need to register.
 
-	EQStream::Signature signature;
+	EQStreamInterface::Signature signature;
 
 	//register our world signature.
 	signature.first_length = sizeof(structs::LoginInfo_Struct);
 	signature.first_eq_opcode = opcodes->EmuToEQ(OP_SendLoginInfo);
-	into.RegisterPatch(signature, name, &opcodes, &struct_strategy);
+	into.RegisterOldPatch(signature, name, &opcodes, &struct_strategy);
 
 	//register our zone signature.
 	signature.first_length = sizeof(structs::ClientZoneEntry_Struct);
 	signature.first_eq_opcode = opcodes->EmuToEQ(OP_ZoneEntry);
-	into.RegisterPatch(signature, name, &opcodes, &struct_strategy);
+	into.RegisterOldPatch(signature, name, &opcodes, &struct_strategy);
 }
 
 void Reload() {

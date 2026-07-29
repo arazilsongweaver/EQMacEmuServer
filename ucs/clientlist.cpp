@@ -193,10 +193,21 @@ Clientlist::Clientlist(int ChatPort) {
 	EQStreamManagerInterfaceOptions chat_opts(ChatPort, false, false);
 	chat_opts.opcode_size = 1;
 	chat_opts.reliable_stream_options.stale_connection_ms = 600000;
+	chat_opts.reliable_stream_options.protocol_version = 2;
+	// EQMac ChannelServerApi configures reliable channel 1 for 24 outstanding and 24 "instanding"
+	// packets, a 10,000-byte send window, and no low-level packet hold delay.
+	chat_opts.reliable_stream_options.max_outstanding_packets[0] = 24;
+	chat_opts.reliable_stream_options.max_instanding_packets[0] = 24;
+	chat_opts.reliable_stream_options.max_outstanding_bytes[0] = 10000;
+	chat_opts.reliable_stream_options.hold_length_ms = 0;
 	chat_opts.reliable_stream_options.resend_delay_ms = RuleI(Network, ResendDelayBaseMS);
 	chat_opts.reliable_stream_options.resend_delay_factor = RuleR(Network, ResendDelayFactor);
 	chat_opts.reliable_stream_options.resend_delay_min = RuleI(Network, ResendDelayMinMS);
 	chat_opts.reliable_stream_options.resend_delay_max = RuleI(Network, ResendDelayMaxMS);
+	int max_connections = RuleI(Chat, MaxUCSConnections);
+	if (max_connections > 0) {
+		chat_opts.reliable_stream_options.max_connection_count = static_cast<size_t>(max_connections);
+	}
 
 	chatsf = new EQ::Net::EQStreamManager(chat_opts);
 
