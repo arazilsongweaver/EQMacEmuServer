@@ -744,8 +744,11 @@ bool Client::HandleChecksumPacket(const EQApplicationPacket *app)
 		else if(checksum == 29639760219562021) {
 			LogInfo( "Exe Checksum is GOOD!");
 		}
+		else if(checksum == 1367795807964048) {
+			LogInfo( "Updated Exe Checksum is GOOD!");
+		}
 		else {
-			LogInfo( "Checksum is BAD!");
+			LogInfo( "Checksum is BAD! ({})", checksum);
 			return false;
 		}
 	}
