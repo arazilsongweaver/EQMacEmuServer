@@ -35,11 +35,14 @@
 #include "../common/version.h"
 #include "../common/eqtime.h"
 #include "../common/event/event_loop.h"
-#include "../common/eq_stream_factory.h"
-#include "../common/net/eqstream.h"
+#include "../common/eq_packet_translator.h"
 #include "../common/opcodemgr.h"
 #include "../common/guilds.h"
-#include "../common/eq_stream_ident.h"
+#include "../common/patches/mac.h"
+#include "../common/rdp/rdp_connection.h"
+#include "../common/rdp/rdp_endpoint.h"
+#include "../common/rdp/rdp_runtime.h"
+#include "../common/rdp/rdp_stream.h"
 #include "../common/rulesys.h"
 #include "../common/platform.h"
 #include "../common/crash.h"
@@ -61,7 +64,6 @@
 
 #endif
 
-#include "../common/patches/patches.h"
 #include "zoneserver.h"
 #include "login_server.h"
 #include "login_server_list.h"
@@ -82,10 +84,11 @@
 #include "../common/path_manager.h"
 #include "../common/events/player_event_logs.h"
 #include "../common/skill_caps.h"
-#include "../common/ip_util.h"
 
-TimeoutManager      timeout_manager;
-EQStreamFactory     eqsf(9000);
+#include <memory>
+#include <new>
+#include <utility>
+
 LauncherList        launcher_list; 
 volatile bool       RunLoops = true;
 uint32              numclients = 0;
@@ -167,11 +170,6 @@ int main(int argc, char** argv) {
 	launcher_list.LoadList();
 	ZSList::Instance()->Init();
 
-	if (IpUtil::IsPortInUse(Config->WorldIP, Config->WorldTCPPort)) {
-		LogError("World port [{}] already in use", Config->WorldTCPPort);
-		return 1;
-	}
-
 	std::unique_ptr<EQ::Net::ConsoleServer> console;
 	if (Config->TelnetEnabled) {
 		LogInfo("Console (TCP) listener started on [{}:{}]", Config->TelnetIP, Config->TelnetTCPPort);
@@ -188,7 +186,16 @@ int main(int argc, char** argv) {
 	server_opts.port        = Config->WorldTCPPort;
 	server_opts.ipv6        = false;
 	server_opts.credentials = Config->SharedKey;
-	server_connection->Listen(server_opts);
+	int server_listen_result = server_connection->Listen(server_opts);
+	if (server_listen_result != 0) {
+		LogError(
+			"Failed to start Server (TCP) listener on port [{}]: [{}] ({})",
+			Config->WorldTCPPort,
+			uv_err_name(server_listen_result),
+			uv_strerror(server_listen_result)
+		);
+		return 1;
+	}
 	LogInfo("Server (TCP) listener started on port [{}]", Config->WorldTCPPort);
 		
 	server_connection->OnConnectionIdentified(
@@ -321,25 +328,39 @@ int main(int argc, char** argv) {
 
 	WorldBoot::CheckForPossibleConfigurationIssues();
 
-	if (eqsf.Open()) {
-		LogInfo("Client (UDP) listener started.");
-	} else {
-		LogInfo("Failed to start client (UDP) listener (port 9000)");
+	// Load opcodes and configure packet encode/decode.
+	std::string opcode_file = fmt::format("{}/patch_Mac.conf", PathManager::Instance()->GetPatchPath());
+	EQPacketTranslator packet_translator;
+	if (!packet_translator.LoadOpcodes(opcode_file.c_str())) {
+		LogError("Failed to load opcode file [{}]", opcode_file);
+		return 1;
+	}
+	Mac::Register(packet_translator);
+
+	RDPRuntime rdp_runtime;
+	int rdp_result = rdp_runtime.Open();
+	if (rdp_result != RDPLIB_OK) {
+		LogError("Failed to open the RDP runtime, result [{}]", rdp_result);
 		return 1;
 	}
 
-	//register all the patches we have avaliable with the stream identifier.
-	EQStreamIdentifier stream_identifier;
-	RegisterAllPatches(stream_identifier);
+	static constexpr uint16 WorldClientPort = 9000;
+	static constexpr uint32 MaximumWorldClientAcceptsPerTick = 5;
+	RDPEndpoint rdp_endpoint;
+	rdp_result = rdp_endpoint.Open(rdp_runtime, WorldClientPort);
+	if (rdp_result != RDPLIB_OK) {
+		LogError("Failed to start client RDP listener on port [{}], result [{}]", WorldClientPort, rdp_result);
+		return 1;
+	}
+	LogInfo("Client (RDP/UDP) listener started on port [{}]", WorldClientPort);
+
 	ZSList::Instance()->shutdowntimer = new Timer(60000);
 	ZSList::Instance()->shutdowntimer->Disable();
 	ZSList::Instance()->reminder = new Timer(20000);
 	ZSList::Instance()->reminder->Disable();
 	Timer InterserverTimer(INTERSERVER_TIMER); // does MySQL pings and auto-reconnect
 	InterserverTimer.Trigger();
-	uint8                        ReconnectCounter = 100;
-	std::shared_ptr<EQOldStream> eqos;
-	EQStreamInterface            *eqsi;
+	uint8 ReconnectCounter = 100;
 
 	if (PlayerEventLogs::Instance()->LoadDatabaseConnection()) {
 		PlayerEventLogs::Instance()->Init();
@@ -353,51 +374,73 @@ int main(int argc, char** argv) {
 			return;
 		}
 
-		//give the stream identifier a chance to do its work....
-		stream_identifier.Process();
-
-		int i = 0;
-		//check the factory for any new incoming streams.
-		while ((eqos = eqsf.PopOld())) {
-			//pull the stream out of the factory and give it to the stream identifier
-			//which will figure out what patch they are running, and set up the dynamic
-			//structures and opcodes for that patch.
-			struct in_addr	in{};
-			in.s_addr = eqos->GetRemoteIP();
-			LogInfo("New connection from {0}:{1}", inet_ntoa(in), ntohs(eqos->GetRemotePort()));
-			stream_identifier.AddOldStream(eqos);	//takes the stream
-			i++;
-			if (i == 5)
-				break;
+		int process_result = rdp_endpoint.Process();
+		if (process_result < 0) {
+			LogError("Unable to process the world RDP endpoint, result [{}]", process_result);
+			RunLoops = false;
+			return;
 		}
 
-		//check the stream identifier for any now-identified streams
-		while((eqsi = stream_identifier.PopIdentified())) {
-			//now that we know what patch they are running, start up their client object
-			struct in_addr	in{};
-			in.s_addr = eqsi->GetRemoteIP();
-			if (RuleB(World, UseBannedIPsTable)){ //Lieka: Check to see if we have the responsibility for blocking IPs.
-				LogInfo("Checking inbound connection [{0}] against BannedIPs table", inet_ntoa(in));
-				if (!database.CheckBannedIPs(inet_ntoa(in))){ //Lieka: Check inbound IP against banned IP table.
-					LogInfo("Connection [{0}] PASSED banned IPs check. Processing connection.", inet_ntoa(in));
-					auto client = new Client(eqsi);
-					// @merth: client->zoneattempt=0;
-					ClientList::Instance()->Add(client);
-				} else {
-					LogInfo("Connection from [{0}] FAILED banned IPs check. Closing connection.", inet_ntoa(in));
-					eqsi->Close(); //Lieka: If the inbound IP is on the banned table, close the stream.
+		int accept_result = RDPLIB_OK;
+		for (uint32 accepted_connections = 0;
+			 accepted_connections < MaximumWorldClientAcceptsPerTick;
+			 ++accepted_connections) {
+			std::unique_ptr<RDPConnection> connection(rdp_endpoint.Accept(&accept_result));
+			if (connection == nullptr)
+				break;
+
+			uint8 remote_address[4] = {};
+			uint16 remote_port = 0;
+			int setup_result = connection->GetRemoteAddress(remote_address, remote_port);
+			struct in_addr in = {};
+			if (setup_result == RDPLIB_OK)
+				memcpy(&in.s_addr, remote_address, sizeof(in.s_addr));
+
+			if (setup_result != RDPLIB_OK) {
+				LogError("Unable to read a new world RDP client's address, result [{}]", setup_result);
+				continue;
+			}
+
+			std::string remote_ip = inet_ntoa(in);
+			if (RuleB(World, UseBannedIPsTable)) {
+				LogInfo("Checking inbound connection [{}] against BannedIPs table", remote_ip);
+				if (database.CheckBannedIPs(remote_ip.c_str())) {
+					LogInfo("Connection from [{}] FAILED banned IPs check. Closing connection.", remote_ip);
+					connection->Close(0);
+					continue;
 				}
+				LogInfo("Connection [{}] PASSED banned IPs check. Processing connection.", remote_ip);
 			}
-			if (!RuleB(World, UseBannedIPsTable)){
-				LogInfo(
-					"New connection from [{}]:[{}], processing connection",
-					inet_ntoa(in),
-					ntohs(eqsi->GetRemotePort())
-				);
-				auto client = new Client(eqsi);
-				// @merth: client->zoneattempt=0;
-				ClientList::Instance()->Add(client);
+
+			std::unique_ptr<RDPStream> stream;
+			try {
+				stream.reset(new RDPStream(packet_translator, std::move(connection)));
 			}
+			catch (const std::bad_alloc &) {
+				accept_result = RDPLIB_ERROR_OUT_OF_MEMORY;
+				break;
+			}
+
+			setup_result = stream->EnableKeepalive();
+			if (setup_result == RDPLIB_OK)
+				setup_result = stream->SetDataRate();
+			if (setup_result == RDPLIB_OK)
+				setup_result = stream->SetSendBufferSize();
+
+			if (setup_result != RDPLIB_OK) {
+				LogError("Unable to configure a new world RDP client, result [{}]", setup_result);
+				stream->Close(0);
+				continue;
+			}
+
+			LogInfo("New connection from [{}]:[{}], processing connection", remote_ip, remote_port);
+			ClientList::Instance()->Add(new Client(std::move(stream)));
+		}
+
+		if (accept_result != RDPLIB_OK) {
+			LogError("Unable to accept a world RDP client, result [{}]", accept_result);
+			RunLoops = false;
+			return;
 		}
 
 		WorldEventScheduler::Instance()->Process(ZSList::Instance());
@@ -421,8 +464,6 @@ int main(int argc, char** argv) {
 			}
 		}
 
-		//check for timeouts in other threads
-		timeout_manager.CheckTimeouts();
 		ZSList::Instance()->Process();
 		launcher_list.Process();
 
@@ -456,14 +497,26 @@ int main(int argc, char** argv) {
 	EQ::EventLoop::Get().Run();
 
 	LogInfo("World main loop completed.");
+	LogInfo("Shutting down game clients.");
+	ClientList::Instance()->Clear();
 	LogInfo("Shutting down zone connections (if any).");
 	ZSList::Instance()->KillAll();
 	LogInfo("Zone (TCP) listener stopped.");
-	LogInfo("Client (UDP) listener stopped.");
-	eqsf.Close();
+
+	rdp_result = rdp_endpoint.Close();
+	if (rdp_result != RDPLIB_OK)
+		LogError("Failed to close the world RDP endpoint, result [{}]", rdp_result);
+
+	int runtime_close_result = rdp_runtime.Close();
+	if (runtime_close_result != RDPLIB_OK)
+		LogError("Failed to close the world RDP runtime, result [{}]", runtime_close_result);
+	if (rdp_result == RDPLIB_OK)
+		rdp_result = runtime_close_result;
+
+	LogInfo("Client (RDP/UDP) listener stopped.");
 	LogSys.CloseFileLogs();
 
-	return 0;
+	return rdp_result == RDPLIB_OK ? 0 : 1;
 }
 
 void CatchSignal(int sig_num) {

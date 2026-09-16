@@ -18,9 +18,9 @@
 #ifndef CLIENT_H
 #define CLIENT_H
 
+#include <memory>
 #include <string>
 
-//#include "../common/eq_stream.h"
 #include "../common/linked_list.h"
 #include "../common/timer.h"
 //#include "zoneserver.h"
@@ -31,11 +31,12 @@
 #define CLIENT_TIMEOUT 30000
 
 class EQApplicationPacket;
-class EQStreamInterface;
+class RDPStream;
 
-class Client {
+class Client
+{
 public:
-	Client(EQStreamInterface* ieqs);
+	Client(std::unique_ptr<RDPStream> stream);
 	~Client();
 
 	bool	Process();
@@ -45,7 +46,7 @@ public:
 	void	QueuePacket(const EQApplicationPacket* app, bool ack_req = true);
 	void	Clearance(int8 response);
 	void	SendGuildList();
-	void	SendEnterWorld(std::string name);
+	bool	SendEnterWorld(std::string name);
 	void	SendExpansionInfo();
 	void	SendLogServer();
 	void	SendApproveWorld();
@@ -66,17 +67,32 @@ public:
 	inline void			SetCLE(ClientListEntry* iCLE)			{ cle = iCLE; }
 	inline uint16		GetExpansion()		{ return expansion; }
 	inline uint32		GetClientVersionBit() { return m_ClientVersionBit; }
-	inline bool			GetSessionLimit();
+	bool MatchesWorldEntranceRequest(uint32 request_id, uint32 account_id, uint32 character_id, uint32 requested_zone_id) const;
 
 private:
+	enum class SessionDisposition
+	{
+		ReleaseOnTransportEnd,
+		PreserveOnTransportEnd
+	};
+
+	static constexpr uint32 InitialConnectionTimeoutMs = 10000;
+
+	static bool GetSessionLimit(ClientListEntry *client_entry, bool continuing_zone_transfer);
+	void SendToStream(EQApplicationPacket **packet, bool reliable);
+	void CloseStream();
+	void CloseStream(uint32 linger_timeout_ms);
+	void FinishTransport();
 
 	uint32	ip;
 	uint16	port;
 	uint32	char_id;
 	char	char_name[64];
 	uint32	zone_id;
+	uint32	world_entrance_request_id;
 	bool	is_player_zoning;
 	Timer	autobootup_timeout;
+	Timer	initial_connection_timer;
 	uint32	zone_waiting_for_bootup;
 	bool	enter_world_triggered;
 
@@ -106,7 +122,8 @@ private:
 	bool HandleDeleteCharacterPacket(const EQApplicationPacket *app);
 	bool HandleChecksumPacket(const EQApplicationPacket *app);
 
-	EQStreamInterface* const eqs;
+	SessionDisposition m_session_disposition;
+	std::unique_ptr<RDPStream> m_stream;
 
 	void RecordPossibleHack(const std::string &message);
 

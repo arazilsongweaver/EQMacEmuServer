@@ -192,7 +192,7 @@ bool Zone::LoadZoneObjects() {
             d.pos_z = atof(row[4]); // zpos
             d.heading = atof(row[5]); // heading
 
-            d.name, row[8]; // objectname
+            d.name = row[8]; // objectname
 
             // Strip trailing "_ACTORDEF" if present. Client won't accept it for doors.
 			int pos = d.name.size() - strlen("_ACTORDEF");
@@ -219,12 +219,12 @@ bool Zone::LoadZoneObjects() {
             d.incline = atoi(row[13]); // optional model incline value
             d.client_version_mask = 0xFFFFFFFF; //We should load the mask from the zone.
 
-	    auto door = new Doors(d);
-	    entity_list.AddDoor(door);
-	}
+			auto door = new Doors(d);
+			entity_list.AddDoor(door);
+		}
 
-	Object_Struct data = {0};
-	uint32 id = 0;
+		Object_Struct data = {0};
+		uint32 id = 0;
         uint32 icon = 0;
         uint32 type = 0;
         uint32 itemid = 0;
@@ -275,7 +275,7 @@ bool Zone::LoadZoneObjects() {
 		auto object = new Object(id, type, icon, data, inst);
 		entity_list.AddObject(object, false);
 
-	safe_delete(inst);
+		safe_delete(inst);
     }
 
 	return true;
@@ -1288,6 +1288,7 @@ void Zone::AddAuth(ServerZoneIncomingClient_Struct* szic) {
 	zca->accid = szic->accid;
 	zca->admin = szic->admin;
 	zca->charid = szic->charid;
+	zca->lsid = szic->lsid;
 	zca->tellsoff = szic->tellsoff;
 	strn0cpy(zca->charname, szic->charname, sizeof(zca->charname));
 	strn0cpy(zca->lskey, szic->lskey, sizeof(zca->lskey));
@@ -1414,7 +1415,7 @@ bool Zone::Process() {
 
 		EQ::InventoryProfile::CleanDirty();
 
-		LogSpawns("Running Zone::Process -> Spawn2::Process");
+		LogSpawnsDetail("Running Zone::Process -> Spawn2::Process");
 
 		iterator.Reset();
 		while (iterator.MoreElements()) {

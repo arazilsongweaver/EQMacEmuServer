@@ -44,7 +44,6 @@
 #include "../common/data_verification.h"
 #include "../common/faction.h"
 #include "../common/guilds.h"
-#include "../common/packet_dump_file.h"
 #include "../common/rdtsc.h"
 #include "../common/rulesys.h"
 #include "../common/skills.h"
@@ -295,7 +294,7 @@ int Client::HandlePacket(const EQApplicationPacket *app)
 	LogPacketClientServer(
 		"[{}] [{:#06x}] Size [{}] {}",
 		OpcodeManager::EmuToName(app->GetOpcode()),
-		eqs->GetOpcodeManager()->EmuToEQ(app->GetOpcode()),
+		app->GetProtocolOpcode(),
 		app->Size(),
 		(LogSys.IsLogEnabled(Logs::Detail, Logs::PacketClientServer) ? DumpPacketToString(app) : "")
 	);
@@ -333,11 +332,6 @@ int Client::HandlePacket(const EQApplicationPacket *app)
 		//call the processing routine
 		(this->*p)(app);
 
-		//special case where connecting code needs to boot client...
-		if(client_state == CLIENT_KICKED) {
-			return(false);
-		}
-
 		break;
 	}
 	case CLIENT_CONNECTED: {
@@ -358,8 +352,6 @@ int Client::HandlePacket(const EQApplicationPacket *app)
 	case CLIENT_KICKED:
 	case DISCONNECTED:
 	case CLIENT_LINKDEAD:
-	case PREDISCONNECTED:
-	case ZONING:
 	case CLIENT_WAITING_FOR_AUTH:
 		break;
 	default:
@@ -367,7 +359,7 @@ int Client::HandlePacket(const EQApplicationPacket *app)
 		break;
 	}
 
-	return(true);
+	return client_state != CLIENT_KICKED;
 }
 
 // Finish client connecting state
@@ -609,7 +601,6 @@ void Client::CompleteConnect()
 	entity_list.SendIllusionedPlayers(this);
 
 	conn_state = ClientConnectFinished;
-	database.SetAccountActive(AccountID());
 
 	if (GetGroup())
 	{
@@ -876,10 +867,10 @@ void Client::Handle_Connect_OP_ZoneEntry(const EQApplicationPacket *app)
 		/* Check for Client Spoofing */
 		Client* client = entity_list.GetClientByName(cze->char_name);
 		if (client != 0) {
-			uint16 remote_port = ntohs(eqs->GetRemotePort());
-			if (client->GetIP() != eqs->GetRemoteIP() || client->GetPort() != remote_port) {
+			uint16 remote_port = GetPort();
+			if (client->GetIP() != GetIP() || client->GetPort() != remote_port) {
 				struct in_addr ghost_addr;
-				ghost_addr.s_addr = eqs->GetRemoteIP();
+				ghost_addr.s_addr = GetIP();
 				struct in_addr local_addr;
 				local_addr.s_addr = client->GetIP();
 				LogError(
@@ -888,13 +879,12 @@ void Client::Handle_Connect_OP_ZoneEntry(const EQApplicationPacket *app)
 					client->AccountName(), 
 					client->GetName(), 
 					inet_ntoa(ghost_addr), 
-					ntohs(eqs->GetRemotePort()), 
+					GetPort(),
 					inet_ntoa(local_addr), 
 					client->GetPort()
 				);
 				client->Save();
 				Kick();
-				eqs->Close();
 				return;
 			}
 		}
@@ -959,27 +949,19 @@ void Client::Handle_Connect_OP_ZoneEntry(const EQApplicationPacket *app)
 		}
 	}
 
-	SetClientVersion(Connection()->ClientVersion());
-	m_ClientVersionBit = EQ::versions::ConvertClientVersionToClientVersionBit(Connection()->ClientVersion());
-
-	if(ClientVersion() == EQ::versions::ClientVersion::Mac)
-	{
-		m_ClientVersionBit = versionbit;
-	}
-	else
-	{
-		m_ClientVersionBit = EQ::versions::Unused;
-	}
+	// The auth version bit distinguishes Windows, Intel Mac and PPC clients.
+	SetClientVersion(EQ::versions::ClientVersion::Mac);
+	m_ClientVersionBit = versionbit;
 	std::string clientname = EQ::versions::ClientVersionName(EQ::versions::ConvertClientVersionBitToClientVersion(m_ClientVersionBit));
 	LogInfo("ClientVersionBit is : [{}] : [{}] ", m_ClientVersionBit, clientname.c_str());
 
 	strcpy(name, cze->char_name);
 	/* Check for Client Spoofing */
 	if (client != 0) {
-		uint16 remote_port = ntohs(eqs->GetRemotePort());
-		if (client->GetIP() != eqs->GetRemoteIP() || client->GetPort() != remote_port) {
+		uint16 remote_port = GetPort();
+		if (client->GetIP() != GetIP() || client->GetPort() != remote_port) {
 			struct in_addr ghost_addr;
-			ghost_addr.s_addr = eqs->GetRemoteIP();
+			ghost_addr.s_addr = GetIP();
 			struct in_addr local_addr;
 			local_addr.s_addr = client->GetIP();
 			LogError(
@@ -988,13 +970,12 @@ void Client::Handle_Connect_OP_ZoneEntry(const EQApplicationPacket *app)
 				client->AccountName(), 
 				client->GetName(), 
 				inet_ntoa(ghost_addr), 
-				ntohs(eqs->GetRemotePort()), 
+				GetPort(),
 				inet_ntoa(local_addr), 
 				client->GetPort()
 			);
 			client->Save();
 			Kick();
-			eqs->Close();
 			return;
 		}
 	}
@@ -2392,11 +2373,6 @@ void Client::Handle_OP_Bug(const EQApplicationPacket *app)
 
 void Client::Handle_OP_Camp(const EQApplicationPacket *app) 
 {
-	uint32 option = 0;
-	if (app->size == 4) {
-		option = (uint32)app->pBuffer[0];
-	}
-
 	if (GetBoatNPCID() > 0)
 	{
 		Stand();
@@ -2405,17 +2381,12 @@ void Client::Handle_OP_Camp(const EQApplicationPacket *app)
 
 	if (GetGM())
 	{
-		OnDisconnect(true);
+		Logout();
 		return;
 	}
 
 	camping = true;
-
-	if (option == 1)
-		camp_desktop = true;
-	else
-		camp_desktop = false;
-	camp_timer.Start(35000, true);
+	camp_timer.Start(35000, true); // goes stale and gets disabled at 35 sec
 	return;
 }
 
@@ -2739,9 +2710,14 @@ void Client::Handle_OP_ClickDoor(const EQApplicationPacket *app)
 	std::string  export_string = fmt::format("{}", cd->doorid);
 	std::vector<std::any> args;
 	args.push_back(currentdoor);
-	parse->EventPlayer(EVENT_CLICK_DOOR, this, export_string, 0, &args);
+	if (parse->EventPlayer(EVENT_CLICK_DOOR, this, export_string, 0, &args) != 0)
+	{
+		// returning nonzero from lua event_click_door() means the script owns/handles the door entirely.
+		// returning nil/zero continues normal door processing.
+		return;
+	}
 
-	if (!currentdoor->IsMoveable() || (currentdoor->IsTeleport() && currentdoor->GetOpenType() == 57))
+	if (!currentdoor->IsMoveable())
 	{
 		LogDoors("[{}] clicked a door that does not open. Returning.", GetName());
 	}
@@ -2820,7 +2796,7 @@ void Client::Handle_OP_ClientUpdate(const EQApplicationPacket *app)
 	if (IsAIControlled() && !has_zomm)
 		return;
 
-	if(dead)
+	if(dead || IsZoningOut())
 		return;
 
 	//currently accepting two sizes, one has an extra byte on the end
@@ -2917,11 +2893,6 @@ void Client::Handle_OP_ClientUpdate(const EQApplicationPacket *app)
 
 	m_EQPosition = glm::vec4(ppu->x_pos, ppu->y_pos, (float)ppu->z_pos/10.0f, ppu->heading);
 
-	if (GetZoneID() == Zones::AIRPLANE && m_EQPosition.z < -1200.0f) {
-		MovePC(Zones::FREPORTE, -1570.0f, -25.0f, 20.0f, 231.0f);
-		return;
-	}
-
 	//Check to see if PPU should trigger an update to the rewind position.
 	float rewind_x_diff = 0;
 	float rewind_y_diff = 0;
@@ -3001,11 +2972,6 @@ void Client::Handle_OP_ClientUpdate(const EQApplicationPacket *app)
 		}
 		*/
 		rewind_timer.Start(30000, true);
-	}
-
-	if (door_check_timer.Check())
-	{
-		entity_list.OpenFloorTeleportNear(this);
 	}
 
 	CheckClientToNpcAggroTimer();
@@ -3410,6 +3376,9 @@ void Client::Handle_OP_CreateObject(const EQApplicationPacket *app)
 
 void Client::Handle_OP_Damage(const EQApplicationPacket *app) 
 {
+	if (IsDead() || IsZoningOut())
+		return;
+
 	if (!ClientFinishedLoading())
 	{
 		SendHPUpdate();
@@ -3596,12 +3565,30 @@ void Client::Handle_OP_DeleteCharge(const EQApplicationPacket *app)
 
 void Client::Handle_OP_DeleteSpawn(const EQApplicationPacket *app)
 {
-	// The client will send this with his id when he zones, maybe when he disconnects too?
-	//eqs->RemoveData(); // Flushing the queue of packet data to allow for proper zoning
-	//hate_list.RemoveEnt(this->CastToMob());
-	//Disconnect();
-	HardDisconnect();
-	return;
+	if (app->size != sizeof(DeleteSpawn_Struct))
+	{
+		LogWarning("Client [{}] sent OP_DeleteSpawn with size [{}], expected [{}]", GetName(), app->size, sizeof(DeleteSpawn_Struct));
+	}
+	else
+	{
+		auto request = reinterpret_cast<const DeleteSpawn_Struct *>(app->pBuffer);
+		if (!IsDead() && request->spawn_id != GetID())
+		{
+			LogWarning("Client [{}] sent OP_DeleteSpawn for entity [{}], expected [{}]", GetName(), request->spawn_id, GetID());
+		}
+	}
+
+	if (m_pending_zone_transfer.phase == ZoneTransferPhase::AwaitingDeleteSpawn)
+	{
+		SendLogoutReply();
+		FinishPendingZoneTransfer();
+	}
+	else
+	{
+		LogInfo("Client [{}] sent OP_DeleteSpawn without an approved zone transfer", GetName());
+		ClearPendingZoneTransfer();
+		Logout();
+	}
 }
 
 void Client::Handle_OP_DeleteSpell(const EQApplicationPacket *app)
@@ -4215,7 +4202,7 @@ void Client::Handle_OP_GMGoto(const EQApplicationPacket *app)
 
 	Mob* gt = entity_list.GetMob(gmg->charname);
 	if (gt != nullptr) {
-		this->MovePC(zone->GetZoneID(), gt->GetX(), gt->GetY(), gt->GetZ(), gt->GetHeading());
+		this->MovePC(zone->GetZoneID(), gt->GetX(), gt->GetY(), gt->GetZ(), gt->GetHeading() * 2.0f);
 	}
 	else if (!worldserver.Connected())
 		Message(Chat::White, "Error: World server disconnected.");
@@ -4549,92 +4536,75 @@ void Client::Handle_OP_GMTrainSkill(const EQApplicationPacket *app)
 
 void Client::Handle_OP_GMZoneRequest(const EQApplicationPacket *app)
 {
-	if (app->size != sizeof(GMZoneRequest_Struct)) {
-		LogError("Wrong size on OP_GMZoneRequest. Got:[{}] Expected:[{}]", sizeof(GMZoneRequest_Struct), app->size);
+	if (app->size != sizeof(GMZoneRequest_Struct))
+	{
+		LogError("OP size error: OP_GMZoneRequest expected:[{}] got:[{}]", sizeof(GMZoneRequest_Struct), app->size);
 		return;
 	}
 
-	if (this->Admin() < minStatusToBeGM) {
+	if (Admin() < minStatusToBeGM)
+	{
 		Message(Chat::Red, "Your account has been reported for hacking.");
 		RecordPlayerEventLog(PlayerEvent::POSSIBLE_HACK, PlayerEvent::PossibleHackEvent{ .message = "Used /zone" });
 		return;
 	}
 
-	auto *gmzr = (GMZoneRequest_Struct*)app->pBuffer;
-	float target_x = -1, target_y = -1, target_z = -1, target_heading;
-
-	int16 min_status = AccountStatus::Player;
-	uint8 min_level = 0;
-	char target_zone[32];
-	uint16 zone_id = gmzr->zone_id;
-	if (gmzr->zone_id == 0) {
-		zone_id = zonesummon_id;
-	}
-
-	const char *zone_short_name = ZoneName(zone_id);
-	if (zone_short_name == nullptr) {
-		target_zone[0] = 0;
-	}
-	else {
-		strcpy(target_zone, zone_short_name);
-	}
-
-	// this both loads the safe points and does a sanity check on zone name
-	auto z = GetZone(target_zone);
-	if (z) {
-		target_x       = z->safe_x;
-		target_y       = z->safe_y;
-		target_z       = z->safe_z;
-		target_heading = z->safe_heading;
-	}
-	else {
-		target_zone[0] = 0;
-	}
+	// The client initializes only zone_id on this request.
+	const auto request = reinterpret_cast<const GMZoneRequest_Struct *>(app->pBuffer);
+	const uint32 zone_id = request->zone_id;
+	auto zone_data = zone_id != 0 ? GetZone(zone_id) : nullptr;
+	const bool allowed = zone_data != nullptr && Admin() >= zone_data->min_status && GetLevel() >= zone_data->min_level;
 
 	auto outapp = new EQApplicationPacket(OP_GMZoneRequest, sizeof(GMZoneRequest_Struct));
-	auto *gmzr2 = (GMZoneRequest_Struct*)outapp->pBuffer;
-	strcpy(gmzr2->charname, this->GetName());
-	gmzr2->zone_id = gmzr->zone_id;
-	gmzr2->x       = target_x;
-	gmzr2->y       = target_y;
-	gmzr2->z       = target_z;
-	gmzr2->heading = target_heading;
+	auto response = reinterpret_cast<GMZoneRequest_Struct *>(outapp->pBuffer);
+	strn0cpy(response->charname, GetName(), sizeof(response->charname));
+	response->zone_id = zone_id;
+	response->y = zone_data ? zone_data->safe_y : 0.0f;
+	response->x = zone_data ? zone_data->safe_x : 0.0f;
+	response->z = zone_data ? zone_data->safe_z : 0.0f;
+	response->heading = zone_data ? zone_data->safe_heading : 0.0f;
 
-	if (target_zone[0] != 0 && admin >= min_status && GetLevel() >= min_level) {
-		gmzr2->success = 1;
-	}
-	else {
-		LogError("GetZoneSafeCoords failed. Zone ID [{}] Current Zone [{}]", gmzr->zone_id, zone->GetZoneID());
-		gmzr2->success = 0;
+	//  1 - success
+	// -2 - An unknown force prevents entry because the zone is restricted to player characters.
+	// -3 - An unknown force prevents entry because of a storyline restriction.
+	// -6 - The destination requires an expansion the account does not own.
+	// -7 - The character is not yet experienced enough to enter.
+	// other - The client reports that it could not get the safe coordinates.
+	response->result = allowed ? 1 : 0;
+
+	if (!allowed)
+	{
+		LogError("/zone request for zone [{}] was not allowed from zone [{}]", zone_id, zone->GetZoneID());
 	}
 
 	QueuePacket(outapp);
 	safe_delete(outapp);
-
-	return;
 }
 
 void Client::Handle_OP_GMZoneRequest2(const EQApplicationPacket *app)
 {
-	if (app->size < sizeof(uint32)) {
-		LogError("OP size error: OP_GMZoneRequest2 expected:[{}] got:[{}]", sizeof(uint32), app->size);
-		return;
-	}
-
-	if (this->Admin() < minStatusToBeGM) {
+	if (Admin() < minStatusToBeGM)
+	{
 		Message(Chat::Red, "Your account has been reported for hacking.");
 		RecordPlayerEventLog(PlayerEvent::POSSIBLE_HACK, PlayerEvent::PossibleHackEvent{ .message = "Used /zone" });
 		return;
 	}
-	if (app->size < sizeof(uint32)) {
+
+	if (app->size != sizeof(uint32))
+	{
 		LogError("OP size error: OP_GMZoneRequest2 expected:[{}] got:[{}]", sizeof(uint32), app->size);
 		return;
 	}
 
-	uint32 zonereq = *((uint32 *)app->pBuffer);
-	GoToSafeCoords(zonereq);
+	const uint32 zone_id = *reinterpret_cast<const uint32 *>(app->pBuffer);
+	auto zone_data = zone_id != 0 ? GetZone(zone_id) : nullptr;
+	if (zone_data == nullptr)
+	{
+		LogError("/zone second request contains invalid zone [{}]", zone_id);
+		return;
+	}
 
-	return;
+	MovePC(zone_id, zone_data->safe_x, zone_data->safe_y, zone_data->safe_z, zone_data->safe_heading, 0, ZoneSolicited);
 }
 
 void Client::Handle_OP_GroupCancelInvite(const EQApplicationPacket *app)
@@ -5763,47 +5733,23 @@ void Client::Handle_OP_LeaveBoat(const EQApplicationPacket *app)
 
 void Client::Handle_OP_Logout(const EQApplicationPacket *app)
 {
-	LogCharacterDetail("[{}] sent a logout packet.", GetName());
-
-	if (camping)
+	if (camping && camp_timer.Enabled() && camp_timer.GetRemainingTime() <= 7000) // 35 sec timer, but character is expected to camp after 30 sec
 	{
-		if (IsGrouped())
-			LeaveGroup();
-
-		Raid *myraid = entity_list.GetRaidByClient(this);
-		if (myraid)
-		{
-			myraid->DisbandRaidMember(GetName());
-		}
-
-		Save();
-		instalog = true;
-		database.ClearAccountActive(this->AccountID());
-		camp_timer.Disable();
-		camping = false;
-		camp_desktop = false;
+		LogCharacterDetail("[{}] sent a logout packet with [{}] milliseconds remaining on the camp timer.", GetName(), camp_timer.GetRemainingTime());
+	}
+	else
+	{
+		// this can happen legitimately if the player's home zone is down
+		LogWarning("[{}] sent a logout packet without a valid camp timer.", GetName());
+		RecordPlayerEventLog(
+			PlayerEvent::POSSIBLE_HACK,
+			PlayerEvent::PossibleHackEvent{ .message = "/MQInstantCamp: Possible instant camp disconnect" }
+		);
 	}
 
-	SendLogoutPackets();
-
-	if (camp_desktop) {
-		if (worldserver.Connected()) {
-			ServerPacket kickPlayerPack(ServerOP_KickPlayer, sizeof(ServerKickPlayer_Struct));
-			ServerKickPlayer_Struct* skp = (ServerKickPlayer_Struct*)kickPlayerPack.pBuffer;
-			strcpy(skp->adminname, "CampDesktop");
-			strcpy(skp->name, GetName());
-			skp->adminrank = 255;
-			worldserver.SendPacket(&kickPlayerPack);
-		}
-		HardDisconnect();
-		return;
-	}
-	else {
-		auto outapp = new EQApplicationPacket(OP_LogoutReply, 2);
-		FastQueuePacket(&outapp);
-	}
-
-	Disconnect();
+	camp_timer.Disable();
+	camping = false;
+	Logout();
 	return;
 }
 
@@ -5838,7 +5784,7 @@ void Client::Handle_OP_LootRequest(const EQApplicationPacket *app)
 		return;
 	}
 
-	Entity* ent = entity_list.GetID(*((uint32*)app->pBuffer));
+	Entity* ent = entity_list.GetID(*((uint16*)app->pBuffer));
 	if (ent == 0) {
 		//	Message(Chat::Red, "Error: OP_LootRequest: Corpse not found (ent = 0)");
 		Corpse::SendLootReqErrorPacket(this);
@@ -6959,8 +6905,8 @@ void Client::Handle_OP_RezzAnswer(const EQApplicationPacket *app)
 	const auto *r = (const Resurrect_Struct*)app->pBuffer;
 
 	LogSpells(
-		"[Client::Handle_OP_RezzAnswer] Received OP_RezzAnswer from client. Pendingrezzexp is [{}] action is [{}]",
-		PendingRezzXP,
+		"[Client::Handle_OP_RezzAnswer] Received OP_RezzAnswer from client. Pending resurrection experience is [{}] action is [{}]",
+		m_pending_resurrection.experience,
 		r->action ? "ACCEPT" : "DECLINE"
 	);
 
@@ -6976,18 +6922,20 @@ void Client::Handle_OP_Sacrifice(const EQApplicationPacket *app)
 	}
 	Sacrifice_Struct *ss = (Sacrifice_Struct*)app->pBuffer;
 
-	if (!PendingSacrifice) {
+	if (!IsSacrificePending()) {
 		LogError("Unexpected OP_Sacrifice reply");
 		DumpPacket(app);
 		return;
 	}
 
 	if (ss->Confirm) {
-		Mob *Caster = entity_list.GetMob(sacrifice_caster_id);
-		if (Caster) Sacrifice(Caster);
+		Mob *Caster = entity_list.GetMob(m_pending_sacrifice.caster_id);
+		if (Caster && strcmp(Caster->GetName(), m_pending_sacrifice.caster) == 0)
+		{
+			Sacrifice(Caster);
+		}
 	}
-	PendingSacrifice = false;
-	sacrifice_caster_id = 0;
+	ClearPendingSacrifice();
 }
 
 void Client::Handle_OP_SafeFallSuccess(const EQApplicationPacket *app)	// bit of a misnomer, sent whenever safe fall is used (success of fail)
@@ -7866,7 +7814,6 @@ void Client::Handle_OP_SpawnAppearance(const EQApplicationPacket *app)
 			BindWound(GetID(), false, true);
 			camp_timer.Disable();
 			camping = false;
-			camp_desktop = false;
 		}
 		else if (sa->parameter == Animation::Sitting) 
 		{
@@ -7938,6 +7885,7 @@ void Client::Handle_OP_SpawnAppearance(const EQApplicationPacket *app)
 		UpdateWho();
 	}
 	else if ((sa->type == AppearanceType::Health) && (dead == 0)) {
+		SendHPUpdate();
 		return;
 	}
 	else if (sa->type == AppearanceType::AFK) {
@@ -8260,7 +8208,7 @@ void Client::Handle_OP_TargetCommand(const EQApplicationPacket *app)
 			if (new_tar) {
 				EQApplicationPacket hp_app;
 				new_tar->CreateHPPacket(&hp_app);
-				QueuePacket(&hp_app);
+				QueuePacket(&hp_app, false);
 			}
 		}
 
@@ -8339,6 +8287,12 @@ void Client::Handle_OP_Track(const EQApplicationPacket *app)
 void Client::Handle_OP_TradeAcceptClick(const EQApplicationPacket *app)
 {
 	Mob* with = trade->With();
+	if (with && with->IsCorpse())
+	{
+		SendCancelTrade(with);
+		return;
+	}
+
 	trade->state = TradeAccepted;
 
 	if (with && with->IsClient()) {
@@ -8420,19 +8374,7 @@ void Client::Handle_OP_Trader(const EQApplicationPacket *app)
 			}
 			case BazaarTrader_EndTransaction:
 			{
-				TraderStatus_Struct* sis = (TraderStatus_Struct*)app->pBuffer;
-				Client* c = entity_list.GetClientByID(sis->TraderID);
-				if (c)
-				{
-					TraderSession = 0;
-					if(!entity_list.TraderHasCustomer(c))
-					{
-						c->WithCustomer = false;
-					}
-				}
-				else
-					LogBazaarDetail("Client::Handle_OP_Trader: Null Client Pointer");
-
+				CloseTraderSession();
 				break;
 			}
 			case BazaarTrader_ShowItems:
@@ -8790,50 +8732,58 @@ void Client::Handle_OP_TradeSkillCombine(const EQApplicationPacket *app)
 
 void Client::Handle_OP_Translocate(const EQApplicationPacket *app) 
 {
-	if (app->size != sizeof(Translocate_Struct)) {
+	if (app->size != sizeof(Translocate_Struct))
+	{
 		LogError("Size mismatch in OP_Translocate expected [{}] got [{}]", sizeof(Translocate_Struct), app->size);
 		DumpPacket(app);
 		return;
 	}
-	Translocate_Struct *its = (Translocate_Struct*)app->pBuffer;
 
-	if (!PendingTranslocate)
-		return;
-
-	if ((RuleI(Spells, TranslocateTimeLimit) > 0) && (time(nullptr) > (TranslocateTime + RuleI(Spells, TranslocateTimeLimit)))) {
-		Message(Chat::Red, "You did not accept the Translocate within the required time limit.");
-		PendingTranslocate = false;
+	if (IsZoningOut())
+	{
+		ClearPendingTranslocate();
 		return;
 	}
 
-	if (its->Complete == 1) {
+	const Translocate_Struct *response = (const Translocate_Struct *)app->pBuffer;
 
-		int SpellID = PendingTranslocateData.spell_id;
+	if (!IsTranslocatePending())
+	{
+		return;
+	}
+
+	if (response->Complete == 1)
+	{
+		int SpellID = m_pending_translocate.spell_id;
 		int i = parse->EventSpell(EVENT_SPELL_EFFECT_TRANSLOCATE_COMPLETE, nullptr, this, SpellID, 0);
+		if (dead || !IsTranslocatePending())
+		{
+			ClearPendingTranslocate();
+			return;
+		}
 
 		if (i == 0)
 		{
-			// If the spell has a translocate to bind effect, AND we are already in the zone the client
-			// is bound in, use the GoToBind method. If we send OP_Translocate in this case, the client moves itself
-			// to the bind coords it has from the PlayerProfile, but with the X and Y reversed. I suspect they are
-			// reversed in the pp, and since spells like Gate are handled serverside, this has not mattered before.
-			if (((SpellID == 1422) || (SpellID == 1334) || (SpellID == 3243)) &&
-				(zone->GetZoneID() == PendingTranslocateData.zone_id))
+			if (m_pending_translocate.zone_id != zone->GetZoneID())
 			{
-				PendingTranslocate = false;
-				GoToBind();
-				return;
+				const uint8 ignore_restrictions = IsTranslocateToBindSpell(SpellID) ? 1 : 0;
+				SetPendingZoneTransfer(
+					ZoneSolicited,
+					m_pending_translocate.zone_id,
+					m_pending_translocate.destination,
+					ignore_restrictions
+				);
+			}
+			else
+			{
+				cheat_manager.SetExemptStatus(Port, true);
 			}
 
-			////Was sending the packet back to initiate client zone...
-			////but that could be abusable, so lets go through proper channels
-			MovePC(PendingTranslocateData.zone_id,
-				PendingTranslocateData.x, PendingTranslocateData.y,
-				PendingTranslocateData.z, PendingTranslocateData.heading, 0, ZoneSolicited);
+			SendPendingTranslocatePacket(true);
 		}
 	}
 
-	PendingTranslocate = false;
+	ClearPendingTranslocate();
 }
 
 void Client::Handle_OP_WearChange(const EQApplicationPacket *app)

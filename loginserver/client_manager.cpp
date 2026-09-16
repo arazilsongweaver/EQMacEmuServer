@@ -1,101 +1,103 @@
 #include "client_manager.h"
 #include "login_server.h"
 
+#include "../common/eqemu_logsys.h"
+#include "../common/file.h"
+#include "../common/path_manager.h"
+#include "../common/rdp/rdp_connection.h"
+#include "../common/rdp/rdp_stream.h"
+
+#include <cstdio>
+#include <cstring>
+#include <new>
+#include <utility>
+
 extern LoginServer server;
 extern bool run_server;
 
-#include "../common/eqemu_logsys.h"
-#include "../common/misc.h"
-#include "../common/path_manager.h"
-#include "../common/file.h"
-
-void CheckOldOpcodeFile(const std::string& path) {
+void CheckOldOpcodeFile(const std::string& path)
+{
 	if (File::Exists(path)) {
 		return;
 	}
+
 	auto f = fopen(path.c_str(), "w");
 	if (f) {
-		fprintf(f, "#EQEmu Public Login Server OPCodes\n");
-		fprintf(f, "OP_SessionReady=0x5900\n");
-		fprintf(f, "OP_LoginOSX=0x8e00\n");
-		fprintf(f, "OP_LoginPC=0x0100\n");
-		fprintf(f, "OP_ClientError=0x0200\n");
-		fprintf(f, "OP_LoginDisconnect=0x0500\n");
-		fprintf(f, "OP_ServerListRequest=0x4600\n");
-		fprintf(f, "OP_PlayEverquestRequest=0x4700\n");
-		fprintf(f, "OP_LoginUnknown1=0x4800\n");
-		fprintf(f, "OP_LoginUnknown2=0x4A00\n");
-		fprintf(f, "OP_LoginAccepted=0x0400\n");
-		fprintf(f, "OP_LoginComplete=0x8800\n");
-		fprintf(f, "OP_ServerName=0x4900\n");
-		fprintf(f, "OP_LoginBanner=0x5200\n");
+		fprintf(f, "#EQEmu Public Login Server Opcodes\n");
+		fprintf(f, "# Opcode values are the client's logical values. EQ application opcodes are\n");
+		fprintf(f, "# serialized little-endian by the RDP stream.\n");
+		fprintf(f, "OP_SessionReady=0x0059\n");
+		fprintf(f, "OP_LoginOSX=0x008e\n");
+		fprintf(f, "OP_LoginPC=0x0001\n");
+		fprintf(f, "OP_ClientError=0x0002\n");
+		fprintf(f, "OP_LoginDisconnect=0x0005\n");
+		fprintf(f, "OP_ServerListRequest=0x0046\n");
+		fprintf(f, "OP_PlayEverquestRequest=0x0047\n");
+		fprintf(f, "OP_LoginUnknown1=0x0048\n");
+		fprintf(f, "OP_LoginUnknown2=0x004A\n");
+		fprintf(f, "OP_LoginAccepted=0x0004\n");
+		fprintf(f, "OP_LoginComplete=0x0088\n");
+		fprintf(f, "OP_ServerName=0x0049\n");
+		fprintf(f, "OP_LoginBanner=0x0052\n");
 		fclose(f);
 	}
 }
 
 ClientManager::ClientManager()
 {
-	int old_port = server.config.GetVariableInt("Old", "port", 6000);
-	old_stream = new EQStreamFactory(old_port);
-	old_ops = new RegularOpcodeManager;
-
-	std::string opcodes_path = fmt::format(
+	std::string opcode_file = server.config.GetVariableString("Old", "opcodes", "login_opcodes_oldver.conf");
+	std::string opcode_path = fmt::format(
 		"{}/{}",
 		PathManager::Instance()->GetOpcodePath(),
-		"login_opcodes_oldver.conf"
+		opcode_file
 	);
 
-	CheckOldOpcodeFile(opcodes_path);
+	CheckOldOpcodeFile(opcode_path);
 
-	if (!old_ops->LoadOpcodes(opcodes_path.c_str())) {
-		LogError("ClientManager fatal error: couldn't load opcodes for Old file [{}].",
-			server.config.GetVariableString("Old", "opcodes", "login_opcodes_oldver.conf"));
+	if (!m_packet_translator.LoadOpcodes(opcode_path.c_str())) {
+		LogError("ClientManager fatal error: couldn't load login opcodes from [{}]", opcode_path);
 		run_server = false;
+		return;
 	}
-	else if (old_stream->Open()) {
-		LogInfo("ClientManager listening on Old stream.");
-	}
-	else {
-		LogError("ClientManager fatal error: couldn't open Old stream.");
+
+	int result = m_rdp_runtime.Open();
+	if (result != RDPLIB_OK) {
+		LogError("ClientManager fatal error: couldn't open the RDP runtime, result [{}]", result);
 		run_server = false;
+		return;
 	}
+
+	uint16 client_port = static_cast<uint16>(server.config.GetVariableInt("Old", "port", 6000));
+	result = m_rdp_endpoint.Open(m_rdp_runtime, client_port);
+	if (result != RDPLIB_OK) {
+		LogError("ClientManager fatal error: couldn't open the client RDP listener on port [{}], result [{}]", client_port, result);
+		run_server = false;
+		return;
+	}
+
+	LogInfo("ClientManager listening for RDP clients on port [{}]", client_port);
 }
 
-ClientManager::~ClientManager()
-{
-	if (old_stream)	{
-		old_stream->Close();
-		delete old_stream;
-	}
-
-	if (old_ops) {
-		delete old_ops;
-	}
-}
+ClientManager::~ClientManager() = default;
 
 void ClientManager::Process()
 {
-	ProcessDisconnect();
-	if (old_stream) {
-		std::shared_ptr<EQStreamInterface> oldcur = old_stream->PopOld();
-		while (oldcur) {
-			struct in_addr in;
-			in.s_addr = oldcur->GetRemoteIP();
-			LogInfo("New client connection from {0}:{1}", inet_ntoa(in), ntohs(oldcur->GetRemotePort()));
-
-			oldcur->SetOpcodeManager(&old_ops);
-			Client* c = new Client(oldcur, cv_old);
-			clients.push_back(c);
-			oldcur = old_stream->PopOld();
-		}
+	int process_result = m_rdp_endpoint.Process();
+	if (process_result < 0) {
+		LogError("Unable to process the login RDP endpoint, result [{}]", process_result);
+		run_server = false;
+		return;
 	}
 
-	auto iter = clients.begin();
+	AcceptClients();
+	if (!run_server)
+		return;
+
+	ClientList::iterator iter = clients.begin();
 	while (iter != clients.end()) {
 		if ((*iter)->Process() == false) {
-			LogWarning("Client had a fatal error and had to be removed from the login");
-			delete (*iter);
-			iter = clients.erase(iter);
+			LogInfo("Client disconnected from the login server, removing client");
+			iter = RemoveClient(iter);
 		}
 		else {
 			++iter;
@@ -103,44 +105,89 @@ void ClientManager::Process()
 	}
 }
 
-void ClientManager::ProcessDisconnect()
+void ClientManager::AcceptClients()
 {
-	auto iter = clients.begin();
+	int accept_result = RDPLIB_OK;
+	for (uint32 accepted_connections = 0; accepted_connections < MaximumClientAcceptsPerTick; ++accepted_connections) {
+		std::unique_ptr<RDPConnection> connection(m_rdp_endpoint.Accept(&accept_result));
+		if (connection == nullptr)
+			break;
+
+		uint8 remote_address[4] = {};
+		uint16 remote_port = 0;
+		int setup_result = connection->GetRemoteAddress(remote_address, remote_port);
+		if (setup_result != RDPLIB_OK) {
+			LogError("Unable to read a new login RDP client's address, result [{}]", setup_result);
+			connection->Close(0);
+			continue;
+		}
+
+		std::unique_ptr<RDPStream> stream;
+		try {
+			stream.reset(new RDPStream(m_packet_translator, std::move(connection)));
+		}
+		catch (const std::bad_alloc &) {
+			accept_result = RDPLIB_ERROR_OUT_OF_MEMORY;
+			break;
+		}
+
+		setup_result = stream->EnableKeepalive();
+		if (setup_result == RDPLIB_OK)
+			setup_result = stream->SetDataRate();
+		if (setup_result == RDPLIB_OK)
+			setup_result = stream->SetSendBufferSize();
+
+		if (setup_result != RDPLIB_OK) {
+			LogError("Unable to configure a new login RDP client, result [{}]", setup_result);
+			stream->Close(0);
+			continue;
+		}
+
+		struct in_addr in = {};
+		std::memcpy(&in.s_addr, remote_address, sizeof(in.s_addr));
+		LogInfo("New login client connection from [{}]:[{}]", inet_ntoa(in), remote_port);
+
+		try {
+			std::unique_ptr<Client> client(new Client(std::move(stream)));
+			clients.emplace_back(std::move(client));
+		}
+		catch (const std::bad_alloc &) {
+			accept_result = RDPLIB_ERROR_OUT_OF_MEMORY;
+			break;
+		}
+	}
+
+	if (accept_result != RDPLIB_OK) {
+		LogError("Unable to accept a login RDP client, result [{}]", accept_result);
+		run_server = false;
+	}
+}
+
+ClientManager::ClientList::iterator ClientManager::RemoveClient(ClientList::iterator client)
+{
+	return clients.erase(client);
+}
+
+void ClientManager::UpdateServerList()
+{
+	ClientList::iterator iter = clients.begin();
 	while (iter != clients.end()) {
-		std::shared_ptr<EQStreamInterface> c = (*iter)->GetConnection();
-		if (c->CheckState(CLOSED)) {
-			c->ReleaseFromUse();
-			LogInfo("Client disconnected from the server, removing client.");
-			delete (*iter);
-			iter = clients.erase(iter);
-		}
-		else {
-			++iter;
-		}
+		(*iter)->SendServerListPacket();
+		++iter;
 	}
 }
 
 void ClientManager::RemoveExistingClient(unsigned int account_id)
 {
-	auto iter = clients.begin();
-	while (iter != clients.end()){
+	ClientList::iterator iter = clients.begin();
+	while (iter != clients.end()) {
 		if ((*iter)->GetAccountID() == account_id) {
 			LogInfo("Client attempting to log in existing client already logged in, removing existing client");
-			delete (*iter);
-			iter = clients.erase(iter);
+			iter = RemoveClient(iter);
 		}
-		else{
+		else {
 			++iter;
 		}
-	}
-}
-
-void ClientManager::UpdateServerList()
-{
-	auto iter = clients.begin();
-	while (iter != clients.end()) {
-		(*iter)->SendServerListPacket();
-		++iter;
 	}
 }
 
@@ -148,18 +195,17 @@ Client *ClientManager::GetClient(unsigned int account_id)
 {
 	Client *cur = nullptr;
 	int count = 0;
-	auto iter = clients.begin();
-	while(iter != clients.end()) {
-		if((*iter)->GetAccountID() == account_id) {
-			cur = (*iter);
+	ClientList::iterator iter = clients.begin();
+	while (iter != clients.end()) {
+		if ((*iter)->GetAccountID() == account_id) {
+			cur = iter->get();
 			count++;
 		}
 		++iter;
 	}
 
-	if(count > 1) {
+	if (count > 1) {
 		LogError("More than one client with a given account_id existed in the client list.");
 	}
 	return cur;
 }
-

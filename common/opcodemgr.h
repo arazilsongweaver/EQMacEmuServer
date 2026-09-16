@@ -25,22 +25,13 @@
 
 #include <map>
 
-//enable the use of shared mem opcodes for world and zone only
-#ifdef ZONE
-#define SHARED_OPCODES
-#endif
-#ifdef WORLD
-#define SHARED_OPCODES
-#endif
-
 class OpcodeManager {
 public:
-	OpcodeManager();
+	OpcodeManager() = default;
 	virtual ~OpcodeManager() {}
 
 	virtual bool Mutable() { return(false); }
 	virtual bool LoadOpcodes(const char *filename, bool report_errors = false) = 0;
-	virtual bool ReloadOpcodes(const char *filename, bool report_errors = false) = 0;
 
 	virtual uint16 EmuToEQ(const EmuOpcode emu_op) = 0;
 	virtual EmuOpcode EQToEmu(const uint16 eq_op) = 0;
@@ -57,7 +48,6 @@ public:
 	};
 
 protected:
-	bool loaded; //true if all opcodes loaded
 	Mutex MOpcodes; //this only protects the local machine
 					//in a shared manager, this dosent protect others
 
@@ -71,28 +61,6 @@ public:
 	virtual void SetOpcode(EmuOpcode emu_op, uint16 eq_op) = 0;
 };
 
-#ifdef SHARED_OPCODES	//quick toggle since only world and zone should possibly use this
-//keeps opcodes in shared memory
-class SharedOpcodeManager : public OpcodeManager {
-public:
-	virtual ~SharedOpcodeManager() {}
-
-	virtual bool LoadOpcodes(const char *filename, bool report_errors = false);
-	virtual bool ReloadOpcodes(const char *filename, bool report_errors = false);
-
-	virtual uint16 EmuToEQ(const EmuOpcode emu_op);
-	virtual EmuOpcode EQToEmu(const uint16 eq_op);
-
-protected:
-	class SharedMemStrategy : public OpcodeManager::OpcodeSetStrategy {
-	public:
-		virtual ~SharedMemStrategy() {} //shut up compiler!
-		void Set(EmuOpcode emu_op, uint16 eq_op);
-	};
-	static bool DLLLoadOpcodesCallback(const char *filename);
-};
-#endif //SHARED_OPCODES
-
 //keeps opcodes in regular heap memory
 class RegularOpcodeManager : public MutableOpcodeManager {
 public:
@@ -101,7 +69,6 @@ public:
 
 	virtual bool Editable() { return(true); }
 	virtual bool LoadOpcodes(const char *filename, bool report_errors = false);
-	virtual bool ReloadOpcodes(const char *filename, bool report_errors = false);
 
 	virtual uint16 EmuToEQ(const EmuOpcode emu_op);
 	virtual EmuOpcode EQToEmu(const uint16 eq_op);
@@ -130,7 +97,6 @@ public:
 	NullOpcodeManager();
 
 	virtual bool LoadOpcodes(const char *filename, bool report_errors = false);
-	virtual bool ReloadOpcodes(const char *filename, bool report_errors = false);
 
 	virtual uint16 EmuToEQ(const EmuOpcode emu_op);
 	virtual EmuOpcode EQToEmu(const uint16 eq_op);
@@ -147,7 +113,6 @@ public:
 	EmptyOpcodeManager();
 
 	virtual bool LoadOpcodes(const char *filename, bool report_errors = false);
-	virtual bool ReloadOpcodes(const char *filename, bool report_errors = false);
 
 	virtual uint16 EmuToEQ(const EmuOpcode emu_op);
 	virtual EmuOpcode EQToEmu(const uint16 eq_op);

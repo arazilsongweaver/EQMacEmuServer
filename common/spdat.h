@@ -43,7 +43,9 @@
 #define SPELL_CAZIC_TOUCH 982
 #define SPELL_DIMENSIONAL_RETURN 1133
 #define SPELL_CASSINDRAS_CHANT_OF_CLARITY 1287
+#define SPELL_TRANSLOCATE_GROUP 1334
 #define SPELL_GREENMIST 1363
+#define SPELL_TRANSLOCATE 1422
 #define SPELL_DEATH_PEACE 1460
 #define SPELL_MODULATION 1502
 #define SPELL_TORPOR 1576
@@ -58,6 +60,7 @@
 #define SPELL_HARM_TOUCH2 2821			// unholy aura HT (disease resist)
 #define SPELL_REMOVE_GREATER_CURSE 2880
 #define SPELL_BALANCE_OF_THE_NAMELESS 3230
+#define SPELL_TELEPORT 3243
 #define SPELL_AA_BOASTFUL_BELLOW 3282
 #define SPELL_TIME_STRIKE 3649
 #define SPELL_EPOCH_CONVICTION 3767
@@ -728,6 +731,7 @@ bool IsPartialDeathSaveSpell(uint16 spell_id);
 bool IsShadowStepSpell(uint16 spell_id);
 bool IsSuccorSpell(uint16 spell_id);
 bool IsTeleportSpell(uint16 spell_id);
+bool IsTranslocateToBindSpell(uint16 spell_id);
 bool IsGateSpell(uint16 spell_id);
 bool IsPlayerIllusionSpell(uint16 spell_id); // seveian 2008-09-23
 int32 GetSpellResistType(uint16 spell_id);

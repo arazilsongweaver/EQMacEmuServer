@@ -19,15 +19,18 @@
 #define EQEMU_CLIENT_H
 
 #include "../common/global_define.h"
-#include "../common/opcodemgr.h"
-#include "../common/eq_stream_type.h"
-#include "../common/eq_stream_factory.h"
 #include "../common/random.h"
+#include "../common/types.h"
 #include "login_types.h"
 #include "salt.h"
+
+#include <memory>
 #include <string>
 
 using namespace std;
+
+class EQApplicationPacket;
+class RDPStream;
 
 /**
 * Client class, controls a single client and it's
@@ -37,14 +40,14 @@ class Client
 {
 public:
 	/**
-	* Constructor, sets our connection to c and version to v
+	* Constructor takes ownership of the client stream.
 	*/
-	Client(std::shared_ptr<EQStreamInterface> c, LSClientVersion v);
+	Client(std::unique_ptr<RDPStream> stream);
 
 	/**
 	* Destructor.
 	*/
-	~Client() { }
+	~Client();
 
 	/**
 	* Processes the client's connection and does various actions.
@@ -54,7 +57,7 @@ public:
 	/**
 	* Sends our reply to session ready packet.
 	*/
-	void Handle_SessionReady(const char* data, unsigned int size);
+	void Handle_SessionReady();
 
 	/**
 * Verifies login and send a reply for Mac clients.
@@ -117,24 +120,9 @@ public:
 	*/
 	string GetKey() const { return m_key; }
 
-	/**
-	* Gets the server selected to be played on for this client.
-	*/
-	unsigned int GetPlayServerID() const { return m_play_server_id; }
-
-	/**
-	* Gets the play sequence state for this client.
-	*/
-	unsigned int GetPlaySequence() const { return m_play_sequence_id; }
-	/**
-	* Gets the client version for this client.
-	*/
-	unsigned int GetClientVersion() const { return m_client_version; }
-
-	/**
-	* Gets the connection for this client.
-	*/
-	std::shared_ptr<EQStreamInterface> GetConnection() { return m_connection; }
+	uint32 GetIP() const { return m_ip; }
+	uint16 GetPort() const { return m_port; }
+	bool HasStream() const { return m_stream != nullptr; }
 
 	/**
 	* Gets the client version for this client.
@@ -144,19 +132,23 @@ public:
 
 
 private:
+	void QueuePacket(const EQApplicationPacket *packet, bool reliable = true);
+	void SendToStream(EQApplicationPacket **packet, bool reliable);
+	void CloseStream();
+	void CloseStream(uint32 linger_timeout_ms);
+
 	Saltme                             m_salt;
 	EQ::Random                         m_random;
-	std::shared_ptr<EQStreamInterface> m_connection;
-	LSClientVersion                    m_client_version;
 	LSClientStatus                     m_client_status;
 	LSMacClientVersion                 m_client_mac_version;
 
 	std::string  m_account_name;
 	unsigned int m_account_id;
 	bool         m_sent_session_info;
-	unsigned int m_play_server_id;
-	unsigned int m_play_sequence_id;
 	std::string  m_key;
+	uint32       m_ip;
+	uint16       m_port;
+	std::unique_ptr<RDPStream> m_stream;
 };
 
 #endif

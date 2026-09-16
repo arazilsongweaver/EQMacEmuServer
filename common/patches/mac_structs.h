@@ -187,14 +187,6 @@ struct Spawn_Struct
 	/*0224*/
 };
 
-struct SpawnHPUpdate_Struct
-{
-	/*000*/ uint32  spawn_id;		// Comment: Id of spawn to update
-	/*004*/ int32 cur_hp;		// Comment:  Current hp of spawn
-	/*008*/ int32 max_hp;		// Comment: Maximum hp of spawn
-	/*012*/	
-};
-
 struct SpecialMesg_Struct
 {
 	/*0000*/ uint32 msg_type;		// Comment: Type of message

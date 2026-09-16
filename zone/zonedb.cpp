@@ -2995,7 +2995,7 @@ bool ZoneDatabase::UpdateCharacterCorpseBackup(uint32 db_id, uint32 char_id, con
 
 
 void ZoneDatabase::MarkCorpseAsRezzed(uint32 db_id) {
-	std::string query = StringFormat("UPDATE `character_corpses` SET `is_rezzed` = 1 WHERE `id` = %i", db_id);
+	std::string query = StringFormat("UPDATE `character_corpses` SET `is_rezzed` = 1 WHERE `id` = %u", db_id);
 	auto results = QueryDatabase(query);
 }
 
@@ -3226,6 +3226,7 @@ bool ZoneDatabase::SaveCharacterCorpseBackup(uint32 corpse_id, uint32 charid, co
 	}
 
 	/* Dump Items from Inventory */
+	query.clear();
 	uint8 first_entry = 0;
 	for (unsigned int i = 0; i < corpse->itemcount; i++) {
 		if (first_entry != 1){
@@ -3248,10 +3249,12 @@ bool ZoneDatabase::SaveCharacterCorpseBackup(uint32 corpse_id, uint32 charid, co
 			);
 		}
 	}
-	auto sc_results = QueryDatabase(query); 
-	if (!sc_results.Success()){
-		LogErrorDetail("Error inserting character_corpse_items_backup.");
-		return false;
+	if (!query.empty()) {
+		auto sc_results = QueryDatabase(query);
+		if (!sc_results.Success()){
+			LogErrorDetail("Error inserting character_corpse_items_backup.");
+			return false;
+		}
 	}
 	return true;
 }

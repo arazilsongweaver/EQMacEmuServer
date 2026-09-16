@@ -42,11 +42,18 @@ ClientList::ClientList()
 : CLStale_timer(10000)
 {
 	NextCLEID = 1;
+	NextWorldEntranceRequestID = 1;
 
 	m_tick = std::make_unique<EQ::Timer>(5000, true, std::bind(&ClientList::OnTick, this, std::placeholders::_1));
 }
 
 ClientList::~ClientList() {
+}
+
+void ClientList::Clear()
+{
+	list.Clear();
+	clientlist.Clear();
 }
 
 void ClientList::Process() {
@@ -65,7 +72,7 @@ void ClientList::Process() {
 			uint32 accountid = iterator.GetData()->GetAccountID();
 			iterator.RemoveCurrent();
 
-			if(!ActiveConnection(accountid))
+			if(!CheckAccountActive(accountid))
 				database.ClearAccountActive(accountid);
 		}
 		else
@@ -465,7 +472,7 @@ void ClientList::CLCheckStale() {
 			LogInfo("Removing stale client on account [{}] from [{}]", iterator.GetData()->AccountID(), inet_ntoa(in));
 			uint32 accountid = iterator.GetData()->AccountID();
 			iterator.RemoveCurrent();
-			if(!ActiveConnection(accountid))
+			if(!CheckAccountActive(accountid))
 				database.ClearAccountActive(accountid);
 		}
 		else
@@ -473,30 +480,134 @@ void ClientList::CLCheckStale() {
 	}
 }
 
+void ClientList::CharacterOffline(uint32 account_id, uint32 character_id, const char *character_name)
+{
+	if (account_id == 0)
+		return;
+
+	// A late message from the old zone must not clean up a newer copy of the same character.
+	if (character_id != 0 && character_name != nullptr && character_name[0] != '\0' && ActiveConnection(account_id, character_id))
+		return;
+
+	if (!CheckAccountActive(account_id))
+		database.ClearAccountActive(account_id);
+
+	// Entries at character select do not have character data to clean up.
+	if (character_id == 0 || character_name == nullptr || character_name[0] == '\0')
+		return;
+
+	LogInfo("Removing offline character [{}] from groups and raids", character_name);
+
+	uint32 group_id = database.GetGroupID(character_name);
+	if (group_id > 0) {
+		auto pack = new ServerPacket(ServerOP_GroupLeave, sizeof(ServerGroupLeave_Struct));
+		auto group_leave = reinterpret_cast<ServerGroupLeave_Struct *>(pack->pBuffer);
+		group_leave->gid = group_id;
+		group_leave->zoneid = 0;
+		strn0cpy(group_leave->member_name, character_name, sizeof(group_leave->member_name));
+		group_leave->checkleader = true;
+		ZSList::Instance()->SendPacket(pack);
+		safe_delete(pack);
+	}
+	database.SetGroupID(character_name, 0, character_id, account_id);
+
+	uint32 raid_id = database.GetRaidID(character_name);
+	if (raid_id == 0)
+		return;
+
+	auto pack = new ServerPacket(ServerOP_RaidRemoveLD, sizeof(ServerRaidGeneralAction_Struct));
+	auto raid_remove = reinterpret_cast<ServerRaidGeneralAction_Struct *>(pack->pBuffer);
+	raid_remove->rid = 0;
+
+	std::string query = StringFormat(
+		"SELECT groupid, isgroupleader, israidleader, islooter FROM raid_members WHERE name='%s' and raidid=%lu",
+		character_name,
+		(unsigned long)raid_id
+	);
+	auto results = database.QueryDatabase(query);
+	if (results.Success() && results.RowCount() == 1) {
+		auto row = results.begin();
+		if (row != results.end()) {
+			int group_number = atoi(row[0]);
+			if (group_number > 11)
+				group_number = 0xFFFFFFFF;
+
+			raid_remove->rid = raid_id;
+			raid_remove->gid = group_number;
+			raid_remove->zoneid = atoi(row[2]);
+			raid_remove->gleader = atoi(row[1]);
+			raid_remove->looter = atoi(row[3]);
+			strn0cpy(raid_remove->playername, character_name, sizeof(raid_remove->playername));
+		}
+	}
+
+	query = StringFormat("DELETE FROM raid_members where name='%s'", character_name);
+	database.QueryDatabase(query);
+	if (raid_remove->rid > 0)
+		ZSList::Instance()->SendPacket(pack);
+	safe_delete(pack);
+}
+
 void ClientList::ClientUpdate(ZoneServer* zoneserver, ServerClientList_Struct* scl) {
+	CLE_Status session_status;
+	switch (scl->status) {
+	case WorldSessionStatus::InZone:
+		session_status = CLE_Status::InZone;
+		break;
+	case WorldSessionStatus::Zoning:
+		session_status = CLE_Status::Zoning;
+		break;
+	case WorldSessionStatus::Offline:
+		session_status = CLE_Status::Offline;
+		break;
+	case WorldSessionStatus::Online:
+		session_status = CLE_Status::Online;
+		break;
+	default:
+		LogInfo("Ignoring client update with invalid world session status [{}]", static_cast<int>(scl->status));
+		return;
+	}
+
 	LinkedListIterator<ClientListEntry*> iterator(clientlist);
-	ClientListEntry* cle;
+	ClientListEntry* cle = nullptr;
 	iterator.Reset();
 	while(iterator.MoreElements()) {
 		if (iterator.GetData()->GetID() == scl->wid) {
 			cle = iterator.GetData();
-			if (scl->remove == 2){
-				cle->LeavingZone(zoneserver, CLE_Status::Offline);
-			}
-			else if (scl->remove == 1)
-				cle->LeavingZone(zoneserver, CLE_Status::Zoning);
-			else
+			if (scl->status == WorldSessionStatus::InZone)
 				cle->Update(zoneserver, scl);
+			else
+				cle->LeavingZone(zoneserver, session_status);
 			return;
 		}
 		iterator.Advance();
 	}
-	if (scl->remove == 2)
-		cle = new ClientListEntry(GetNextCLEID(), zoneserver, scl, CLE_Status::Online);
-	else if (scl->remove == 1)
+
+	if (scl->status != WorldSessionStatus::InZone) {
+		cle = FindCLEByCharacterID(scl->charid);
+		if (cle && cle->AccountID() == scl->AccountID) {
+			cle->LeavingZone(zoneserver, session_status);
+			return;
+		}
+	}
+
+	if (scl->status == WorldSessionStatus::Offline || scl->status == WorldSessionStatus::Online) {
+		LogInfo(
+			"{} client update for unknown world ID [{}], character [{}]",
+			scl->status == WorldSessionStatus::Online ? "Return-to-world" : "Final",
+			scl->wid,
+			scl->name
+		);
+		CharacterOffline(scl->AccountID, scl->charid, scl->name);
+		return;
+	}
+	else if (scl->status == WorldSessionStatus::Zoning) {
 		cle = new ClientListEntry(GetNextCLEID(), zoneserver, scl, CLE_Status::Zoning);
-	else
+		cle->LeavingZone(zoneserver, CLE_Status::Zoning);
+	}
+	else {
 		cle = new ClientListEntry(GetNextCLEID(), zoneserver, scl, CLE_Status::InZone);
+	}
 	clientlist.Insert(cle);
 	zoneserver->ChangeWID(scl->charid, cle->GetID());
 }
@@ -1222,18 +1333,27 @@ void ClientList::Add(Client* client) {
 	list.Insert(client);
 }
 
-Client* ClientList::FindByAccountID(uint32 account_id) {
+Client* ClientList::FindByWorldEntranceRequest(const WorldToZone_Struct &request)
+{
 	LinkedListIterator<Client*> iterator(list);
 
 	iterator.Reset();
-	while(iterator.MoreElements()) {
-		if (iterator.GetData()->GetAccountID() == account_id) {
-			Client* tmp = iterator.GetData();
-			return tmp;
-		}
+	while (iterator.MoreElements())
+	{
+		Client *client = iterator.GetData();
+		if (client->MatchesWorldEntranceRequest(request.request_id, request.account_id, request.character_id, request.zone_id))
+			return client;
 		iterator.Advance();
 	}
-	return 0;
+	return nullptr;
+}
+
+uint32 ClientList::GetNextWorldEntranceRequestID()
+{
+	uint32 request_id = NextWorldEntranceRequestID++;
+	if (NextWorldEntranceRequestID == 0)
+		NextWorldEntranceRequestID = 1;
+	return request_id;
 }
 
 Client* ClientList::FindByName(char* charname) {

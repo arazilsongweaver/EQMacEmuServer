@@ -27,22 +27,10 @@ struct ServerList_Struct {
 	uchar	data[0];
 };
 
-struct ServerList_Trilogy_Struct {
-	uint8	numservers;
-	uint8	padding[2];
-	uint8	showusercount; // 0xFF = show numbers, 0x0 = show "UP"
-	uchar	data[0];
-};
-
 struct ServerListServerFlags_Struct {
 	uint8 greenname;
 	int32 flags; // if 0x8 then server is hidden on list
 	int32 worldid;
-	uint32 usercount;
-};
-
-struct ServerListServerFlags_Trilogy_Struct {
-	uint8 greenname;
 	uint32 usercount;
 };
 
@@ -82,22 +70,6 @@ struct LoginCrypt_struct {
 	char	password[20];
 };
 
-struct PlayEverquestRequest_Struct {
-	uint16 Sequence;
-	uint32 Unknown1;
-	uint32 Unknown2;
-	uint32 ServerNumber;
-};
-
-struct PlayEverquestResponse_Struct {
-	uint8 Sequence;
-	uint8 Unknown1[9];
-	uint8 Allowed;
-	uint16 Message;
-	uint8 Unknown2[3];
-	uint32 ServerNumber;
-};
-
 static const unsigned char FailedLoginResponseData[] = {
 	0xf6, 0x85, 0x9c, 0x23, 0x57, 0x7e, 0x3e, 0x55, 0xb3, 0x4c, 0xf8, 0xc8, 0xcb, 0x77, 0xd5, 0x16,
 	0x09, 0x7a, 0x63, 0xdc, 0x57, 0x7e, 0x3e, 0x55, 0xb3, 0x4c, 0xf8, 0xc8, 0xcb, 0x77, 0xd5, 0x16,
@@ -105,12 +77,7 @@ static const unsigned char FailedLoginResponseData[] = {
 
 #pragma pack()
 
-enum LSClientVersion {
-	cv_old
-};
-
 enum LSMacClientVersion {
-	unused = 1,
 	pc = 2,
 	intel = 4,
 	ppc = 8
@@ -121,22 +88,5 @@ enum LSClientStatus {
 	cs_waiting_for_login,
 	cs_logged_in
 };
-
-enum LoginMode {
-	lm_initial = 2,
-	lm_from_world = 3
-};
-
-namespace LS{
-	namespace ErrStr {
-		constexpr static int NON_ERROR = 101; // No Error
-		constexpr static int SERVER_UNAVAILABLE = 326; // That server is currently unavailable.  Please check the EverQuest webpage for current server status and try again later.
-		constexpr static int ACCOUNT_SUSPENDED = 337; // This account is currently suspended.  Please contact customer service for more information.
-		constexpr static int ACCOUNT_BANNED = 338; // This account is currently banned.  Please contact customer service for more information.
-		constexpr static int WORLD_MAX_CAPACITY = 303; // The world server is currently at maximum capacity and not allowing further logins until the number of players online decreases.  Please try again later.
-		constexpr static int ERROR_1018_ACTIVE_CHARACTER = 111; // Error 1018: You currently have an active character on that EverQuest Server, please allow a minute for synchronization and try again.
-		constexpr static int IP_ADDR_MAX = 198; // Error - You have exceeded the maximum number of allowed IP addresses for this account.
-	};
-}
 
 #endif

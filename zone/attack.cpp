@@ -1041,7 +1041,7 @@ void Mob::Heal()
 
 void Client::Damage(Mob* other, int32 damage, uint16 spell_id, EQ::skills::SkillType attack_skill, bool avoidable, int8 buffslot, bool iBuffTic)
 {
-	if(dead || IsCorpse())
+	if (dead || IsCorpse() || IsZoningOut())
 		return;
 
 	if(spell_id==0)
@@ -1173,6 +1173,9 @@ void Client::Damage(Mob* other, int32 damage, uint16 spell_id, EQ::skills::Skill
 
 void Mob::DamageCommand(Mob* other, int32 damage, bool skipaggro, uint16 spell_id, EQ::skills::SkillType attack_skill)
 {
+	if (IsClient() && CastToClient()->IsZoningOut())
+		return;
+
 	if(!skipaggro)
 		AddToHateList(other, 0, damage, false, false);
 
@@ -1245,13 +1248,11 @@ void Mob::AggroPet(Mob* attacker)
 
 bool Client::Death(Mob* killerMob, int32 damage, uint16 spell, EQ::skills::SkillType attack_skill, uint8 killedby, bool bufftic)
 {
-	if(!ClientFinishedLoading())
+	if (!ClientFinishedLoading() || IsZoningOut())
 		return false;
 
 	if(dead)
 		return false;	//cant die more than once...
-
-	zone_mode = ZoneUnsolicited;
 
 	if(!spell)
 		spell = SPELL_UNKNOWN;
@@ -1274,6 +1275,9 @@ bool Client::Death(Mob* killerMob, int32 damage, uint16 spell, EQ::skills::Skill
 	if(killerMob && killerMob->IsClient() && (spell != SPELL_UNKNOWN) && damage > 0) {
 		char val1[20]={0};
 	}
+
+	if (Trader)
+		Trader_EndTrader();
 
 	// We're in the middle of a trade and are not leaving a corpse.
 	if (trade && (GetGM() || !RuleB(Character, LeaveCorpses) || GetLevel() < RuleI(Character, DeathItemLossLevel)))
@@ -1514,29 +1518,7 @@ bool Client::Death(Mob* killerMob, int32 damage, uint16 spell, EQ::skills::Skill
 	if(r)
 		r->MemberZoned(this);
 
-	dead_timer.Start(5000, true);
-
-	if (!IsLD())
-	{
-		m_pp.zone_id = m_pp.binds[0].zoneId;
-		database.MoveCharacterToZone(this->CharacterID(), m_pp.zone_id);
-	}
-	else
-	{
-		m_pp.zone_id = database.MoveCharacterToBind(CharacterID());
-		glm::vec4 bindpts (m_pp.binds[0].x, m_pp.binds[0].y, m_pp.binds[0].z, m_pp.binds[0].heading);
-		m_Position = bindpts;
-	}
-
-	m_pp.intoxication = 0;
-	m_pp.air_remaining = CalculateLungCapacity();
-
-	Save();
-
-	if (!IsLD())
-	{
-		GoToDeath();
-	}
+	GoToDeath();
 
 	if (PlayerEventLogs::Instance()->IsEventEnabled(PlayerEvent::DEATH)) {
 		auto e = PlayerEvent::DeathEvent{
@@ -3043,7 +3025,7 @@ void Mob::GenerateDamagePackets(Mob* attacker, bool FromDamageShield, int32 dama
 			SpawnHPUpdate_Struct* ds = (SpawnHPUpdate_Struct*)hp_app2->pBuffer;
 			ds->cur_hp = CastToClient()->GetHP() - itembonuses.HP;
 			ds->spawn_id = GetID();
-			ds->max_hp = CastToClient()->GetMaxHP() - itembonuses.HP;
+			ds->max_hp = CastToClient()->GetMaxHP();
 			CastToClient()->QueuePacket(hp_app2, false);
 			safe_delete(hp_app2);
 		}

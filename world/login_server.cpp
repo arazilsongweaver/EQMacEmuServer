@@ -59,7 +59,7 @@ LoginServer::~LoginServer() {
 void LoginServer::ProcessUsertoWorldReq(uint16_t opcode, EQ::Net::Packet& p)
 {
 	const WorldConfig* Config = WorldConfig::get();
-	LogNetcode("Received ServerPacket from LS OpCode {:#04x}", opcode);
+	LogNetcodeDetail("Received ServerPacket from LS OpCode {:#04x}", opcode);
 
 	UsertoWorldRequest* utwr = (UsertoWorldRequest*)p.Data();
 	uint32                     id = database.GetAccountIDFromLSID(utwr->lsaccountid);

@@ -190,7 +190,7 @@ static void ProcessCommandIgnore(Client *c, std::string Ignoree) {
 }
 
 Clientlist::Clientlist(int ChatPort) {
-	EQStreamManagerInterfaceOptions chat_opts(ChatPort, false, false);
+	EQ::Net::EQStreamManagerOptions chat_opts(ChatPort, false, false);
 	chat_opts.opcode_size = 1;
 	chat_opts.reliable_stream_options.stale_connection_ms = 600000;
 	chat_opts.reliable_stream_options.protocol_version = 2;
@@ -211,7 +211,7 @@ Clientlist::Clientlist(int ChatPort) {
 
 	chatsf = new EQ::Net::EQStreamManager(chat_opts);
 
-	ChatOpMgr = new RegularOpcodeManager;
+	ChatOpMgr = std::make_shared<RegularOpcodeManager>();
 
 	const ucsconfig *Config = ucsconfig::get();
 
@@ -228,14 +228,14 @@ Clientlist::Clientlist(int ChatPort) {
 
 	chatsf->OnNewConnection([this](std::shared_ptr<EQ::Net::EQStream> stream) {
 		LogInfo("New Client UDP connection from [{0}] [{1}]", stream->GetRemoteIP(), stream->GetRemotePort());
-		stream->SetOpcodeManager(&ChatOpMgr);
+		stream->SetOpcodeManager(ChatOpMgr);
 
 		auto c = new Client(stream);
 		ClientChatConnections.push_back(c);
 	});
 }
 
-Client::Client(std::shared_ptr<EQStreamInterface> eqs) {
+Client::Client(std::shared_ptr<EQ::Net::EQStream> eqs) {
 
 	ClientStream = eqs;
 
@@ -285,12 +285,7 @@ Client::~Client() {
 }
 
 void Client::CloseConnection() {
-
-	ClientStream->RemoveData();
-
 	ClientStream->Close();
-
-	ClientStream->ReleaseFromUse();
 }
 
 void Clientlist::CheckForStaleConnectionsAll() {
@@ -336,7 +331,7 @@ void Clientlist::Process()
 	auto it = ClientChatConnections.begin();
 	while (it != ClientChatConnections.end()) {
 		(*it)->AccountUpdate();
-		if ((*it)->ClientStream->CheckState(CLOSED)) {
+		if ((*it)->ClientStream->IsClosed()) {
 			struct in_addr in;
 			in.s_addr = (*it)->ClientStream->GetRemoteIP();
 

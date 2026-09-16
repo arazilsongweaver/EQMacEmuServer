@@ -354,8 +354,15 @@ struct ServerEmoteMessage_Struct {
 	char	message[0];
 };
 
+enum class WorldSessionStatus : uint8 {
+	InZone = 0,
+	Zoning = 1,
+	Offline = 2,
+	Online = 3
+};
+
 struct ServerClientList_Struct {
-	uint8	remove;
+	WorldSessionStatus status;
 	uint32	wid;
 	uint32	IP;
 	uint32	zone;
@@ -400,6 +407,7 @@ struct ServerZonePlayer_Struct {
 	float	x_pos;
 	float	y_pos;
 	float	z_pos;
+	float   heading;
 };
 
 struct RezzPlayer_Struct {
@@ -636,10 +644,14 @@ struct ZoneToZone_Struct {
 	int8	response;
 	int16	admin;
 	uint8	ignorerestrictions;
+	uint32	transaction_id;
 };
 
 struct WorldToZone_Struct {
 	uint32	account_id;
+	uint32	request_id;
+	uint32	character_id;
+	uint32	zone_id;
 	int8	response;
 };
 

@@ -1,7 +1,7 @@
 #include "../common/global_define.h"
 #include "../common/eqemu_logsys.h"
 #include "../common/eq_packet.h"
-#include "../common/eq_stream_intf.h"
+#include "../common/rdp/rdp_stream.h"
 #include "../common/misc.h"
 #include "../common/rulesys.h"
 #include "../common/emu_opcodes.h"
@@ -36,6 +36,8 @@
 
 #include <iostream>
 #include <iomanip>
+#include <memory>
+#include <utility>
 
 #include <string.h>
 #include <stdio.h>
@@ -69,22 +71,31 @@ extern uint32 numclients;
 extern volatile bool RunLoops;
 extern volatile bool UCSServerAvailable_;
 
-Client::Client(EQStreamInterface* ieqs)
-:	autobootup_timeout(RuleI(World, ZoneAutobootTimeoutMS)),
-	connect(1000),
-	eqs(ieqs)
+Client::Client(std::unique_ptr<RDPStream> stream)
+	: autobootup_timeout(RuleI(World, ZoneAutobootTimeoutMS)),
+	  initial_connection_timer(InitialConnectionTimeoutMs),
+	  connect(1000),
+	  m_session_disposition(SessionDisposition::ReleaseOnTransportEnd),
+	  m_stream(std::move(stream))
 {
-
-	// Live does not send datarate as of 3/11/2005
-	//eqs->SetDataRate(7);
-	ip = eqs->GetRemoteIP();
-	port = ntohs(eqs->GetRemotePort());
+	uint8 remote_address[4] = {};
+	ip = 0;
+	port = 0;
+	if (m_stream == nullptr || m_stream->GetRemoteAddress(remote_address, port) != RDPLIB_OK)
+	{
+		LogError("Client was created without a usable RDP stream");
+	}
+	else
+	{
+		memcpy(&ip, remote_address, sizeof(ip));
+	}
 
 	autobootup_timeout.Disable();
 	connect.Disable();
 	seen_character_select = false;
 	cle = 0;
 	zone_id = 0;
+	world_entrance_request_id = 0;
 	char_name[0] = 0;
 	char_id = 0;
 	zone_waiting_for_bootup = 0;
@@ -93,16 +104,26 @@ Client::Client(EQStreamInterface* ieqs)
 	numclients++;
 }
 
-Client::~Client() {
-	if (RunLoops && cle && zone_id == 0) {
+bool Client::MatchesWorldEntranceRequest(uint32 request_id, uint32 account_id, uint32 character_id, uint32 requested_zone_id) const
+{
+	return request_id != 0 &&
+		world_entrance_request_id == request_id &&
+		cle != nullptr &&
+		cle->AccountID() == account_id &&
+		char_id == character_id &&
+		zone_id == requested_zone_id;
+}
+
+Client::~Client()
+{
+	if (RunLoops && cle && cle->Online() != CLE_Status::Offline && m_session_disposition == SessionDisposition::ReleaseOnTransportEnd)
+	{
 		cle->SetOnline(CLE_Status::Offline);
 	}
 
 	numclients--;
 
-	//let the stream factory know were done with this stream
-	eqs->Close();
-	eqs->ReleaseFromUse();
+	CloseStream(0);
 }
 
 void Client::SendLogServer()
@@ -131,13 +152,12 @@ void Client::SendLogServer()
 	safe_delete(outapp);
 }
 
-void Client::SendEnterWorld(std::string name)
+bool Client::SendEnterWorld(std::string name)
 {
 	char char_name[64] = { 0 };
 	if (is_player_zoning && database.GetLiveChar(GetAccountID(), char_name)) {
 		if(database.GetAccountIDByChar(char_name) != GetAccountID()) {
-			eqs->Close();
-			return;
+			return false;
 		} else {
 			LogInfo("Telling client to continue session.");
 		}
@@ -147,6 +167,7 @@ void Client::SendEnterWorld(std::string name)
 	memcpy(outapp->pBuffer,char_name,strlen(char_name)+1);
 	QueuePacket(outapp);
 	safe_delete(outapp);
+	return true;
 }
 
 void Client::SendExpansionInfo() {
@@ -218,28 +239,27 @@ bool Client::HandleSendLoginInfoPacket(const EQApplicationPacket *app) {
 		return false;
 	}
 
-	if (((cle = ClientList::Instance()->CheckAuth(name, password)) || (cle = ClientList::Instance()->CheckAuth(id, password))))
+	ClientListEntry *authenticated_cle = ClientList::Instance()->CheckAuth(name, password);
+	if (!authenticated_cle)
+		authenticated_cle = ClientList::Instance()->CheckAuth(id, password);
 
+	if (authenticated_cle)
 	{
-		if(GetSessionLimit())
+		if (GetSessionLimit(authenticated_cle, is_player_zoning))
 			return false;
+
+		cle = authenticated_cle;
+		initial_connection_timer.Disable();
 
 		if(cle->Online() < CLE_Status::Online)
 			cle->SetOnline();
 		
-		if(eqs->ClientVersion() == EQ::versions::ClientVersion::Mac)
+		// All supported clients use the Mac packet protocol.  The login packet distinguishes Windows, Intel Mac, and PowerPC.
+		if( cle->GetMacClientVersion() != EQ::versions::ClientVersion::MacPC )
 		{
-			// EQMac PC Windows client is 2, passed from the loginserver.  This is world, it detects MacOSX Intel (4) and PPC (8) clients here.
-			if( cle->GetMacClientVersion() != EQ::versions::ClientVersion::MacPC )
-			{
-				cle->SetMacClientVersion(login_info->macversion);
-			}
-			m_ClientVersionBit = cle->GetMacClientVersion();
+			cle->SetMacClientVersion(login_info->macversion);
 		}
-		else
-		{
-			m_ClientVersionBit = EQ::versions::ClientVersion::Unused;
-		}
+		m_ClientVersionBit = cle->GetMacClientVersion();
 
 		LogInfo("ClientVersionBit is: [{}]", m_ClientVersionBit);
 		LogInfo("Logged in. Mode= [{}]", is_player_zoning ? "(Zoning)" : "(CharSel)");
@@ -275,15 +295,17 @@ bool Client::HandleSendLoginInfoPacket(const EQApplicationPacket *app) {
 			char_id = database.GetCharacterInfo(char_name, &tmpaccid, &zone_id);
 			if (char_id == 0 || tmpaccid != GetAccountID()) {
 				LogInfo("Could not get CharInfo for '[{}]'", char_name);
-				eqs->Close();
-				return true;
+				return false;
 			}
 			cle->SetChar(char_id, char_name);
-			SendEnterWorld(cle->name());
+			m_session_disposition = SessionDisposition::PreserveOnTransportEnd;
+			if (!SendEnterWorld(cle->name()))
+				return false;
 		}
 
 		if (!is_player_zoning) {
-			SendEnterWorld(cle->name());
+			if (!SendEnterWorld(cle->name()))
+				return false;
 			SendExpansionInfo();
 			SendCharInfo();
 			database.LoginIP(cle->AccountID(), long2ip(GetIP()));
@@ -490,14 +512,12 @@ bool Client::HandleEnterWorldPacket(const EQApplicationPacket *app)
 {
 	if (GetAccountID() == 0) {
 		LogInfo( "Enter world with no logged in account");
-		eqs->Close();
-		return true;
+		return false;
 	}
 
 	if (GetAdmin() < 0)	{
 		LogInfo( "Account banned or suspended.");
-		eqs->Close();
-		return true;
+		return false;
 	}
 
 	EnterWorld_Struct *ew = (EnterWorld_Struct *)app->pBuffer;
@@ -508,7 +528,7 @@ bool Client::HandleEnterWorldPacket(const EQApplicationPacket *app)
 	//if (RuleI(World, MaxClientsPerIP) >= 0) {
 	//	client_list.GetCLEIP(this->GetIP()); //Check current CLE Entry IPs against incoming connection
 	//}
-	if (GetSessionLimit()) {
+	if (GetSessionLimit(cle, is_player_zoning)) {
 		LogInfo("HandleEnterWorldPacket(): Rejecting request for character {} from {}:{} because of GetSessionLimit()", char_name, long2ip(this->GetIP()).c_str(), this->GetPort());
 		return false;
 	}
@@ -522,15 +542,13 @@ bool Client::HandleEnterWorldPacket(const EQApplicationPacket *app)
 	char_id = database.GetCharacterInfo(char_name, &tmpaccid, &zone_id);
 	if (char_id == 0 || tmpaccid != GetAccountID()) {
 		LogInfo( "Could not get CharInfo for '[{}]'", char_name);
-		eqs->Close();
-		return true;
+		return false;
 	}
 
 	// Make sure this account owns this character
 	if (tmpaccid != GetAccountID()) {
 		LogInfo( "This account does not own the character named '[{}]'", char_name);
-		eqs->Close();
-		return true;
+		return false;
 	}
 
 	if (zone_id == 0 || !ZoneName(zone_id)) {
@@ -546,85 +564,8 @@ bool Client::HandleEnterWorldPacket(const EQApplicationPacket *app)
 	}
 
 	if (!is_player_zoning) {
-		// we need to fix groups here.
-		// if they are in a group, it is because they have not timed out.
-		// server will allow someone logging right back in to pass through
-		// if they disconnected while zoning.
-		uint32 groupid = database.GetGroupID(char_name);
-		if (groupid > 0) {
-			auto pack = new ServerPacket(ServerOP_GroupLeave, sizeof(ServerGroupLeave_Struct));
-			ServerGroupLeave_Struct* gl = (ServerGroupLeave_Struct*)pack->pBuffer;
-			gl->gid = groupid;
-			gl->zoneid = 0;
-			strcpy(gl->member_name, char_name);
-			gl->checkleader = true;
-
-			database.SetGroupID(char_name, 0, char_id, GetAccountID());
-			
-			ZSList::Instance()->SendPacket(pack);
-			safe_delete(pack);
-		}
-		
-
-		// remove from raids
-		uint32 raidid = database.GetRaidID(char_name);
-		if (raidid > 0) {
-			auto pack = new ServerPacket(ServerOP_RaidRemoveLD, sizeof(ServerRaidGeneralAction_Struct));
-			ServerRaidGeneralAction_Struct *rga = (ServerRaidGeneralAction_Struct*)pack->pBuffer;
-			rga->rid = 0;
-
-			std::string query = StringFormat("SELECT groupid, isgroupleader, israidleader, islooter "
-				"FROM raid_members WHERE name='%s' and raidid=%lu",
-				char_name, (unsigned long)raidid);
-			auto results = database.QueryDatabase(query);
-			if (results.Success() && results.RowCount() == 1) {
-				auto row = results.begin();
-				if (row != results.end()) {
-					int groupNum = atoi(row[0]);
-					if (groupNum > 11)
-						groupNum = 0xFFFFFFFF;
-					bool GroupLeader = atoi(row[1]);
-					bool RaidLeader = atoi(row[2]);
-					bool RaidLooter = atoi(row[3]);
-
-					rga->rid = raidid;
-					rga->gid = groupNum;
-					rga->zoneid = RaidLeader;
-					rga->gleader = GroupLeader;
-					rga->looter = RaidLooter;
-					strn0cpy(rga->playername, char_name, 64);
-				}
-			}
-			// delete them from the raid in the db
-			query = StringFormat("DELETE FROM raid_members where name='%s'", char_name);
-			results = database.QueryDatabase(query);
-			if (rga->rid > 0) {
-				// this packet expects client already to be removed
-				// from db, when it arrives at zoneservers
-				ZSList::Instance()->SendPacket(pack);
-			}
-			safe_delete(pack);
-		}
-
-		/*uint32 groupid = database.GetGroupID(char_name);
-		if (groupid > 0) {
-			char* leader = 0;
-			char leaderbuf[64] = { 0 };
-			if ((leader = database.GetGroupLeaderForLogin(char_name, leaderbuf)) && strlen(leader) > 1) {
-				auto outapp3 = new EQApplicationPacket(OP_GroupUpdate, sizeof(GroupJoin_Struct));
-				GroupJoin_Struct* gj = (GroupJoin_Struct*)outapp3->pBuffer;
-				gj->action = groupActMakeLeader;
-				strcpy(gj->yourname, char_name);
-				strcpy(gj->membername, leader);
-				QueuePacket(outapp3);
-				safe_delete(outapp3);
-			}
-		}
-		else {
-			LogInfo( "Not pZoning clearing groupid for:%s", char_name);
-			database.SetGroupID(char_name, 0, charid, GetAccountID());
-			database.SetFirstLogon(charid, 1);
-		} */
+		// A normal character select entry must not inherit group or raid data from an old session. Zoning reconnects preserve it.
+		ClientList::Instance()->CharacterOffline(GetAccountID(), char_id, char_name);
 	}
 	else {
 		uint32 groupid = database.GetGroupID(char_name);
@@ -760,25 +701,19 @@ bool Client::HandlePacket(const EQApplicationPacket *app) {
 
 	EmuOpcode opcode = app->GetOpcode();
 
-	auto o = eqs->GetOpcodeManager();
 	LogPacketClientServer(
 		"[{}] [{:#06x}] Size [{}] {}",
 		OpcodeManager::EmuToName(app->GetOpcode()),
-		o->EmuToEQ(app->GetOpcode()) == 0 ? app->GetProtocolOpcode() : o->EmuToEQ(app->GetOpcode()),
+		app->GetProtocolOpcode(),
 		app->Size(),
 		(LogSys.IsLogEnabled(Logs::Detail, Logs::PacketClientServer) ? DumpPacketToString(app) : "")
 	);
-
-	if (!eqs->CheckState(ESTABLISHED)) {
-		LogInfo("Client disconnected (net inactive on send)");
-		return false;
-	}
 
 	// Voidd: Anti-GM Account hack, Checks source ip against valid GM Account IP Addresses
 	if (RuleB(World, GMAccountIPList) && this->GetAdmin() >= (RuleI(World, MinGMAntiHackStatus))) {
 		if(!database.CheckGMIPs(long2ip(this->GetIP()), this->GetAccountID())) {
 			LogInfo("GM Account not permited from source address [{}] and accountid [{}]", long2ip(this->GetIP()).c_str(), this->GetAccountID());
-			eqs->Close();
+			return false;
 		}
 	}
 
@@ -821,8 +756,7 @@ bool Client::HandlePacket(const EQApplicationPacket *app) {
 		}
 		case OP_WorldLogout:
 		{
-			eqs->Close();
-			return true;
+			return false;
 		}
 		
 		case OP_ZoneChange:
@@ -846,7 +780,6 @@ bool Client::HandlePacket(const EQApplicationPacket *app) {
 			else
 			{
 				LogInfo("Checksum failed for account: [{}]. Closing connection.", this->GetAccountID());
-				eqs->Close();
 				return false;
 			}
 		}
@@ -859,22 +792,63 @@ bool Client::HandlePacket(const EQApplicationPacket *app) {
 	return true;
 }
 
-bool Client::Process() {
-	bool ret = true;
-	//bool sendguilds = true;
-	sockaddr_in to = {};
+bool Client::Process()
+{
+	if (initial_connection_timer.Check(false))
+	{
+		LogInfo("Client timed out before sending an initial world login packet");
+		FinishTransport();
+		return false;
+	}
 
-	memset((char *) &to, 0, sizeof(to));
-	to.sin_family = AF_INET;
-	to.sin_port = port;
-	to.sin_addr.s_addr = ip;
+	bool keep_client = true;
+	bool transport_ended = m_stream == nullptr;
+	uint32 disconnect_reason = 0;
 
-	if (autobootup_timeout.Check()) {
-		LogInfo( "Zone bootup timer expired, bootup failed or too slow.");
+	while (keep_client && m_stream != nullptr)
+	{
+		EQApplicationPacket *app = nullptr;
+		RDPStream::ReceiveResult receive_result = m_stream->Receive(&app, &disconnect_reason);
+		if (receive_result == RDPStream::NoData)
+			break;
+
+		if (receive_result == RDPStream::PacketReceived)
+		{
+			keep_client = HandlePacket(app);
+			delete app;
+			continue;
+		}
+
+		transport_ended = true;
+		if (receive_result == RDPStream::PeerClosed)
+		{
+			LogNetcode("World client [{}] closed its RDP connection", GetAccountName());
+		}
+		else
+		{
+			LogNetcode(
+				"World client [{}] lost its RDP connection, reason [{:#010x}]",
+				GetAccountName(),
+				disconnect_reason
+			);
+		}
+		break;
+	}
+
+	if (!keep_client || transport_ended)
+	{
+		FinishTransport();
+		return false;
+	}
+
+	if (autobootup_timeout.Check())
+	{
+		LogInfo("Zone bootup timer expired, bootup failed or too slow.");
 		TellClientZoneUnavailable();
 	}
 
-	if(connect.Check()){
+	if (connect.Check())
+	{
 		//SendGuildList();// Send OPCode: OP_GuildsList
 		SendApproveWorld();
 		connect.Disable();
@@ -883,36 +857,49 @@ bool Client::Process() {
 	if (cle)
 		cle->KeepAlive();
 
+	return true;
+}
 
-	/************ Get all packets from packet manager out queue and process them ************/
-	EQApplicationPacket *app = 0;
-	while(ret && (app = (EQApplicationPacket *)eqs->PopPacket())) {
-		ret = HandlePacket(app);
-
-		delete app;
+void Client::FinishTransport()
+{
+	if (WorldConfig::get()->UpdateStats && cle != nullptr)
+	{
+		auto pack = new ServerPacket;
+		pack->opcode = ServerOP_LSPlayerLeftWorld;
+		pack->size = sizeof(ServerLSPlayerLeftWorld_Struct);
+		pack->pBuffer = new uchar[pack->size];
+		memset(pack->pBuffer, 0, pack->size);
+		auto logout = reinterpret_cast<ServerLSPlayerLeftWorld_Struct *>(pack->pBuffer);
+		strcpy(logout->key, GetLSKey());
+		logout->lsaccount_id = GetLSID();
+		LoginServerList::Instance()->SendPacket(pack);
+		safe_delete(pack);
 	}
 
-	if (!eqs->CheckState(ESTABLISHED)) {
-		if(WorldConfig::get()->UpdateStats){
-			auto pack = new ServerPacket;
-			pack->opcode = ServerOP_LSPlayerLeftWorld;
-			pack->size = sizeof(ServerLSPlayerLeftWorld_Struct);
-			pack->pBuffer = new uchar[pack->size];
-			memset(pack->pBuffer,0,pack->size);
-			ServerLSPlayerLeftWorld_Struct* logout =(ServerLSPlayerLeftWorld_Struct*)pack->pBuffer;
-			strcpy(logout->key,GetLSKey());
-			logout->lsaccount_id = GetLSID();
-			LoginServerList::Instance()->SendPacket(pack);
-			safe_delete(pack);
-		}
-		LogInfo("Client disconnected (not active in process)");
-		return false;
-	}
+	if (RunLoops && cle != nullptr && cle->Online() != CLE_Status::Offline && m_session_disposition == SessionDisposition::ReleaseOnTransportEnd)
+		cle->SetOnline(CLE_Status::Offline);
 
-	return ret;
+	CloseStream();
+	LogInfo("Client disconnected (world transport ended)");
+}
+
+void Client::CloseStream()
+{
+	CloseStream(RDPStream::DefaultLingerTimeout);
+}
+
+void Client::CloseStream(uint32 linger_timeout_ms)
+{
+	if (m_stream == nullptr)
+		return;
+
+	m_stream->Close(linger_timeout_ms);
+	m_stream.reset();
 }
 
 void Client::EnterWorld(bool TryBootup) {
+	world_entrance_request_id = 0;
+
 	if (zone_id == 0)
 		return;
 
@@ -980,7 +967,11 @@ void Client::EnterWorld(bool TryBootup) {
 		pack->pBuffer = new uchar[pack->size];
 		memset(pack->pBuffer, 0, pack->size);
 		WorldToZone_Struct* wtz = (WorldToZone_Struct*) pack->pBuffer;
+		world_entrance_request_id = ClientList::Instance()->GetNextWorldEntranceRequestID();
 		wtz->account_id = GetAccountID();
+		wtz->request_id = world_entrance_request_id;
+		wtz->character_id = char_id;
+		wtz->zone_id = zone_id;
 		wtz->response = 0;
 		zone_server->SendPacket(pack);
 		delete pack;
@@ -993,6 +984,8 @@ void Client::EnterWorld(bool TryBootup) {
 
 void Client::Clearance(int8 response)
 {
+	world_entrance_request_id = 0;
+
 	ZoneServer* zs = nullptr;
 	zs = ZSList::Instance()->FindByZoneID(zone_id);
 
@@ -1069,9 +1062,19 @@ void Client::Clearance(int8 response)
 	QueuePacket(outapp);
 	safe_delete(outapp);
 
+	// solar: The client will tear down the connection without a clean close as soon as it sees OP_ZoneServerInfo from us.
+	// This causes our side to keep retransmitting to a deaf peer.  We can't just tear it down immediately here,
+	// we need to give RDP time to send it out and possibly retransmit if it's lost, so we set a linger period.
+	// During this linger period RDP will keep trying to retransmit and will provoke ICMP unrechables from the peer.
+	// We have ICMP handling in rdplib which will close the transport and stop the retransmits.  If the ICMP doesn't
+	// make it, rdplib will keep trying to retransmit until either the linger period expires, or the transport is
+	// detected dead after 30 seconds.
+	CloseStream(30000);
+
 	if (cle) {
 		autobootup_timeout.Disable();
 		cle->SetOnline(CLE_Status::Zoning);
+		m_session_disposition = SessionDisposition::PreserveOnTransportEnd;
 	}
 }
 
@@ -1085,16 +1088,41 @@ void Client::TellClientZoneUnavailable() {
 	delete outapp;
 
 	zone_id = 0;
+	world_entrance_request_id = 0;
+	m_session_disposition = SessionDisposition::ReleaseOnTransportEnd;
 	zone_waiting_for_bootup = 0;
 	enter_world_triggered = false;
 	autobootup_timeout.Disable();
 }
 
-void Client::QueuePacket(const EQApplicationPacket* app, bool ack_req) {
-	LogNetcode("Sending EQApplicationPacket OpCode {:#04x}", app->GetOpcode());
+void Client::SendToStream(EQApplicationPacket **packet, bool reliable)
+{
+	if (packet == nullptr || *packet == nullptr)
+		return;
 
-	//ack_req = true;	// It's broke right now, dont delete this line till fix it. =P
-	eqs->QueuePacket(app, ack_req);
+	EmuOpcode opcode = (*packet)->GetOpcode();
+	if (m_stream == nullptr)
+	{
+		delete *packet;
+		*packet = nullptr;
+		return;
+	}
+
+	int result = m_stream->Send(packet, reliable);
+	if (result != RDPLIB_OK)
+	{
+		LogNetcode("Unable to send opcode [{}], RDP result [{}]", OpcodeManager::EmuToName(opcode), result);
+	}
+}
+
+void Client::QueuePacket(const EQApplicationPacket* app, bool ack_req) {
+	if (app == nullptr)
+		return;
+
+	LogNetcodeDetail("Sending EQApplicationPacket OpCode {:#04x}", app->GetOpcode());
+
+	EQApplicationPacket *copy = app->Copy();
+	SendToStream(&copy, ack_req);
 }
 
 void Client::SendGuildList() 
@@ -1111,7 +1139,7 @@ void Client::SendGuildList()
 
 	LogGuilds("Sending OP_GuildsList of length [{}]", outapp->size);
 
-	eqs->FastQueuePacket(&outapp);
+	SendToStream(&outapp, true);
 }
 
 void Client::SendApproveWorld()
@@ -1588,13 +1616,18 @@ void Client::SetClassLanguages(PlayerProfile_Struct *pp)
 	}
 }
 
-bool Client::GetSessionLimit()
+bool Client::GetSessionLimit(ClientListEntry *client_entry, bool continuing_zone_transfer)
 {
-	if (RuleI(World, AccountSessionLimit) >= 0 && cle->Admin() < (RuleI(World, ExemptAccountLimitStatus)) && (RuleI(World, ExemptAccountLimitStatus) != -1)) 
+	if (!client_entry)
+		return false;
+
+	if (RuleI(World, AccountSessionLimit) >= 0 && client_entry->Admin() < (RuleI(World, ExemptAccountLimitStatus)) && (RuleI(World, ExemptAccountLimitStatus) != -1))
 	{
-		if(ClientList::Instance()->CheckAccountActive(cle->AccountID()) && cle->Online() != CLE_Status::Zoning)
+		bool entry_active = client_entry->Online() >= CLE_Status::Zoning;
+		bool may_continue = continuing_zone_transfer && entry_active;
+		if (ClientList::Instance()->CheckAccountActive(client_entry->AccountID(), client_entry) || (entry_active && !may_continue))
 		{
-			LogInfo("Account [{}] attempted to login with an active player in the world.", cle->AccountID());
+			LogInfo("Account [{}] attempted to login with an active player in the world.", client_entry->AccountID());
 			return true;
 		}
 		else

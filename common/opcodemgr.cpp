@@ -25,10 +25,6 @@
 #include <stdio.h>
 #include <string>
 
-OpcodeManager::OpcodeManager() {
-	loaded = false;
-}
-
 bool OpcodeManager::LoadOpcodesFile(const char *filename, OpcodeSetStrategy *s, bool report_errors) {
 	FILE *opf = fopen(filename, "r");
 	if(opf == nullptr) {
@@ -147,35 +143,18 @@ bool RegularOpcodeManager::LoadOpcodes(const char *filename, bool report_errors)
 	s.it = this;
 	MOpcodes.lock();
 
-	loaded = true;
-	eq_to_emu = new EmuOpcode[MAX_EQ_OPCODE];
+	eq_to_emu = new EmuOpcode[EQ_OPCODE_COUNT];
 	emu_to_eq = new uint16[_maxEmuOpcode];
-	EQOpcodeCount = MAX_EQ_OPCODE;
+	EQOpcodeCount = EQ_OPCODE_COUNT;
 	EmuOpcodeCount = _maxEmuOpcode;
 
 	//dont need to set eq_to_emu cause every element should get a value
-	memset(eq_to_emu, 0, sizeof(EmuOpcode)*MAX_EQ_OPCODE);
+	memset(eq_to_emu, 0, sizeof(*eq_to_emu)*EQ_OPCODE_COUNT);
 	memset(emu_to_eq, 0, sizeof(uint16)*_maxEmuOpcode);
 
 	bool ret = LoadOpcodesFile(filename, &s, report_errors);
 	MOpcodes.unlock();
 	return ret;
-}
-
-bool RegularOpcodeManager::ReloadOpcodes(const char *filename, bool report_errors) {
-	if(!loaded)
-		return(LoadOpcodes(filename));
-
-	NormalMemStrategy s;
-	s.it = this;
-	MOpcodes.lock();
-
-	memset(eq_to_emu, 0, sizeof(uint16)*MAX_EQ_OPCODE);
-
-	bool ret = LoadOpcodesFile(filename, &s, report_errors);
-
-	MOpcodes.unlock();
-	return(ret);
 }
 
 uint16 RegularOpcodeManager::EmuToEQ(const EmuOpcode emu_op) {
@@ -195,9 +174,6 @@ uint16 RegularOpcodeManager::EmuToEQ(const EmuOpcode emu_op) {
 
 EmuOpcode RegularOpcodeManager::EQToEmu(const uint16 eq_op) {
 	//opcode is checked for validity in GetEmuOpcode
-//Disabled since current live EQ uses the entire uint16 bitspace for opcodes
-//	if(eq_op > MAX_EQ_OPCODE)
-//		return(OP_Unknown);
 	EmuOpcode res;
 	MOpcodes.lock();
 	res = eq_to_emu[eq_op];
@@ -236,10 +212,6 @@ bool NullOpcodeManager::LoadOpcodes(const char *filename, bool report_errors) {
 	return(true);
 }
 
-bool NullOpcodeManager::ReloadOpcodes(const char *filename, bool report_errors) {
-	return(true);
-}
-
 uint16 NullOpcodeManager::EmuToEQ(const EmuOpcode emu_op) {
 	return(0);
 }
@@ -253,10 +225,6 @@ EmptyOpcodeManager::EmptyOpcodeManager()
 }
 
 bool EmptyOpcodeManager::LoadOpcodes(const char *filename, bool report_errors) {
-	return(true);
-}
-
-bool EmptyOpcodeManager::ReloadOpcodes(const char *filename, bool report_errors) {
 	return(true);
 }
 

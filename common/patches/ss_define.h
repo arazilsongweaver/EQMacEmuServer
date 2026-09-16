@@ -1,5 +1,5 @@
 
-#define ENCODE(x) void Strategy::Encode_##x(EQApplicationPacket** p, std::shared_ptr<EQStreamInterface> dest, bool ack_req)
+#define ENCODE(x) void Strategy::Encode_##x(EQApplicationPacket** p, EQPacketEncodeResult *result, bool reliable)
 #define DECODE(x) void Strategy::Decode_##x(EQApplicationPacket *__packet)
 
 #define StructDist(in, f1, f2) (uint32(&in->f2)-uint32(&in->f1))
@@ -15,7 +15,7 @@
  *
  */
 //more complex operations and variable length packets
-#define FASTQUEUE(packet) dest->FastQueuePacket(&packet, ack_req);
+#define FASTQUEUE(packet) result->SetPacket(&packet, reliable);
 #define TAKE(packet_name) \
 	EQApplicationPacket *packet_name = *p; \
 	*p = nullptr;
@@ -59,19 +59,19 @@
 //call to finish an encoder using SETUP_DIRECT_ENCODE
 #define FINISH_ENCODE() \
 	delete[] __emu_buffer; \
-	dest->FastQueuePacket(&__packet, ack_req);
+	result->SetPacket(&__packet, reliable);
 
 //check length of packet before decoding. Call before setup.
 #define ENCODE_LENGTH_EXACT(struct_) \
 	if((*p)->size != sizeof(struct_)) { \
-		LogNetcodeDetail("Wrong size on outbound [{}] (" #struct_ "): Got [{}], expected [{}]", opcodes->EmuToName((*p)->GetOpcode()), (*p)->size, sizeof(struct_)); \
+		LogNetcodeDetail("Wrong size on outbound [{}] (" #struct_ "): Got [{}], expected [{}]", OpcodeManager::EmuToName((*p)->GetOpcode()), (*p)->size, sizeof(struct_)); \
 		delete *p; \
 		*p = nullptr; \
 		return; \
 	}
 #define ENCODE_LENGTH_ATLEAST(struct_) \
 	if((*p)->size < sizeof(struct_)) { \
-		LogNetcodeDetail("Wrong size on outbound [{}] (" #struct_ "): Got [{}], expected at least [{}]", opcodes->EmuToName((*p)->GetOpcode()), (*p)->size, sizeof(struct_)); \
+		LogNetcodeDetail("Wrong size on outbound [{}] (" #struct_ "): Got [{}], expected at least [{}]", OpcodeManager::EmuToName((*p)->GetOpcode()), (*p)->size, sizeof(struct_)); \
 		delete *p; \
 		*p = nullptr; \
 		return; \
@@ -79,7 +79,7 @@
 
 //forward this opcode to another encoder
 #define ENCODE_FORWARD(other_op) \
-	Encode_##other_op(p, dest, ack_req);
+	Encode_##other_op(p, result, reliable);
 
 //destroy the packet, it is not sent to this client version
 #define EAT_ENCODE(op) \
@@ -120,12 +120,12 @@
 #undef IN
 #define IN(x) emu->x = eq->x;
 
-//call before any premature returns in an encoder using SETUP_DIRECT_DECODE
+//call before any premature returns in a decoder using SETUP_DIRECT_DECODE
 #define FAIL_DIRECT_DECODE() \
 	delete[] __eq_buffer; \
-	p->SetOpcode(OP_Unknown);
+	__packet->SetOpcode(OP_Unknown);
 
-//call to finish an encoder using SETUP_DIRECT_DECODE
+//call to finish a decoder using SETUP_DIRECT_DECODE
 #define FINISH_DIRECT_DECODE() \
 	delete[] __eq_buffer;
 
@@ -133,14 +133,14 @@
 #define DECODE_LENGTH_EXACT(struct_) \
 	if(__packet->size != sizeof(struct_)) { \
 		__packet->SetOpcode(OP_Unknown); /* invalidate the packet */ \
-		LogNetcodeDetail("Wrong size on incoming [{}] (" #struct_ "): Got [{}], expected [{}]", opcodes->EmuToName(__packet->GetOpcode()), __packet->size, sizeof(struct_)); \
+		LogNetcodeDetail("Wrong size on incoming [{}] (" #struct_ "): Got [{}], expected [{}]", OpcodeManager::EmuToName(__packet->GetOpcode()), __packet->size, sizeof(struct_)); \
 		return; \
 	}
 
 #define DECODE_LENGTH_ATLEAST(struct_) \
 	if(__packet->size < sizeof(struct_)) { \
 		__packet->SetOpcode(OP_Unknown); /* invalidate the packet */ \
-		LogNetcodeDetail("Wrong size on incoming [{}] (" #struct_ "): Got [{}], expected at least [{}]", opcodes->EmuToName(__packet->GetOpcode()), __packet->size, sizeof(struct_)); \
+		LogNetcodeDetail("Wrong size on incoming [{}] (" #struct_ "): Got [{}], expected at least [{}]", OpcodeManager::EmuToName(__packet->GetOpcode()), __packet->size, sizeof(struct_)); \
 		return; \
 	}
 

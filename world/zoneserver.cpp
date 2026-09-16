@@ -37,7 +37,6 @@
 #include "../common/repositories/player_event_logs_repository.h"
 #include "../common/events/player_event_logs.h"
 #include "../common/zone_store.h"
-#include "../common/patches/patches.h"
 #include "../common/skill_caps.h"
 #include "../common/server_reload_types.h"
 
@@ -876,24 +875,28 @@ void ZoneServer::HandleMessage(uint16 opcode, const EQ::Net::Packet &p) {
 			}
 
 			auto wtz = (WorldToZone_Struct*) pack->pBuffer;
-			Client *client = 0;
-			client = ClientList::Instance()->FindByAccountID(wtz->account_id);
-			if (client != 0) {
+			Client *client = ClientList::Instance()->FindByWorldEntranceRequest(*wtz);
+			if (client != nullptr) {
 				client->Clearance(wtz->response);
+			}
+			else {
+				LogInfo(
+					"Ignoring stale world entrance response request [{}] account [{}] character [{}] zone [{}]",
+					wtz->request_id,
+					wtz->account_id,
+					wtz->character_id,
+					wtz->zone_id
+				);
 			}
 			break;
 		}
 		case ServerOP_ZoneToZoneRequest: {
 			//
-			// solar: ZoneChange is received by the zone the player is in, then the
-			// zone sends a ZTZ which ends up here. This code then find the target
-			// (ingress point) and boots it if needed, then sends the ZTZ to it.
-			// The ingress server will decide wether the player can enter, then will
-			// send back the ZTZ to here. This packet is passed back to the egress
-			// server, which will send a ZoneChange response back to the client
-			// which can be an error, or a success, in which case the client will
-			// disconnect, and their zone location will be saved when ~Client is
-			// called, so it will be available when they ask to zone.
+			// solar: ZoneChange is received by the zone the player is in, then the zone sends a ZTZ here.
+			// World finds or boots the ingress zone and asks it for the final answer. The reply from the ingress
+			// zone is routed back through here to the egress zone.
+			// The egress zone commits the destination when the ingress zone approves it, then replies to the client.
+			// OP_DeleteSpawn is the client's final acknowledgement that it is ready for the source zone to remove it.
 			//
 
 
@@ -907,8 +910,8 @@ void ZoneServer::HandleMessage(uint16 opcode, const EQ::Net::Packet &p) {
 				client = ClientList::Instance()->FindCharacter(ztz->name);
 			}
 
-			LogInfo("ZoneToZone request for [{}] current zone [{}] req zone [{}]",
-				ztz->name, ztz->current_zone_id, ztz->requested_zone_id);
+			LogInfo("ZoneToZone request for [{}] transaction [{}] current zone [{}] req zone [{}]",
+				ztz->name, ztz->transaction_id, ztz->current_zone_id, ztz->requested_zone_id);
 
 			/* This is a request from the egress zone */
 			if (GetZoneID() == ztz->current_zone_id) {
@@ -952,17 +955,22 @@ void ZoneServer::HandleMessage(uint16 opcode, const EQ::Net::Packet &p) {
 						ztz->response = 0;
 					}
 				}
-				if (ztz->response != 0 && client)
-					client->LSZoneChange(ztz);
-				SendPacket(pack);	// send back to egress server
 				if (ingress_server) {
 					ingress_server->SendPacket(pack);	// inform target server
+				}
+				else {
+					// No destination exists to answer us.
+					SendPacket(pack);
 				}
 			}
 			/* Response from Ingress server, route back to egress */
 			else {
 
 				LogInfo("Processing ZTZ for ingress to zone for client [{}]", ztz->name);
+				if (ztz->response > 0 && client) {
+					client->LSZoneChange(ztz);
+				}
+
 				ZoneServer *egress_server = nullptr;
 				egress_server = ZSList::Instance()->FindByZoneID(ztz->current_zone_id);
 
@@ -1022,12 +1030,7 @@ void ZoneServer::HandleMessage(uint16 opcode, const EQ::Net::Packet &p) {
 			break;
 		}
 		case ServerOP_KickPlayer: {
-			auto skp = (ServerKickPlayer_Struct*) pack->pBuffer;
-			ClientListEntry* cle = ClientList::Instance()->FindCLEByAccountID(skp->AccountID);
-			if (cle) {
-				cle->SetOnline(CLE_Status::Offline);
-			}
-
+			// Zone sends the final client update after it processes the kick. Until then the character is still in the world.
 			ZSList::Instance()->SendPacket(pack);
 			break;
 		}

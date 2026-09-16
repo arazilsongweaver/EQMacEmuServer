@@ -20,6 +20,7 @@
 #include "login_types.h"
 #include <stdlib.h>
 
+#include "../common/eq_packet.h"
 #include "../common/eqemu_logsys.h"
 #include "../common/ip_util.h"
 
@@ -110,7 +111,7 @@ EQApplicationPacket* ServerManager::CreateServerListPacket(Client* c)
 	unsigned int packet_size = sizeof(ServerList_Struct);
 	unsigned int server_count = 0;
 	in_addr in;
-	in.s_addr = c->GetConnection()->GetRemoteIP();
+	in.s_addr = c->GetIP();
 	std::string client_ip = inet_ntoa(in);
 	auto iter = m_world_servers.begin();
 	while (iter != m_world_servers.end()) {

@@ -19,11 +19,12 @@
 #define EQEMU_CLIENTMANAGER_H
 
 #include "../common/global_define.h"
-#include "../common/opcodemgr.h"
-#include "../common/eq_stream_type.h"
-#include "../common/eq_stream_factory.h"
+#include "../common/eq_packet_translator.h"
+#include "../common/rdp/rdp_endpoint.h"
 #include "client.h"
+
 #include <list>
+#include <memory>
 
 using namespace std;
 
@@ -34,12 +35,12 @@ class ClientManager
 {
 public:
 	/**
-	* Constructor, sets up the stream factories and opcode managers.
+	* Constructor, sets up the RDP listener and opcode translator.
 	*/
 	ClientManager();
 
 	/**
-	* Destructor, shuts down the streams and opcode managers.
+	* Destructor, shuts down the clients, listener, translator, and RDP runtime.
 	*/
 	~ClientManager();
 
@@ -62,16 +63,19 @@ public:
 	* Gets a client (if exists) by their account id.
 	*/
 	Client *GetClient(unsigned int account_id);
+
 private:
+	using ClientList = std::list<std::unique_ptr<Client>>;
 
-	/**
-	* Processes disconnected clients, removes them if necessary.
-	*/
-	void ProcessDisconnect();
+	static constexpr uint32 MaximumClientAcceptsPerTick = 5;
 
-	std::list<Client *> clients;
-	OpcodeManager       *old_ops;
-	EQStreamFactory     *old_stream;
+	void AcceptClients();
+	ClientList::iterator RemoveClient(ClientList::iterator client);
+
+	RDPRuntime m_rdp_runtime;
+	EQPacketTranslator m_packet_translator;
+	RDPEndpoint m_rdp_endpoint;
+	ClientList clients;
 };
 
 #endif

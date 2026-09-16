@@ -92,11 +92,12 @@ ClientListEntry::ClientListEntry(uint32 in_id, ZoneServer *iZS, ServerClientList
 
 ClientListEntry::~ClientListEntry()
 {
+	SetOnline(CLE_Status::Offline);
+
 	if (RunLoops) {
-		Camp(); // updates zoneserver's numplayers
 		ClientList::Instance()->RemoveCLEReferances(this);
 	}
-	SetOnline(CLE_Status::Offline);
+
 	SetAccountID(0);
 	for (auto &elem : tell_queue)
 		safe_delete_array(elem);
@@ -125,12 +126,18 @@ void ClientListEntry::SetOnline(CLE_Status iOnline)
 	else if (iOnline < CLE_Status::Online && pOnline >= CLE_Status::Online) {
 		numplayers--;
 	}
-		if (iOnline != CLE_Status::Online || pOnline < CLE_Status::Online) {
+	if (paccountid != 0 && iOnline >= CLE_Status::Zoning && pOnline < CLE_Status::Zoning)
+		database.SetAccountActive(paccountid);
+
+	if (pOnline >= CLE_Status::Zoning && iOnline < CLE_Status::Zoning) {
 		pOnline = iOnline;
-	}
-	if (iOnline < CLE_Status::Zoning) {
 		Camp();
 	}
+
+	if (iOnline != CLE_Status::Online || pOnline < CLE_Status::Online) {
+		pOnline = iOnline;
+	}
+
 	if (pOnline >= CLE_Status::Online) {
 		stale = 0;
 	}
@@ -267,7 +274,7 @@ void ClientListEntry::ClearVars(bool iAll)
 	pLFG           = false;
 	gm             = 0;
 	pClientVersion = 0;
-	pLD;
+	pLD            = false;
 	pbaserace      = 0;
 	pmule          = false;
 	pAFK           = false;
@@ -287,64 +294,7 @@ void ClientListEntry::Camp(ZoneServer* iZS)
 		LSUpdate(pzoneserver);
 	}
 
-	if (!ClientList::Instance()->ActiveConnection(paccountid, pcharid)) {
-		database.ClearAccountActive(paccountid);
-		// remove from groups
-		LogInfo("Camp() Removing from groups: [{}]", this->pname);
-
-		uint32 groupid = database.GetGroupID(this->pname);
-		if (groupid > 0) {
-			auto pack = new ServerPacket(ServerOP_GroupLeave, sizeof(ServerGroupLeave_Struct));
-			ServerGroupLeave_Struct* gl = (ServerGroupLeave_Struct*)pack->pBuffer;
-			gl->gid = groupid;
-			gl->zoneid = 0;
-			strcpy(gl->member_name, this->pname);
-			gl->checkleader = true;
-			ZSList::Instance()->SendPacket(pack);
-			safe_delete(pack);
-		}
-		database.SetGroupID(this->pname, 0, CharID(), this->paccountid);
-
-		// remove from raids
-		uint32 raidid = database.GetRaidID(this->pname);
-		if (raidid > 0) {
-			auto pack = new ServerPacket(ServerOP_RaidRemoveLD, sizeof(ServerRaidGeneralAction_Struct));
-			ServerRaidGeneralAction_Struct *rga = (ServerRaidGeneralAction_Struct*)pack->pBuffer;
-			rga->rid = 0;
-
-			std::string query = StringFormat("SELECT groupid, isgroupleader, israidleader, islooter "
-				"FROM raid_members WHERE name='%s' and raidid=%lu",
-				this->pname, (unsigned long)raidid);
-			auto results = database.QueryDatabase(query);
-			if (results.Success() && results.RowCount() == 1) {
-				auto row = results.begin();
-				if (row != results.end()) {
-					int groupNum = atoi(row[0]);
-					if (groupNum > 11)
-						groupNum = 0xFFFFFFFF;
-					bool GroupLeader = atoi(row[1]);
-					bool RaidLeader = atoi(row[2]);
-					bool RaidLooter = atoi(row[3]);
-
-					rga->rid = raidid;
-					rga->gid = groupNum;
-					rga->zoneid = RaidLeader;
-					rga->gleader = GroupLeader;
-					rga->looter = RaidLooter;
-					strn0cpy(rga->playername, this->pname, 64);
-				}
-			}
-			// delete them from the raid in the db
-			query = StringFormat("DELETE FROM raid_members where name='%s'", this->pname);
-			results = database.QueryDatabase(query);
-			if (rga->rid > 0) {
-				// server expects db to already be updated with member removed
-				// when ServerOP_RaidRemoveLD arrives at zoneservers
-				ZSList::Instance()->SendPacket(pack);
-			}
-			safe_delete(pack);
-		}
-	}
+	ClientList::Instance()->CharacterOffline(paccountid, pcharid, pname);
 	if (pOnline < CLE_Status::Online)
 		stale = 3; // new state is offline
 	else

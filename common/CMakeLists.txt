@@ -26,10 +26,7 @@ SET(common_sources
     eqemu_logsys.cpp
     eq_limits.cpp
     eq_packet.cpp
-    eq_stream.cpp
-    eq_stream_factory.cpp
-    eq_stream_ident.cpp
-    eq_stream_proxy.cpp
+    eq_packet_translator.cpp
     eqtime.cpp
     event_sub.cpp
     events/player_event_logs.cpp
@@ -58,7 +55,6 @@ SET(common_sources
     opcode_map.cpp
     opcodemgr.cpp
     packet_dump.cpp
-    packet_dump_file.cpp
     packet_functions.cpp
     path_manager.cpp
     process/process.cpp
@@ -67,6 +63,12 @@ SET(common_sources
     profanity_manager.cpp
     ptimer.cpp
     races.cpp
+    rdp/position_update_batch.cpp
+    rdp/rdp_connection.cpp
+    rdp/rdp_endpoint.cpp
+    rdp/rdp_packet_loss.cpp
+    rdp/rdp_runtime.cpp
+    rdp/rdp_stream.cpp
     rdtsc.cpp
     rulesys.cpp
     say_link.cpp
@@ -78,9 +80,7 @@ SET(common_sources
     skill_caps.cpp
     spdat.cpp
     strings.cpp
-    struct_strategy.cpp
     textures.cpp
-    timeoutmgr.cpp
     timer.cpp
     unix.cpp
     uuid.cpp
@@ -103,7 +103,6 @@ SET(common_sources
     net/websocket_server_connection.cpp
     json/json.hpp
     json/jsoncpp.cpp
-    patches/patches.cpp
     patches/mac.cpp
     patches/mac_limits.cpp
     StackWalker/StackWalker.cpp
@@ -390,13 +389,7 @@ SET(common_headers
     eqemu_logsys_log_aliases.h
     eq_limits.h
     eq_packet.h
-    eq_stream.h
-    eq_stream_factory.h
-    eq_stream_ident.h
-    eq_stream_intf.h
-    eq_stream_locator.h
-    eq_stream_proxy.h
-    eq_stream_type.h
+    eq_packet_translator.h
     eqtime.h
     event_sub.h
     events/player_event_logs.h
@@ -433,10 +426,8 @@ SET(common_headers
     mysql_request_result.h
     mysql_request_row.h
     name_generator.h
-    op_codes.h
     opcodemgr.h
     packet_dump.h
-    packet_dump_file.h
     packet_functions.h
     path_manager.h
     platform.h
@@ -449,6 +440,12 @@ SET(common_headers
     queue.h
     races.h
     random.h
+    rdp/position_update_batch.h
+    rdp/rdp_connection.h
+    rdp/rdp_endpoint.h
+    rdp/rdp_packet_loss.h
+    rdp/rdp_runtime.h
+    rdp/rdp_stream.h
     rdtsc.h
     rulesys.h
     ruletypes.h
@@ -464,9 +461,7 @@ SET(common_headers
     skill_caps.h
     spdat.h
     strings.h
-    struct_strategy.h
     textures.h
-    timeoutmgr.h
     timer.h
     types.h
     unix.h
@@ -502,14 +497,12 @@ SET(common_headers
     net/tcp_server.h
     net/websocket_server.h
     net/websocket_server_connection.h
-    patches/patches.h
     patches/mac.h
     patches/mac_limits.h
     patches/mac_ops.h
     patches/mac_structs.h
     patches/ss_declare.h
     patches/ss_define.h
-    patches/ss_register.h
     StackWalker/StackWalker.h
     termcolor/rang.hpp
     tinyxml/tinystr.h
@@ -571,11 +564,8 @@ SOURCE_GROUP(Net FILES
 )
 
 SOURCE_GROUP(Patches FILES
-    patches/patches.h
     patches/ss_declare.h
     patches/ss_define.h
-    patches/ss_register.h
-    patches/patches.cpp
     patches/mac.h
     patches/mac_ops.h
     patches/mac_structs.h

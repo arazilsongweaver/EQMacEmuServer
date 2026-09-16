@@ -186,7 +186,49 @@ bool Doors::Process()
 	return true;
 }
 
-void Doors::HandleClick(Client* sender, uint8 trigger, bool floor_port)
+void Doors::HandleTeleport(Client *sender)
+{
+	// First pass policy: the legacy doors destination columns are authoritative.
+	// Later, destination resolution can fall back to a zone point resolved by the door parameter here.
+	if (!sender || sender->HasDied() || !HasDestinationZone())
+	{
+		return;
+	}
+
+	const uint32 destination_zone_id = ZoneID(destination_zone_name);
+	if (destination_zone_id == 0)
+	{
+		LogDoors(
+			"[{}] clicked teleport door [{}] with invalid destination zone [{}].",
+			sender->GetName(),
+			door_id,
+			destination_zone_name
+		);
+		return;
+	}
+
+	uint32 player_key = 0;
+	if (!DoorKeyCheck(sender, player_key))
+	{
+		return;
+	}
+
+	if (destination_zone_id != zone->GetZoneID() && !sender->CanBeInZone(destination_zone_id))
+	{
+		return;
+	}
+
+	glm::vec4 destination = m_destination;
+	// Retain the legacy random location adjustment for transfers between zones.
+	if (destination_zone_id != zone->GetZoneID())
+	{
+		zone->ApplyRandomLoc(destination_zone_id, destination.x, destination.y);
+	}
+
+	sender->MovePC(destination_zone_id, destination.x, destination.y, destination.z, destination.w);
+}
+
+void Doors::HandleClick(Client* sender, uint8 trigger)
 {
 	//door debugging info dump
 	LogDoors("[{}] clicked door [{}] (dbid [{}], eqid [{}]) at [{}]", sender->GetName(), this->door_name, this->database_id, this->door_id, to_string(m_position).c_str());
@@ -195,6 +237,16 @@ void Doors::HandleClick(Client* sender, uint8 trigger, bool floor_port)
 
 	if (!IsMoveable()) {
 		LogDoors("[{}] clicked door [{}] that doesn't open.", sender->GetName(), door_id);
+		return;
+	}
+
+	if (open_type == 57)
+	{
+		// The client parameter is a 16 bit field whose negative sentinel appears here as an unsigned value.
+		if (door_param > 0 && door_param <= 0x7fff)
+		{
+			HandleTeleport(sender);
+		}
 		return;
 	}
 
@@ -258,7 +310,7 @@ void Doors::HandleClick(Client* sender, uint8 trigger, bool floor_port)
 		}
 	}
 
-	if ((!floor_port && open_type != 58) || !HasDestinationZone()) {
+	if (open_type != 58 || !HasDestinationZone()) {
 		entity_list.QueueClients(sender, outapp, false);
 		if (!IsDoorOpen()) {
 			if (close_time > 0)
@@ -297,7 +349,7 @@ void Doors::HandleClick(Client* sender, uint8 trigger, bool floor_port)
 	safe_delete(outapp);
 
 	// Teleport door!
-	if((floor_port || open_type == 58) && IsTeleport() && sender && !sender->HasDied()) {
+	if(open_type == 58 && IsTeleport() && sender && !sender->HasDied()) {
 
 		uint32 keyneeded = GetKeyItem();
 		uint32 playerkey = key;
@@ -310,12 +362,12 @@ void Doors::HandleClick(Client* sender, uint8 trigger, bool floor_port)
 			return;
 		}
 
-		if ((floor_port || IsDestinationZoneSame()) && !keyneeded) {
+		if (IsDestinationZoneSame() && !keyneeded) {
 			if(!keepoffkeyring) {
 				sender->KeyRingAdd(playerkey);
 			}
 			sender->MovePC(zone->GetZoneID(), m_destination.x, m_destination.y, m_destination.z, m_destination.w);
-		} else if ((!IsDoorOpen() || open_type == 58 || floor_port) && (keyneeded && ((keyneeded == playerkey) || sender->GetGM()))) {
+		} else if ((!IsDoorOpen() || open_type == 58) && (keyneeded && ((keyneeded == playerkey) || sender->GetGM()))) {
 			if(!keepoffkeyring) {
 				sender->KeyRingAdd(playerkey);
 			}

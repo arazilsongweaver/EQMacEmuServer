@@ -51,6 +51,8 @@ extern volatile bool is_zone_loaded;
 extern WorldServer worldserver;
 extern uint32 numclients;
 
+constexpr uint16 MaxEntityID = 4999;
+
 Entity::Entity()
 {
 	id = 0;
@@ -244,6 +246,8 @@ const Encounter* Entity::CastToEncounter() const
 
 EntityList::EntityList()
 	:
+	tsFirstSpawnOnQueue(0xFFFFFFFF),
+	NumSpawnsOnQueue(0),
 	object_timer(5000),
 	door_timer(5000),
 	corpse_timer(2000),
@@ -254,10 +258,10 @@ EntityList::EntityList()
 {
 
 
-	// set up ids between 1 and 1500
+	// Entity IDs accepted by the client are 1 through 4999.
 	// neither client or server performs well if you have
 	// enough entities to exhaust this list
-	for (uint16 i = 1; i <= 4999; i++)
+	for (uint16 i = 1; i <= MaxEntityID; i++)
 		free_ids.push(i);
 }
 
@@ -687,6 +691,7 @@ void EntityList::AddCorpse(Corpse *corpse, uint32 in_id)
 	else
 		corpse->SetID(in_id);
 
+	corpse->SetSpawned();
 	corpse->CalcCorpseName();
 	corpse_list.emplace(std::pair<uint16, Corpse *>(corpse->GetID(), corpse));
 
@@ -864,30 +869,6 @@ void EntityList::CheckSpawnQueue()
 	}
 }
 
-void EntityList::OpenFloorTeleportNear(Client* c)
-{
-	if (!c || door_list.empty())
-		return;
-
-	auto client_pos = c->GetPosition();
-	for (auto it = door_list.begin(); it != door_list.end(); ++it) 
-	{
-		Doors *cdoor = it->second;
-
-		if (!cdoor || !cdoor->IsMoveable() || cdoor->GetOpenType() != 57 || !cdoor->IsTeleport())
-			continue;
-
-		auto diff = c->GetPosition() - cdoor->GetPosition();
-		float curdist = diff.x * diff.x + diff.y * diff.y;
-		LogDoorsDetail("A floor teleport with id [{}] was found at [{:.2f}] away at [{:.2f}] Z.", cdoor->GetDoorDBID(), curdist, diff.z * diff.z);
-		if (diff.z * diff.z < 105 && curdist <= 600)
-		{
-			cdoor->HandleClick(c, 0, true);
-			return;
-		}
-	}
-}
-
 Doors *EntityList::FindNearestDoor(Client* c)
 {
 	if (!c || door_list.empty())
@@ -1025,13 +1006,14 @@ bool EntityList::SendZoneDoorsBulk(EQApplicationPacket* app, Client *client)
 
 	auto it = door_list.begin();
 	while (it != door_list.end()) {
-		if ((it->second->GetClientVersionMask() & mask_test) &&
-			strlen(it->second->GetDoorName()) > 3)
+		if (it->second->GetClientVersionMask() & mask_test) {
 			count++;
+			if (count == 0) return false; // more than 255 is an error
+		}
 		++it;
 	}
 
-	if (count == 0 || count > 255) //doorid is uint8
+	if (count == 0) //doorid is uint8
 		return false;
 
 	Doors *door;
@@ -1041,8 +1023,7 @@ bool EntityList::SendZoneDoorsBulk(EQApplicationPacket* app, Client *client)
 	it = door_list.begin();
 	while (it != door_list.end()) {
 		door = it->second;
-		if (door && (door->GetClientVersionMask() & mask_test) &&
-				strlen(door->GetDoorName()) > 3) {
+		if (door && (door->GetClientVersionMask() & mask_test)) {
 			memcpy(nd->name, door->GetDoorName(), 16);
 			auto position = door->GetPosition();
 			nd->xPos = position.x;
@@ -1063,15 +1044,21 @@ bool EntityList::SendZoneDoorsBulk(EQApplicationPacket* app, Client *client)
 		++it;
 	}
 
-	int32 deflength = sizeof(Door_Struct) * count;
 	int buffer = 2; //Length of count that preceeds the packet.
-
 	app->SetOpcode(OP_SpawnDoor);
 	uint32 deflatedSize = EstimateDeflateBuffer(length);
-	app->pBuffer = new uchar[deflatedSize];
-	app->size = buffer + DeflatePacket(packet, length, app->pBuffer + buffer, deflatedSize);
+	if (!deflatedSize)
+		return false;
+	app->pBuffer = new uchar[deflatedSize + buffer];
+	int compressed_size = DeflatePacket(packet, length, app->pBuffer + buffer, deflatedSize);
+	if (!compressed_size)
+	{
+		safe_delete_array(app->pBuffer);
+		app->size = 0;
+		return false;
+	}
+	app->size = buffer + compressed_size;
 	DoorSpawns_Struct* ds = (DoorSpawns_Struct*)app->pBuffer;
-
 	ds->count = count;
 
 	return true;
@@ -1080,7 +1067,13 @@ bool EntityList::SendZoneDoorsBulk(EQApplicationPacket* app, Client *client)
 Entity *EntityList::GetEntityMob(uint16 id)
 {
 	auto it = mob_list.find(id);
-	if (it != mob_list.end())
+	// solar: when a Client or NPC dies and leaves a corpse, the retiring entity still exists but
+	// has its ID changed to 0 and the Corpse entity gains their original ID.  the maps that
+	// EntityList is using are not updated when this happens, and mob_list is checked before corpse_list
+	// so during the retiring period, which is at least 2 seconds for a dead client, GetMob returns
+	// the stale object with ID 0.
+	// this GetID() == id check allows the Client or NPC that turned into a Corpse to be rejected here
+	if (it != mob_list.end() && it->second != nullptr && it->second->GetID() == id)
 		return it->second;
 	return nullptr;
 }
@@ -1319,22 +1312,53 @@ Doors *EntityList::GetDoorsByDoorID(uint32 id)
 	return nullptr;
 }
 
+bool EntityList::IsEntityIDOccupied(uint16 id) const
+{
+	if (id == 0)
+		return true;
+
+	return client_list.count(id) != 0 ||
+		mob_list.count(id) != 0 ||
+		npc_list.count(id) != 0 ||
+		corpse_list.count(id) != 0 ||
+		object_list.count(id) != 0 ||
+		door_list.count(id) != 0 ||
+		trap_list.count(id) != 0 ||
+		beacon_list.count(id) != 0 ||
+		encounter_list.count(id) != 0;
+}
+
 uint16 EntityList::GetFreeID()
 {
-	if (free_ids.empty()) { // hopefully this will never be true
-		// The client has a hard cap on entity count some where
-		// Neither the client or server performs well with a lot entities either
-		uint16 newid = 1500;
-		while (true) {
-			newid++;
-			if (GetID(newid) == nullptr)
-				return newid;
-		}
+	while (!free_ids.empty()) {
+		const uint16 candidate = free_ids.front();
+		free_ids.pop();
+
+		if (!IsEntityIDOccupied(candidate))
+			return candidate;
 	}
 
-	uint16 newid = free_ids.front();
-	free_ids.pop();
-	return newid;
+	LogError(
+		"Entity ID free queue exhausted: "
+		"clients [{}], mobs [{}], NPCs [{}], corpses [{}], objects [{}], "
+		"doors [{}], traps [{}], beacons [{}], encounters [{}]",
+		client_list.size(),
+		mob_list.size(),
+		npc_list.size(),
+		corpse_list.size(),
+		object_list.size(),
+		door_list.size(),
+		trap_list.size(),
+		beacon_list.size(),
+		encounter_list.size()
+	);
+
+	uint16 newid = 1500;
+	while (true) {
+		newid++;
+		if (!IsEntityIDOccupied(newid))
+			return newid;
+	}
 }
 
 // if no language skill is specified, sent with 100 skill
@@ -1775,13 +1799,13 @@ void EntityList::QueueWearChange(Mob *sender, const EQApplicationPacket *app, bo
 }
 
 void EntityList::QueueClientsStatus(Mob *sender, const EQApplicationPacket *app,
-		bool ignore_sender, uint8 minstatus, uint8 maxstatus)
+		bool ignore_sender, uint8 minstatus, uint8 maxstatus, bool ackreq)
 {
 	auto it = client_list.begin();
 	while (it != client_list.end()) {
 		if ((!ignore_sender || it->second != sender) &&
 				(it->second->Admin() >= minstatus && it->second->Admin() <= maxstatus))
-			it->second->QueuePacket(app);
+			it->second->QueuePacket(app, ackreq);
 
 		++it;
 	}
@@ -2293,13 +2317,13 @@ void EntityList::RemoveAllMobs()
 {
 	auto it = mob_list.begin();
 	while (it != mob_list.end()) {
-		if (!it->second) {
-			++it;
-			continue;
-		}
+		const uint16 entity_id = it->first;
+
 		safe_delete(it->second);
-		free_ids.push(it->first);
 		it = mob_list.erase(it);
+
+		if (!IsEntityIDOccupied(entity_id))
+			free_ids.push(entity_id);
 	}
 }
 
@@ -2365,8 +2389,12 @@ void EntityList::RespawnAllDoors()
 	while (it != client_list.end()) {
 		if (it->second) {
 			auto outapp = new EQApplicationPacket();
-			SendZoneDoorsBulk(outapp, it->second);
-			it->second->FastQueuePacket(&outapp);
+			if (SendZoneDoorsBulk(outapp, it->second)) {
+				it->second->FastQueuePacket(&outapp);
+			}
+			else {
+				safe_delete(outapp);
+			}
 		}
 		++it;
 	}
@@ -2399,6 +2427,20 @@ void EntityList::RemoveAllTraps()
 		safe_delete(it->second);
 		free_ids.push(it->first);
 		it = trap_list.erase(it);
+	}
+}
+
+void EntityList::RemoveAllBeacons()
+{
+	auto it = beacon_list.begin();
+	while (it != beacon_list.end()) {
+		const uint16 entity_id = it->first;
+
+		safe_delete(it->second);
+		it = beacon_list.erase(it);
+
+		if (!IsEntityIDOccupied(entity_id))
+			free_ids.push(entity_id);
 	}
 }
 
@@ -2593,8 +2635,13 @@ bool EntityList::RemoveRaid(uint32 delete_id)
 
 void EntityList::Clear()
 {
+	SpawnQueue.Clear();
+	tsFirstSpawnOnQueue = 0xFFFFFFFF;
+	NumSpawnsOnQueue = 0;
+
 	RemoveAllClients();
 	entity_list.RemoveAllTraps(); //we can have child npcs so we go first
+	entity_list.RemoveAllBeacons();
 	entity_list.RemoveAllNPCs();
 	entity_list.RemoveAllMobs();
 	entity_list.RemoveAllCorpses();
@@ -2619,7 +2666,7 @@ void EntityList::UpdateWho(bool iSendFullUpdate)
 
 	auto it = client_list.begin();
 	while (it != client_list.end()) {
-		if (it->second->InZone()) {
+		if (it->second->HasWorldSession()) {
 			if (iSendFullUpdate) {
 				it->second->UpdateWho();
 			} else {
@@ -2862,6 +2909,15 @@ void EntityList::SendPositionUpdates(Client *client)
 		++it;
 	}
 	safe_delete(outapp);
+}
+
+void EntityList::FlushPositionUpdates()
+{
+	for (const auto &entry : client_list)
+	{
+		if (entry.second != nullptr)
+			entry.second->FlushPositionUpdates();
+	}
 }
 
 
@@ -4917,6 +4973,11 @@ void EntityList::SendClientAppearances(Client *to_client)
 			safe_delete(outapp);
 		}
 
+		if (c->IsLD())
+		{
+			c->SendAppearancePacket(AppearanceType::Linkdead, 1, false, true, to_client);
+		}
+
 		int levitate_value = c->GetFlyMode() ? c->GetFlyMode() : (c->FindType(SE_Levitate) ? 2 : 0);
 		if (levitate_value)
 		{
@@ -4928,7 +4989,8 @@ void EntityList::SendClientAppearances(Client *to_client)
 void EntityList::StopMobAI()
 {
 	for (auto &mob : mob_list) {
-		mob.second->AI_Stop();
+		if (!mob.second->IsClient())
+			mob.second->AI_Stop();
 		mob.second->AI_ShutDown();
 	}
 }

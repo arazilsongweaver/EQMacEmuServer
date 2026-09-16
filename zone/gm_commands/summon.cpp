@@ -17,10 +17,6 @@ void command_summon(Client *c, const Seperator *sep){
 				c->Message(Chat::White, "Error: World server disconnected.");
 			else
 			{ // player is in another zone
-				//Taking this command out until we test the factor of 8 in ServerOP_ZonePlayer
-				//c->Message(Chat::White, "Summoning player from another zone not yet implemented.");
-				//return;
-
 				auto pack = new ServerPacket(ServerOP_ZonePlayer, sizeof(ServerZonePlayer_Struct));
 				ServerZonePlayer_Struct* szp = (ServerZonePlayer_Struct*)pack->pBuffer;
 				strcpy(szp->adminname, c->GetName());
@@ -28,9 +24,10 @@ void command_summon(Client *c, const Seperator *sep){
 				szp->ignorerestrictions = 2;
 				strcpy(szp->name, sep->arg[1]);
 				strcpy(szp->zone, zone->GetShortName());
-				szp->x_pos = c->GetX(); // May need to add a factor of 8 in here..
+				szp->x_pos = c->GetX();
 				szp->y_pos = c->GetY();
 				szp->z_pos = c->GetZ();
+				szp->heading = c->GetHeading();
 				worldserver.SendPacket(pack);
 				safe_delete(pack);
 			}
@@ -72,7 +69,7 @@ void command_summon(Client *c, const Seperator *sep){
 		}
 
 		c->Message(Chat::White, "Summoning player %s to %1.1f, %1.1f, %1.1f", t->GetName(), c->GetX(), c->GetY(), c->GetZ());
-		t->CastToClient()->MovePC(zone->GetZoneID(), c->GetX(), c->GetY(), c->GetZ(), c->GetHeading(), 2, GMSummon);
+		t->CastToClient()->MovePC(zone->GetZoneID(), c->GetX(), c->GetY(), c->GetZ(), c->GetHeading() * 2.0f, 2, GMSummon);
 	}
 }
 

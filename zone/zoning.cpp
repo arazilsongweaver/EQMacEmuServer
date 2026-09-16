@@ -18,7 +18,6 @@
 
 #include "../common/global_define.h"
 #include "../common/eqemu_logsys.h"
-#include "../common/packet_dump_file.h"
 #include "../common/rulesys.h"
 #include "../common/strings.h"
 
@@ -36,287 +35,347 @@ extern QueryServ* QServ;
 extern WorldServer worldserver;
 extern Zone* zone;
 
+static uint32 NextZoneTransferTransactionID()
+{
+	static uint32 transaction_id = 0;
 
-// this is the client checking IsZoneAvailable() but they haven't actually requested to zone there
-void Client::Handle_OP_ZoneChange(const EQApplicationPacket *app) {
-	zoning = true;
-	if (app->size != sizeof(ZoneChange_Struct)) {
+	++transaction_id;
+	if (transaction_id == 0)
+		++transaction_id;
+
+	return transaction_id;
+}
+
+void Client::SetPendingZoneTransfer(ZoneMode mode, uint32 zone_id, const glm::vec4 &destination, uint8 ignore_restrictions)
+{
+	if (dead && m_pending_zone_transfer.phase != ZoneTransferPhase::None)
+	{
+		// Death has already selected bind. Nothing else may replace it before the client starts that transfer.
+		LogInfo("Ignoring a new zone transfer for dead client [{}]; the bind transfer is already waiting for the client", GetName());
+		return;
+	}
+
+	if (m_pending_zone_transfer.phase != ZoneTransferPhase::None &&
+		m_pending_zone_transfer.phase != ZoneTransferPhase::AwaitingZoneStatusRequest)
+	{
+		LogInfo(
+			"Ignoring a new zone transfer for client [{}]; the current transfer is already in phase [{}]",
+			GetName(),
+			static_cast<int>(m_pending_zone_transfer.phase)
+		);
+		return;
+	}
+
+	m_pending_zone_transfer.phase = ZoneTransferPhase::AwaitingZoneStatusRequest;
+	m_pending_zone_transfer.mode = mode;
+	m_pending_zone_transfer.zone_id = zone_id;
+	m_pending_zone_transfer.destination = destination;
+	m_pending_zone_transfer.ignore_restrictions = ignore_restrictions;
+	m_pending_zone_transfer.transaction_id = 0;
+	pending_zone_transfer_timer.Start(ZoneTransferRequestTimeoutMs);
+}
+
+void Client::ClearPendingZoneTransfer()
+{
+	m_pending_zone_transfer = PendingZoneTransfer();
+	pending_zone_transfer_timer.Disable();
+}
+
+void Client::SendZoneStatusResponse(uint32 zone_id, ZoningMessage result)
+{
+	cheat_manager.SetExemptStatus(Port, true);
+
+	auto outapp = new EQApplicationPacket(OP_ZoneChange, sizeof(ZoneChange_Struct));
+	auto response = reinterpret_cast<ZoneChange_Struct *>(outapp->pBuffer);
+	strn0cpy(response->char_name, GetName(), sizeof(response->char_name));
+	response->zoneID = zone_id;
+	response->success = result;
+	outapp->priority = 6;
+	FastQueuePacket(&outapp, true, client_state);
+}
+
+void Client::HandleZoneTransferResponse(uint32 current_zone_id, uint32 requested_zone_id, uint32 transaction_id, int8 response)
+{
+	if (client_state == CLIENT_KICKED || client_state == DISCONNECTED)
+	{
+		LogInfo("Ignoring zone transfer response for [{}] after client removal was requested", GetName());
+		ClearPendingZoneTransfer();
+		return;
+	}
+
+	if (transaction_id == 0 ||
+		m_pending_zone_transfer.phase != ZoneTransferPhase::AwaitingWorldResponse ||
+		current_zone_id != zone->GetZoneID() ||
+		m_pending_zone_transfer.zone_id != requested_zone_id ||
+		m_pending_zone_transfer.transaction_id != transaction_id)
+	{
+		LogInfo(
+			"Ignoring stale zone transfer response for [{}]: transaction [{}], current zone [{}], requested zone [{}], pending transaction [{}], pending zone [{}], phase [{}]",
+			GetName(),
+			transaction_id,
+			current_zone_id,
+			requested_zone_id,
+			m_pending_zone_transfer.transaction_id,
+			m_pending_zone_transfer.zone_id,
+			static_cast<int>(m_pending_zone_transfer.phase)
+		);
+		return;
+	}
+
+	if (response > 0)
+	{
+		if (!CommitPendingZoneTransfer())
+			return;
+
+		m_pending_zone_transfer.phase = ZoneTransferPhase::AwaitingDeleteSpawn;
+		pending_zone_transfer_timer.Start(ZoneTransferDepartureTimeoutMs);
+
+		if (m_stream == nullptr || IsLD())
+		{
+			FinishPendingZoneTransfer();
+			return;
+		}
+
+		SendZoneStatusResponse(requested_zone_id, ZoningMessage::ZoneSuccess);
+		return;
+	}
+
+	if (dead)
+		dead_timer.Start(DeadClientRemovalTimeoutMs);
+
+	SendZoneStatusResponse(requested_zone_id, ZoningMessage::ZoneNotReady);
+	ClearPendingZoneTransfer();
+	if (m_stream == nullptr && !IsLD())
+		LinkDead();
+
+	switch (response)
+	{
+	case -2:
+		Message(Chat::Red, "You do not own the required locations to enter this zone.");
+		break;
+	case -1:
+		Message(Chat::Red, "The zone is currently full, please try again later.");
+		break;
+	case 0:
+		Message(Chat::Red, "All zone servers are taken at this time, please try again later.");
+		break;
+	}
+}
+
+
+// This is the client's IsZoneAvailable() request. A successful world reply commits the destination and OP_DeleteSpawn finishes the departure.
+void Client::Handle_OP_ZoneChange(const EQApplicationPacket *app)
+{
+	if (app->size != sizeof(ZoneChange_Struct))
+	{
 		LogError("Wrong size: OP_ZoneChange, size=[{}], expected [{}]", app->size, sizeof(ZoneChange_Struct));
 		DumpPacket(app);
 		return;
 	}
 
-	ZoneChange_Struct* zc = (ZoneChange_Struct*)app->pBuffer;
-	LogInfo("Zone request from [{}] : char_name {}, zoneID {}, zone_reason {}, success {}", GetName(),
-		std::string(zc->char_name), (int)zc->zoneID, (int)zc->zone_reason, (int)zc->success);
-
-	uint16 target_zone_id = 0;
-	ZonePoint* zone_point = nullptr;
-	//figure out where they are going.
-	//we should never trust the client's logic, however, the client's information coupled with the server's information can help us determine locations they should be going to.
-	//try to figure it out for them.
-
-	if(zc->zoneID == 0) {
-		//client dosent know where they are going...
-		//try to figure it out for them.
-
-		switch(zone_mode) {
-			case EvacToSafeCoords:
-			case ZoneToSafeCoords:
-				//going to safe coords, but client dosent know where?
-				//assume it is this zone for now.
-				target_zone_id = zone->GetZoneID();
-				break;
-			case GMSummon:
-			case ZoneSolicited: //we told the client to zone somewhere, so we know where they are going.
-				target_zone_id = zonesummon_id;
-				break;
-			case GateToBindPoint:
-			case ZoneToBindPoint:
-				target_zone_id = m_pp.binds[0].zoneId;
-				break;
-			case ZoneUnsolicited: //client came up with this on its own.
-				zone_point = zone->GetClosestZonePointWithoutZone(GetX(), GetY(), GetZ(), this, ZONEPOINT_NOZONE_RANGE);
-
-				if(zone_point) {
-					//we found a zone point, which is a reasonable distance away
-					//assume that is the one were going with.
-					target_zone_id = zone_point->target_zone_id;
-				} 
-				else {
-					//unable to find a zone point... is there anything else
-					//that can be a valid un-zolicited zone request?
-
-					Message(Chat::Red, "Invalid unsolicited zone request.");
-					LogError("Zoning [{}]: Invalid unsolicited zone request to zone id [{}]", GetName(), target_zone_id);
-					if (GetBindZoneID() == target_zone_id) {
-						cheat_manager.CheatDetected(MQGate, glm::vec3(GetX(), GetY(), GetZ()));
-					}
-					else {
-						cheat_manager.CheatDetected(MQZone, glm::vec3(GetX(), GetY(), GetZ()));
-					}
-					SendZoneCancel(zc);
-					return;
-				}
-				break;
-			default:
-				break;
-		};
-	}
-	else {
-		if (zone_mode == EvacToSafeCoords && zonesummon_id > 0) {
-			target_zone_id = zonesummon_id;
-		}
-		else {
-			target_zone_id = zc->zoneID;
-		}
-
-		//if we are zoning to a specific zone unsolicied,
-		//then until otherwise determined, they must be zoning
-		//on a zone line.
-		if(zone_mode == ZoneUnsolicited)
-		{
-			if (target_zone_id == zone->GetZoneID())
-			{
-				SendZoneCancel(zc);
-				return;
-			}
-
-			zone_point = zone->GetClosestZonePoint(glm::vec3(GetPosition()), target_zone_id, this, ZONEPOINT_ZONE_RANGE);
-			//if we didnt get a zone point, or its to a different zone,
-			//then we assume this is invalid.
-			if(!zone_point || zone_point->target_zone_id != target_zone_id) {
-				LogError("Zoning [{}]: Invalid unsolicited zone request to zone id [{}]", GetName(), target_zone_id);
-				if (GetBindZoneID() == target_zone_id) {
-					cheat_manager.CheatDetected(MQGate, glm::vec3(GetX(), GetY(), GetZ()));
-				}
-				else {
-					cheat_manager.CheatDetected(MQZone, glm::vec3(GetX(), GetY(), GetZ()));
-				}
-				SendZoneCancel(zc);
-				return;
-			}
-		}
-	}
-
-	/* Check for Valid Zone */
-	const char *target_zone_name = ZoneName(target_zone_id);
-	if(target_zone_name == nullptr) {
-		//invalid zone...
-		Message(Chat::Red, "Invalid target zone ID.");
-		LogError("Zoning [{}]: Unable to get zone name for zone id '[{}]'.", GetName(), target_zone_id);
-		SendZoneCancel(zc);
-		return;
-	}
-
-	/* Load up the Safe Coordinates, restrictions and verify the zone name*/
-	auto zone_data = GetZone(ZoneID(target_zone_name));
-	if (!zone_data) {
-		Message(Chat::Red, "Invalid target zone while getting safe points.");
-		LogError("Zoning [{}]: Unable to get safe coordinates for zone '[{}]'.", GetName(), target_zone_name);
-		SendZoneCancel(zc);
-		return;
-	}
-
-	float safe_x, safe_y, safe_z, safe_heading;
-	int16 min_status = AccountStatus::Player;
-	uint8 min_level = 0;
-
-	LogInfo("[Handle_OP_ZoneChange] Loaded zone flag [{}]", zone_data->flag_needed);
-
-	safe_x = zone_data->safe_x;
-	safe_y = zone_data->safe_y;
-	safe_z = zone_data->safe_z;
-	min_status = zone_data->min_status;
-	min_level = zone_data->min_level;
-
-	std::string export_string = fmt::format(
-		"{} {}",
-		zone->GetZoneID(),
-		target_zone_id
+	auto zone_change = reinterpret_cast<const ZoneChange_Struct *>(app->pBuffer);
+	LogInfo(
+		"Zone request from [{}]: char_name [{}], zoneID [{}], zone_reason [{}], success [{}]",
+		GetName(),
+		zone_change->char_name,
+		zone_change->zoneID,
+		zone_change->zone_reason,
+		zone_change->success
 	);
-	if (parse->EventPlayer(EVENT_ZONE, this, export_string, 0) != 0) {
-		SendZoneCancel(zc);
+
+	const uint32 target_zone_id = zone_change->zoneID;
+	if (m_pending_zone_transfer.phase == ZoneTransferPhase::AwaitingWorldResponse)
+	{
+		if (m_pending_zone_transfer.zone_id == target_zone_id)
+		{
+			LogInfo("Ignoring a repeated zone status request for [{}] while waiting for world", GetName());
+		}
+		else
+		{
+			LogWarning(
+				"Ignoring a zone status request for [{}] to zone [{}] while waiting for world to answer zone [{}]",
+				GetName(),
+				target_zone_id,
+				m_pending_zone_transfer.zone_id
+			);
+		}
 		return;
 	}
 
-	if (PlayerEventLogs::Instance()->IsEventEnabled(PlayerEvent::ZONING)) {
-		auto e = PlayerEvent::ZoningEvent{};
-		e.from_zone_long_name = zone->GetLongName();
-		e.from_zone_short_name = zone->GetShortName();
-		e.from_zone_id = zone->GetZoneID();
-		e.to_zone_long_name = ZoneLongName(target_zone_id);
-		e.to_zone_short_name = ZoneName(target_zone_id);
-		e.to_zone_id = target_zone_id;
-
-		RecordPlayerEventLog(PlayerEvent::ZONING, e);
+	if (m_pending_zone_transfer.phase == ZoneTransferPhase::AwaitingDeleteSpawn)
+	{
+		if (m_pending_zone_transfer.zone_id == target_zone_id)
+		{
+			SendZoneStatusResponse(target_zone_id, ZoningMessage::ZoneSuccess);
+		}
+		else
+		{
+			LogWarning(
+				"Ignoring a zone status request for [{}] to zone [{}] while waiting for departure to zone [{}]",
+				GetName(),
+				target_zone_id,
+				m_pending_zone_transfer.zone_id
+			);
+		}
+		return;
 	}
 
-	//handle circumvention of zone restrictions
-	//we need the value when creating the outgoing packet as well.
-	uint8 ignorerestrictions = zonesummon_ignorerestrictions;
-	zonesummon_ignorerestrictions = 0;
+	// A death which began before OP_ZoneChange owns the destination. Any status request can advance the bind transfer which was already saved and latched.
+	if (dead && m_pending_zone_transfer.phase == ZoneTransferPhase::AwaitingZoneStatusRequest)
+	{
+		if (m_pending_zone_transfer.zone_id != target_zone_id)
+		{
+			LogWarning(
+				"Dead client [{}] requested zone [{}] while the bind transfer is waiting for zone [{}]. Using the bind transfer.",
+				GetName(),
+				target_zone_id,
+				m_pending_zone_transfer.zone_id
+			);
+		}
 
-	float dest_x=0, dest_y=0, dest_z=0, dest_h=0;
-	switch(zone_mode) {
-	case EvacToSafeCoords:
-	case ZoneToSafeCoords:
-		LogInfo(
-			"Zoning [{}] to safe coords ([{}],[{}],[{}],[{}]) in [{}] ([{}])", 
-			GetName(), 
-			safe_x, 
-			safe_y, 
-			safe_z, 
-			safe_heading, 
-			target_zone_name, 
-			target_zone_id
+		RequestZoneTransferApproval(
+			m_pending_zone_transfer.mode,
+			m_pending_zone_transfer.zone_id,
+			m_pending_zone_transfer.destination,
+			m_pending_zone_transfer.ignore_restrictions
 		);
-		dest_x = safe_x;
-		dest_y = safe_y;
-		dest_z = safe_z;
-		dest_h = safe_heading;
-		break;
-	case GMSummon:
-		dest_x = m_ZoneSummonLocation.x;
-		dest_y = m_ZoneSummonLocation.y;
-		dest_z = m_ZoneSummonLocation.z;
-		dest_h = m_ZoneSummonLocation.w;
-		ignorerestrictions = 1;
-		break;
-	case GateToBindPoint:
-		dest_x = m_pp.binds[0].x;
-		dest_y = m_pp.binds[0].y;
-		dest_z = m_pp.binds[0].z;
-		dest_h = m_pp.binds[0].heading;
-		break;
-	case ZoneToBindPoint:
-		dest_x = m_pp.binds[0].x;
-		dest_y = m_pp.binds[0].y;
-		dest_z = m_pp.binds[0].z;
-		dest_h = m_pp.binds[0].heading;
-		ignorerestrictions = 1;	//can always get to our bind point? seems exploitable
-		break;
-	case ZoneSolicited: //we told the client to zone somewhere, so we know where they are going.
-		//recycle zonesummon variables
-		dest_x = m_ZoneSummonLocation.x;
-		dest_y = m_ZoneSummonLocation.y;
-		dest_z = m_ZoneSummonLocation.z;
-		dest_h = m_ZoneSummonLocation.w;
-		break;
-	case ZoneUnsolicited: //client came up with this on its own.
-		//client requested a zoning... what are the cases when this could happen?
-
-		//Handle zone point case:
-		if(zone_point != nullptr) {
-			//they are zoning using a valid zone point, figure out coords
-
-			//999999 is a placeholder for 'same as where they were from'
-			//The client compile shows 1044 difference when zoning freport <-> nro.  this fixes server side when using 999999.
-			if (zone_point->target_x == 999999) {  
-				if (zone->GetZoneID() == Zones::FREPORTE && zone_point->target_zone_id == Zones::NRO) {
-					dest_x = GetX() + 1044;
-				}
-				else if (zone->GetZoneID() == Zones::NRO && zone_point->target_zone_id == Zones::FREPORTE) {
-					dest_x = GetX() - 1044;
-				}
-				else {
-					dest_x = GetX();
-				}
-			}
-			else
-				dest_x = zone_point->target_x;
-			if (zone_point->target_y == 999999)
-				dest_y = GetY();
-			else
-				dest_y = zone_point->target_y;
-			if(zone_point->target_z == 999999)
-				dest_z=GetZ()+5;
-			else
-				dest_z = zone_point->target_z;
-			if(zone_point->target_heading == 999)
-				dest_h = GetHeading()*2.0f;  // client heading uses 0 - 512
-			else
-				dest_h = zone_point->target_heading;
-
-			break;
-		}
-
-		//for now, there are no other cases...
-
-		//could not find a valid reason for them to be zoning, stop it.
-		cheat_manager.CheatDetected(MQZoneUnknownDest, glm::vec3(0.0, 0.0, 0.0));
-		LogError("Zoning [{}]: Invalid unsolicited zone request to zone id [{}]", GetName(), target_zone_id);
-		if (GetBindZoneID() == target_zone_id) {
-			cheat_manager.CheatDetected(MQGate, glm::vec3(GetX(), GetY(), GetZ()));
-		}
-		else {
-			cheat_manager.CheatDetected(MQZone, glm::vec3(GetX(), GetY(), GetZ()));
-		}
-		SendZoneCancel(zc);
 		return;
-	default:
-		break;
-	};
+	}
 
-	//OK, now we should know where were going...
+	if (target_zone_id == 0)
+	{
+		LogError("Zoning [{}]: Client requested invalid zone id [0]", GetName());
+		SendZoneStatusResponse(target_zone_id, ZoningMessage::ZoneDown);
+		return;
+	}
 
-	//Check some rules first.
+	if (dead && m_pending_zone_transfer.phase == ZoneTransferPhase::None)
+	{
+		// A failed bind check clears the transfer, but the client may still send its current zone recovery query. Do not let a dead client begin another move.
+		SendZoneStatusResponse(
+			target_zone_id,
+			target_zone_id == zone->GetZoneID() ? ZoningMessage::ZoneSuccess : ZoningMessage::ZoneDown
+		);
+		return;
+	}
+
+	// Ordinary zone points use reason 0 and must be resolved from zone-point data, even if an older server-selected destination has the same zone id.
+	const bool client_zone_point = zone_change->zone_reason == ZC_Teleport;
+	const bool use_pending_destination =
+		!client_zone_point &&
+		m_pending_zone_transfer.phase == ZoneTransferPhase::AwaitingZoneStatusRequest &&
+		m_pending_zone_transfer.zone_id == target_zone_id;
+	if (client_zone_point && m_pending_zone_transfer.phase == ZoneTransferPhase::AwaitingZoneStatusRequest)
+	{
+		LogInfo(
+			"Resolving reason 0 zone point for [{}] without using the pending destination for zone [{}]",
+			GetName(),
+			m_pending_zone_transfer.zone_id
+		);
+	}
+
+	ZonePoint *zone_point = nullptr;
+	if (!use_pending_destination)
+	{
+		// The client does a second status query for its current zone after a declined status check for its original destination.
+		if (target_zone_id == zone->GetZoneID())
+		{
+			SendZoneStatusResponse(target_zone_id, ZoningMessage::ZoneSuccess);
+			return;
+		}
+
+		// client side 'zone lines' are lists of DRNTP BSP regions that either encode the destination directly or reference a teleport index.
+		// the 'zone_points' table in the database combines two things: the teleport records sent in OP_Zonepoints and an eqemu server side
+		// bounding box teleport system called virtual zone points.
+		//
+		// the x/y positions on the zone_point here are server side authored validation reusing the virtual zone point fields for this.
+		// teleport coords sent to the client do not have an x/y position, they are just destination coords.  this validation relies on there
+		// being 'fake' records in zone_points for the directly encoded destinations that don't naturally reference a TP index.
+		//
+		// TODO: check the zone geometry regions, project the client's position to estimate where they touched it
+		// and resolve destination coordinates from the the effective DRNTP string.
+		zone_point = zone->GetClosestZonePoint(glm::vec3(GetPosition()), target_zone_id, this, ZONEPOINT_ZONE_RANGE);
+		if (zone_point == nullptr || zone_point->target_zone_id != target_zone_id)
+		{
+			LogError("Zoning [{}]: Invalid unsolicited zone request to zone id [{}]", GetName(), target_zone_id);
+			if (GetBindZoneID() == target_zone_id)
+				cheat_manager.CheatDetected(MQGate, glm::vec3(GetX(), GetY(), GetZ()));
+			else
+				cheat_manager.CheatDetected(MQZone, glm::vec3(GetX(), GetY(), GetZ()));
+
+			SendZoneStatusResponse(target_zone_id, ZoningMessage::ZoneDown);
+			return;
+		}
+	}
+
+	const char *target_zone_name = ZoneName(target_zone_id);
+	auto zone_data = GetZone(target_zone_id);
+	if (target_zone_name == nullptr || zone_data == nullptr)
+	{
+		Message(Chat::Red, "Invalid target zone ID.");
+		LogError("Zoning [{}]: Unable to get zone information for zone id '[{}]'.", GetName(), target_zone_id);
+		SendZoneStatusResponse(target_zone_id, ZoningMessage::ZoneDown);
+		if (use_pending_destination)
+			ClearPendingZoneTransfer();
+		return;
+	}
+
+	std::string export_string = fmt::format("{} {}", zone->GetZoneID(), target_zone_id);
+	if (parse->EventPlayer(EVENT_ZONE, this, export_string, 0) != 0)
+	{
+		SendZoneStatusResponse(target_zone_id, ZoningMessage::ZoneDown);
+		if (use_pending_destination)
+			ClearPendingZoneTransfer();
+		return;
+	}
+
+	glm::vec4 destination;
+	uint8 ignore_restrictions = 0;
+	ZoneMode mode = ZoneUnsolicited;
+	if (use_pending_destination)
+	{
+		destination = m_pending_zone_transfer.destination;
+		ignore_restrictions = m_pending_zone_transfer.ignore_restrictions;
+		mode = m_pending_zone_transfer.mode;
+	}
+	else
+	{
+		const uint32 current_zone_id = zone->GetZoneID();
+		float target_x = zone_point->target_x;
+		float target_y = zone_point->target_y;
+		float target_z = zone_point->target_z;
+		float target_heading = zone_point->target_heading;
+
+		if (current_zone_id == Zones::FREPORTE && target_zone_id == Zones::NRO)
+			target_x = GetX() + 1044.0f;
+		else if (current_zone_id == Zones::NRO && target_zone_id == Zones::FREPORTE)
+			target_x = GetX() - 1044.0f;
+		else if (current_zone_id == Zones::QRG && target_zone_id == Zones::QEYTOQRG)
+			target_z = GetZ() + 2.0f;
+		else if (current_zone_id == Zones::QEYNOS2 && target_zone_id == Zones::QEYTOQRG)
+			target_y += 10.0f;
+
+		const bool preserve_z = target_z >= 999999.0f;
+		destination = ResolveClientTeleportDestination(target_zone_id, glm::vec4(target_x, target_y, target_z, target_heading));
+
+		// This is not client behavior. It is an extra margin to keep the player above the floor when the zone point preserves Z.
+		if (preserve_z)
+			destination.z += 5.0f;
+	}
+
 	auto zoning_message = ZoningMessage::ZoneSuccess;
 
-	//not sure when we would use ZONE_ERROR_NOTREADY
-	
-	//enforce min status and level
-	if (!ignorerestrictions && (Admin() < min_status || GetLevel() < zone_data->min_level)) {
+	if (!ignore_restrictions && (Admin() < zone_data->min_status || GetLevel() < zone_data->min_level))
 		zoning_message = ZoningMessage::ZoneNoExperience;
-	}
 
-	if(!ignorerestrictions && !zone_data->flag_needed.empty()) {
-		//the flag needed string is not empty, meaning a flag is required.
-		if(Admin() < minStatusToIgnoreZoneFlags && !HasZoneFlag(target_zone_id)) {
+	if (!ignore_restrictions && !zone_data->flag_needed.empty())
+	{
+		if (Admin() < minStatusToIgnoreZoneFlags && !HasZoneFlag(target_zone_id))
+		{
 			LogInfo(
 				"Client [{}] does not have the proper flag to enter [{}] ({})",
 				GetCleanName(),
-				ZoneName(target_zone_id),
+				target_zone_name,
 				target_zone_id
 			);
 			Message(Chat::Red, "You do not have the flag to enter %s.", target_zone_name);
@@ -324,476 +383,387 @@ void Client::Handle_OP_ZoneChange(const EQApplicationPacket *app) {
 		}
 	}
 
-	if (Admin() < minStatusToIgnoreZoneFlags && IsMule() && (target_zone_id != Zones::BAZAAR && target_zone_id != Zones::NEXUS && target_zone_id != Zones::POKNOWLEDGE)) {
+	if (Admin() < minStatusToIgnoreZoneFlags && IsMule() &&
+		target_zone_id != Zones::BAZAAR && target_zone_id != Zones::NEXUS && target_zone_id != Zones::POKNOWLEDGE)
+	{
 		zoning_message = ZoningMessage::ZoneNoExperience;
 		LogCharacterDetail("[CLIENT] Character is a mule and cannot leave Bazaar/Nexus/PoK!");
 	}
 
-	// Expansion checks and routing
-	if ((WorldContentService::Instance()->GetCurrentExpansion() >= Expansion::Classic && !GetGM())) {
-		bool meets_zone_expansion_check = false;
-
+	if (WorldContentService::Instance()->GetCurrentExpansion() >= Expansion::Classic && !GetGM())
+	{
 		auto zones = ZoneRepository::GetWhere(
 			database,
 			fmt::format(
 				"expansion <= {} AND short_name = '{}'",
-				(WorldContentService::Instance()->GetCurrentExpansion()),
+				WorldContentService::Instance()->GetCurrentExpansion(),
 				target_zone_name
 			)
 		);
-	
-		meets_zone_expansion_check = !zones.empty(); 
-		
+
 		LogInfo(
 			"Checking zone request [{}] for expansion [{}] ({}) success [{}]",
 			target_zone_name,
-			(WorldContentService::Instance()->GetCurrentExpansion()),
+			WorldContentService::Instance()->GetCurrentExpansion(),
 			WorldContentService::Instance()->GetCurrentExpansionName(),
 			!zones.empty() ? "true" : "false"
 		);
 
-		if (!meets_zone_expansion_check) {
+		if (zones.empty())
 			zoning_message = ZoningMessage::ZoneNoExpansion;
-		}
 	}
 
-	if (WorldContentService::Instance()->GetCurrentExpansion() >= Expansion::Classic && GetGM()) {
+	if (WorldContentService::Instance()->GetCurrentExpansion() >= Expansion::Classic && GetGM())
 		LogInfo("[{}] Bypassing Expansion zone checks because GM status is set", GetCleanName());
+
+	if (zoning_message == ZoningMessage::ZoneSuccess)
+	{
+		RequestZoneTransferApproval(mode, target_zone_id, destination, ignore_restrictions);
+		return;
 	}
 
-	if(zoning_message == ZoningMessage::ZoneSuccess) {
-		//we have successfully zoned
-		DoZoneSuccess(zc, target_zone_id, dest_x, dest_y, dest_z, dest_h, ignorerestrictions);
-		UpdateZoneChangeCount(target_zone_id);
-	} else {
-		LogError("Zoning [{}]: Rules prevent this char from zoning into [{}]", GetName(), target_zone_name);
-		SendZoneError(zc, zoning_message);
-	}
+	LogError("Zoning [{}]: Rules prevent this char from zoning into [{}]", GetName(), target_zone_name);
+	SendZoneStatusResponse(target_zone_id, zoning_message);
+	if (use_pending_destination)
+		ClearPendingZoneTransfer();
 }
 
-void Client::SendZoneCancel(ZoneChange_Struct *zc) {
-	//effectively zone them right back to where they were
-	//unless we find a better way to stop the zoning process.
-	cheat_manager.SetExemptStatus(Port, true);
-	auto outapp = new EQApplicationPacket(OP_ZoneChange, sizeof(ZoneChange_Struct));
-	ZoneChange_Struct *zc2 = (ZoneChange_Struct*)outapp->pBuffer;
-	strcpy(zc2->char_name, zc->char_name);
-	zc2->zoneID = zone->GetZoneID();
-	zc2->success = 1;
-	outapp->priority = 6;
-	FastQueuePacket(&outapp);
-
-	//reset to unsolicited.
-	zone_mode = ZoneUnsolicited;
-	// reset since we're not zoning anymore
-	zoning = false;
-	// remove save position lock
-	m_lock_save_position = false;
-}
-
-void Client::SendZoneError(ZoneChange_Struct *zc, int32 err)
+void Client::RequestZoneTransferApproval(ZoneMode mode, uint32 zone_id, const glm::vec4 &destination, uint8 ignore_restrictions)
 {
-	LogError("Zone [{}] is not available because target wasn't found or character insufficent level", zc->zoneID);
+	LogInfo("Beginning zone transfer for [{}] to zone [{}], mode [{}]", GetName(), zone_id, (int)mode);
 
-	cheat_manager.SetExemptStatus(Port, true);
-
-	auto outapp = new EQApplicationPacket(OP_ZoneChange, sizeof(ZoneChange_Struct));
-	ZoneChange_Struct *zc2 = (ZoneChange_Struct*)outapp->pBuffer;
-	strcpy(zc2->char_name, zc->char_name);
-	zc2->zoneID = zc->zoneID;
-	zc2->success = err;
-	outapp->priority = 6;
-	FastQueuePacket(&outapp);
-
-	//reset to unsolicited.
-	zone_mode = ZoneUnsolicited;
-	// reset since we're not zoning anymore
-	zoning = false;
-	// remove save position lock
-	m_lock_save_position = false;
-}
-
-void Client::DoZoneSuccess(ZoneChange_Struct *zc, uint16 zone_id, float dest_x, float dest_y, float dest_z, float dest_h, int8 ignore_r) {
-	//this is called once the client is fully allowed to zone here
-	//it takes care of all the activities which occur when a client zones out
-	LogInfo("DoZoneSuccess {} {} mode {}", GetName(), zone_id, (int)zone_mode);
-
-	SendLogoutPackets();
-
-	// it's a bit early to do these final things here, the client hasn't asked to zone yet, they are only asking permission to enter
-	// but this code makes the assumption they will zone very shortly.
-
-	// fade charmed pets
-	Mob* mypet = GetPet();
-	if (mypet && mypet->IsCharmedPet())
+	// Reaching OP_ZoneChange means the client has left gameplay even though world has not answered yet.
+	Mob *pet = GetPet();
+	if (pet && pet->IsCharmedPet())
 		FadePetCharmBuff();
 
-	/* Dont clear aggro until the zone is successful */
 	entity_list.RemoveFromHateLists(this);
-	m_client_npc_aggro_scan_timer.Reset(); // prevent mobs from immediately reaggroing before player is actually gone
+	m_client_npc_aggro_scan_timer.Reset();
 
-	EndShield();		// warrior /shield
-
-	// depop pet
+	EndShield();
 	DepopPet();
 
-	if (zone_id == Zones::AIRPLANE)
+	m_pending_zone_transfer.phase = ZoneTransferPhase::AwaitingWorldResponse;
+	m_pending_zone_transfer.mode = mode;
+	m_pending_zone_transfer.zone_id = zone_id;
+	m_pending_zone_transfer.destination = destination;
+	m_pending_zone_transfer.ignore_restrictions = ignore_restrictions;
+	m_pending_zone_transfer.transaction_id = NextZoneTransferTransactionID();
+	pending_zone_transfer_timer.Start(ZoneTransferApprovalTimeoutMs);
+	// The dead client removal timer only runs while no active zone transfer timer owns progress.
+	if (dead)
+		dead_timer.Disable();
+
+	auto pack = new ServerPacket(ServerOP_ZoneToZoneRequest, sizeof(ZoneToZone_Struct));
+	auto request = reinterpret_cast<ZoneToZone_Struct *>(pack->pBuffer);
+	request->response = 0;
+	request->current_zone_id = zone->GetZoneID();
+	request->requested_zone_id = zone_id;
+	request->admin = admin;
+	request->ignorerestrictions = ignore_restrictions;
+	request->transaction_id = m_pending_zone_transfer.transaction_id;
+	strn0cpy(request->name, GetName(), sizeof(request->name));
+	request->guild_id = GuildID();
+	worldserver.SendPacket(pack);
+	safe_delete(pack);
+}
+
+bool Client::CommitPendingZoneTransfer()
+{
+	if (m_pending_zone_transfer.phase != ZoneTransferPhase::AwaitingWorldResponse)
+		return false;
+
+	PendingZoneTransfer &transfer = m_pending_zone_transfer;
+
+	LogInfo("Committing zone transfer for [{}] to zone [{}], mode [{}]", GetName(), transfer.zone_id, (int)transfer.mode);
+
+	if (PlayerEventLogs::Instance()->IsEventEnabled(PlayerEvent::ZONING)) {
+		auto e = PlayerEvent::ZoningEvent{};
+		e.from_zone_long_name = zone->GetLongName();
+		e.from_zone_short_name = zone->GetShortName();
+		e.from_zone_id = zone->GetZoneID();
+		e.to_zone_long_name = ZoneLongName(transfer.zone_id);
+		e.to_zone_short_name = ZoneName(transfer.zone_id);
+		e.to_zone_id = transfer.zone_id;
+
+		RecordPlayerEventLog(PlayerEvent::ZONING, e);
+	}
+
+	if (transfer.zone_id == Zones::AIRPLANE)
 		BuffFadeAll(true);
 
-	LogInfo("Zoning [{}] to: [{}] ([{}]) x = [{}], y = [{}], z = [{}]", m_pp.name, ZoneName(zone_id), zone_id, dest_x, dest_y, dest_z);
+	LogInfo("Zoning [{}] to: [{}] ([{}]) x = [{}], y = [{}], z = [{}]", m_pp.name, ZoneName(transfer.zone_id), transfer.zone_id, transfer.destination.x, transfer.destination.y, transfer.destination.z);
 
 	//set the player's coordinates in the new zone so they have them
 	//when they zone into it
-	m_pp.x = dest_x;
-	m_pp.y = dest_y;
-	m_pp.z = dest_z;
-	m_pp.heading = dest_h;
-	m_pp.zone_id = zone_id;
+	m_pp.x = transfer.destination.x;
+	m_pp.y = transfer.destination.y;
+	m_pp.z = transfer.destination.z;
+	m_pp.heading = transfer.destination.w;
+	m_pp.zone_id = transfer.zone_id;
 	m_lock_save_position = true;
 	//Force a save so its waiting for them when they zone
 	Save(2);
 
-	// vesuvias - zoneing to another zone so we need to the let the world server
-	//handle things with the client for a while
-	SetZoningState();
-	auto pack = new ServerPacket(ServerOP_ZoneToZoneRequest, sizeof(ZoneToZone_Struct));
-	ZoneToZone_Struct* ztz = (ZoneToZone_Struct*) pack->pBuffer;
-	ztz->response = 0;
-	ztz->current_zone_id = zone->GetZoneID();
-	ztz->requested_zone_id = zone_id;
-	ztz->admin = admin;
-	ztz->ignorerestrictions = ignore_r;
-	strcpy(ztz->name, GetName());
-	ztz->guild_id = GuildID();
-	worldserver.SendPacket(pack);
-	safe_delete(pack);
-
-	//reset to unsolicited.
-	zone_mode = ZoneUnsolicited;
-	m_ZoneSummonLocation = glm::vec4();
-	zonesummon_id = 0;
-	zonesummon_ignorerestrictions = 0;
+	UpdateZoneChangeCount(transfer.zone_id);
+	return true;
 }
 
-void Client::MovePC(const char* zonename, float x, float y, float z, float heading, uint8 ignorerestrictions, ZoneMode zm) {
-	ProcessMovePC(ZoneID(zonename), x, y, z, heading, ignorerestrictions, zm);
+bool Client::FinishPendingZoneTransfer()
+{
+	if (m_pending_zone_transfer.phase != ZoneTransferPhase::AwaitingDeleteSpawn)
+		return false;
+
+	DisconnectForZoneTransfer();
+	ClearPendingZoneTransfer();
+	return true;
 }
 
-//designed for in zone moving
-void Client::MovePC(float x, float y, float z, float heading, uint8 ignorerestrictions, ZoneMode zm) {
-	ProcessMovePC(zone->GetZoneID(), x, y, z, heading, ignorerestrictions, zm);
+void Client::HandlePendingZoneTransferTimeout()
+{
+	const ZoneTransferPhase phase = m_pending_zone_transfer.phase;
+	const uint32 zone_id = m_pending_zone_transfer.zone_id;
+
+	if (phase == ZoneTransferPhase::AwaitingWorldResponse)
+	{
+		LogWarning("Zone transfer for [{}] to zone [{}] timed out waiting for world", GetName(), zone_id);
+		SendZoneStatusResponse(zone_id, ZoningMessage::ZoneNotReady);
+		ClearPendingZoneTransfer();
+		if (m_stream == nullptr && !IsLD())
+			LinkDead();
+
+		if (dead)
+			dead_timer.Start(DeadClientRemovalTimeoutMs);
+		return;
+	}
+
+	if (phase == ZoneTransferPhase::AwaitingDeleteSpawn)
+	{
+		LogWarning("Zone transfer for [{}] to zone [{}] timed out waiting for OP_DeleteSpawn", GetName(), zone_id);
+		FinishPendingZoneTransfer();
+		return;
+	}
+
+	ClearPendingZoneTransfer();
 }
 
-void Client::MovePC(uint32 zoneID, float x, float y, float z, float heading, uint8 ignorerestrictions, ZoneMode zm) {
+glm::vec4 Client::ResolveClientTeleportDestination(uint32 zone_id, const glm::vec4 &requested) const
+{
+	// The client applies these changes in CDisplay::DoTeleportB. This path is used for zone points and OP_RequestClientZoneChange, but not spells or death.
+	static constexpr float PreserveCoordinate = 999999.0f;
+	static constexpr float PreserveHeading = 513.0f;
+
+	glm::vec4 destination = requested;
+
+	if (requested.x >= PreserveCoordinate)
+		destination.x = GetX();
+
+	if (requested.y >= PreserveCoordinate)
+		destination.y = GetY();
+
+	if (requested.z >= PreserveCoordinate)
+		destination.z = GetZ();
+
+	if (requested.w >= PreserveHeading)
+		destination.w = GetHeading() * 2.0f;
+
+	if (zone_id != zone->GetZoneID() &&
+		(GetRace() == Race::Dwarf || GetRace() == Race::Halfling || GetRace() == Race::Gnome))
+	{
+		destination.z += 1.0f;
+	}
+
+	return destination;
+}
+
+void Client::SendTeleportPacket(uint32 zone_id, const glm::vec4 &destination, uint32 reason)
+{
+	// Reason 0 is reserved for ordinary client zone points. A server requested move must use a nonzero reason so its status request uses the saved destination.
+	if (reason == ZC_Teleport)
+	{
+		LogError("SendTeleportPacket received the reserved zone point reason [0]; using server teleport reason [1]");
+		reason = 1;
+	}
+
+	auto outapp = new EQApplicationPacket(OP_RequestClientZoneChange, sizeof(RequestClientZoneChange_Struct));
+	auto request = reinterpret_cast<RequestClientZoneChange_Struct *>(outapp->pBuffer);
+	request->zone_id = zone_id;
+	request->x = destination.x;
+	request->y = destination.y;
+	request->z = destination.z;
+	request->heading = destination.w;
+	request->type = reason;
+	outapp->priority = 6;
+	FastQueuePacket(&outapp);
+}
+
+// solar: this expects the 512 scale heading, GetHeading() * 2.0f
+void Client::MovePC(uint32 zoneID, float x, float y, float z, float heading, uint8 ignorerestrictions, ZoneMode zm)
+{
+	if (dead || IsZoningOut())
+	{
+		LogInfo("Ignoring a movement request for client [{}] while dead or zoning out", GetName());
+		return;
+	}
+
 	if (IsAIControlled())
 		StopNavigation();
 	if (currently_fleeing)
 		currently_fleeing = false;
-	ProcessMovePC(zoneID, x, y, z, heading, ignorerestrictions, zm);
-}
 
-void Client::ProcessMovePC(uint32 zoneID, float x, float y, float z, float heading, uint8 ignorerestrictions, ZoneMode zm)
-{
-	// From what I have read, dragged corpses should stay with the player for Intra-zone summons etc, but we can implement that later.
+	// From what I have read, dragged corpses should stay with the player for intra-zone summons, but we can implement that later.
 	ClearDraggedCorpses();
 
-	if(zoneID == 0)
+	if (zoneID == 0)
 		zoneID = zone->GetZoneID();
 
-	if(zoneID == zone->GetZoneID())
+	const char *zone_name = ZoneName(zoneID);
+	auto zone_data = GetZone(zoneID);
+	if (zone_name == nullptr || zone_data == nullptr)
 	{
-		if(GetPetID() != 0 && GetGM()) 
+		Message(Chat::Red, "Invalid zone number specified");
+		return;
+	}
+
+	glm::vec4 destination(x, y, z, heading);
+	bool transfer = zoneID != zone->GetZoneID();
+
+	switch (zm)
+	{
+	case ZoneToSafeCoords:
+		if (zoneID == zone->GetZoneID())
 		{
-			//if they have a pet, are a GM, and they are staying in zone, move with them
-			Mob *p = GetPet();
-			if(p != nullptr){
-				p->SetPetOrder(SPO_Follow);
-				p->GMMove(x+15, y, z);	//so it dosent have to run across the map.
-			}
+			destination = zone->GetSafePoint();
 		}
-	}
+		else
+		{
+			destination = glm::vec4(zone_data->safe_x, zone_data->safe_y, zone_data->safe_z, zone_data->safe_heading);
+		}
+		LogInfo(
+			"Zoning [{}] to safe coords ([{}],[{}],[{}],[{}]) in [{}] ([{}])",
+			GetName(),
+			destination.x,
+			destination.y,
+			destination.z,
+			destination.w,
+			zone_name,
+			zoneID
+		);
+		break;
 
-	switch(zm) {
-		case GateToBindPoint:
-			ZonePC(zoneID, x, y, z, heading, ignorerestrictions, zm);
-			break;
-		case EvacToSafeCoords:
-		case ZoneToSafeCoords:
-			ZonePC(zoneID, x, y, z, heading, ignorerestrictions, zm);
-			break;
-		case GMSummon:
-			if (!GetGM())
-				Message(Chat::Yellow, "You have been summoned by a GM!");
-			ZonePC(zoneID, x, y, z, heading, ignorerestrictions, zm);
-			break;
-		case ZoneToBindPoint:
-			ZonePC(zoneID, x, y, z, heading, ignorerestrictions, zm);
-			break;
-		case ZoneSolicited:
-			ZonePC(zoneID, x, y, z, heading, ignorerestrictions, zm);
-			break;
-		case SummonPC:
-			if(!GetGM())
-				Message_StringID(Chat::Yellow, StringID::BEEN_SUMMONED);
-			ZonePC(zoneID, x, y, z, heading, ignorerestrictions, zm);
-			break;
-		case Rewind:
-			Message(Chat::Yellow, "Rewinding to previous location.");
-			ZonePC(zoneID, x, y, z, heading, ignorerestrictions, zm);
-			break;
-		default:
-			LogError("Client::ProcessMovePC received a reguest to perform an unsupported client zone operation.");
-			break;
-	}
-}
+	case GMSummon:
+		if (!GetGM())
+			Message(Chat::Yellow, "You have been summoned by a GM!");
+		ignorerestrictions = 1;
+		break;
 
-void Client::ZonePC(uint32 zoneID, float x, float y, float z, float heading, uint8 ignorerestrictions, ZoneMode zm) {
+	case ZoneSolicited:
+		break;
 
-	bool ReadyToZone = true;
-	int iZoneNameLength = 0;
-	const char*	pShortZoneName = nullptr;
-	char* pZoneName = nullptr;
+	case GateToBindPoint:
+		destination = glm::vec4(m_pp.binds[0].x, m_pp.binds[0].y, m_pp.binds[0].z, m_pp.binds[0].heading);
+		break;
 
-	pShortZoneName = ZoneName(zoneID);
-	auto zd = GetZone(zoneID);
-	if (zd) {
-		pZoneName = strcpy(new char[strlen(zd->long_name.c_str()) + 1], zd->long_name.c_str());
+	case SummonPC:
+		Message_StringID(Chat::Yellow, StringID::BEEN_SUMMONED);
+		if (zoneID != zone->GetZoneID())
+		{
+			LogError("Client::MovePC received a local movement mode for another zone.");
+			return;
+		}
+		break;
+
+	case Rewind:
+		Message(Chat::Yellow, "Rewinding to previous location.");
+		if (zoneID != zone->GetZoneID())
+		{
+			LogError("Client::MovePC received a local movement mode for another zone.");
+			return;
+		}
+		LogInfo(
+			"[{}] has requested a /rewind from [{}], [{}], [{}], to [{}], [{}], [{}] in [{}]",
+			GetName(),
+			m_Position.x,
+			m_Position.y,
+			m_Position.z,
+			destination.x,
+			destination.y,
+			destination.z,
+			zone->GetShortName()
+		);
+		break;
+
+	default:
+		LogError("Client::MovePC received a request to perform an unsupported client zone operation.");
+		return;
 	}
 
 	cheat_manager.SetExemptStatus(Port, true);
 
-	if(!pZoneName) {
-		Message(Chat::Red, "Invalid zone number specified");
-		safe_delete_array(pZoneName);
-		return;
-	}
-	iZoneNameLength = strlen(pZoneName);
-	glm::vec4 safePoint;
-
-	switch(zm) {
-		case EvacToSafeCoords:
-		case ZoneToSafeCoords:
-			safePoint = zone->GetSafePoint();
-			x = safePoint.x;
-			y = safePoint.y;
-			z = safePoint.z;
-			heading = safePoint.w;
-			break;
-		case GMSummon:
-			m_Position = glm::vec4(x, y, z, heading);
-			m_ZoneSummonLocation = m_Position;
-			zonesummon_id = zoneID;
-			zonesummon_ignorerestrictions = 1;
-			break;
-		case ZoneSolicited:
-			m_ZoneSummonLocation = glm::vec4(x,y,z,heading);
-			zonesummon_id = zoneID;
-			zonesummon_ignorerestrictions = ignorerestrictions;
-			break;
-		case GateToBindPoint:
-			x = m_Position.x = m_pp.binds[0].x;
-			y = m_Position.y = m_pp.binds[0].y;
-			z = m_Position.z = m_pp.binds[0].z;
-			heading = m_pp.binds[0].heading;
-			m_Position.w = heading * 0.5f;
-			break;
-		case ZoneToBindPoint:
-			x = m_Position.x = m_pp.binds[0].x;
-			y = m_Position.y = m_pp.binds[0].y;
-			z = m_Position.z = m_pp.binds[0].z;
-			heading = m_pp.binds[0].heading;
-			m_Position.w = heading * 0.5f;
-
-			zonesummon_ignorerestrictions = 1;
-			LogInfo(
-				"Player [{}] has died and will be zoned to bind point in zone: [{}] at LOC x=[{}], y=[{}], z=[{}], heading=[{}]", 
-				GetName(), 
-				pZoneName, 
-				m_pp.binds[0].x, 
-				m_pp.binds[0].y, 
-				m_pp.binds[0].z, 
-				m_pp.binds[0].heading
-			);
-			break;
-		case SummonPC:
-			m_ZoneSummonLocation = glm::vec4(x, y, z, heading);
-			m_Position = m_ZoneSummonLocation;
-			break;
-		case Rewind:
-			LogInfo(
-				"[{}] has requested a /rewind from [{}], [{}], [{}], to [{}], [{}], [{}] in [{}]", 
-				GetName(), 
-				m_Position.x, 
-				m_Position.y, 
-				m_Position.z, 
-				m_RewindLocation.x, 
-				m_RewindLocation.y, 
-				m_RewindLocation.z, 
-				zone->GetShortName()
-			);
-			m_ZoneSummonLocation = glm::vec4(x, y, z, heading);
-			m_Position = m_ZoneSummonLocation;
-			break;
-		default:
-			LogError("Client::ZonePC() received a request to perform an unsupported client zone operation.");
-			ReadyToZone = false;
-			break;
-	}
-
-	if (ReadyToZone)
+	if (IsLooting())
 	{
-		//if client is looting, we need to send an end loot
-		if (IsLooting())
+		Corpse *corpse = entity_list.GetCorpseByID(entity_id_being_looted);
+		if (corpse == nullptr)
 		{
-			Entity* entity = entity_list.GetID(entity_id_being_looted);
-			if (entity == 0)
-			{
-				Corpse::SendLootReqErrorPacket(this);
-			}
-			else if (!entity->IsCorpse())
-			{
-				Corpse::SendLootReqErrorPacket(this);
-			}
-			else
-			{
-				Corpse::SendEndLootErrorPacket(this);
-				entity->CastToCorpse()->EndLoot(this, nullptr);
-			}
-			SetLooting(0);
+			Corpse::SendLootReqErrorPacket(this);
 		}
-		if(Trader)
+		else
 		{
-			Trader_EndTrader();
+			Corpse::SendEndLootErrorPacket(this);
+			corpse->EndLoot(this, nullptr);
 		}
-
-		zone_mode = zm;
-
-		if(zm == ZoneSolicited || zm == ZoneToSafeCoords) {
-			LogEQMacDetail("Zoning packet about to be sent (ZS/ZTS). We are headed to zone: [{}], at [{}], [{}], [{}]", zoneID, x, y, z);
-			auto outapp = new EQApplicationPacket(OP_RequestClientZoneChange, sizeof(RequestClientZoneChange_Struct));
-			RequestClientZoneChange_Struct* gmg = (RequestClientZoneChange_Struct*) outapp->pBuffer;
-
-			gmg->zone_id = zoneID;
-
-			gmg->x = x;
-			gmg->y = y;
-			gmg->z = z;
-			gmg->heading = heading;
-			gmg->type = 0x01;				//an observed value, not sure of meaning
-
-			outapp->priority = 6;
-			FastQueuePacket(&outapp);	
-		}
-		else if (zm == ZoneToBindPoint) {
-			//TODO: Find a better packet that works with EQMac on death. Sending OP_RequestClientZoneChange here usually does not zone the
-			//player correctly (it starts the zoning process, then disconnect.) OP_GMGoto seems to work 90% of the time. It's a hack, but it works...
-			LogEQMacDetail("Zoning packet about to be sent (ZTB). We are headed to zone: [{}], at [{}], [{}], [{}]", zoneID, x, y, z);
-			auto outapp = new EQApplicationPacket(OP_GMGoto, sizeof(GMGoto_Struct));
-			GMGoto_Struct* gmg = (GMGoto_Struct*) outapp->pBuffer;
-	
-			strcpy(gmg->charname,this->name);
-			strcpy(gmg->gmname,this->name);
-			gmg->zoneID = zoneID;
-			gmg->x = x;
-			gmg->y = y;
-			gmg->z = z;
-			outapp->priority = 6;
-			FastQueuePacket(&outapp);
-		}
-		else if (zm == GateToBindPoint) {			
-
-			// we hide the real zoneid we want to evac/succor to here
-			zonesummon_id = zoneID;
-			LogEQMacDetail("Zoning packet about to be sent (GTB). We are headed to zone: [{}], at [{}], [{}], [{}]", zoneID, x, y, z);
-			if(zoneID == GetZoneID()) {
-				//Not doing inter-zone for same zone gates. Client is supposed to handle these, based on PP info it is fed.
-				//properly handle proximities
-				entity_list.ProcessMove(this, glm::vec3(m_Position));
-				m_Proximity = glm::vec3(m_Position);
-				//send out updates to people in zone.
-				SendPosition(true);
-			}
-
-			auto outapp = new EQApplicationPacket(OP_RequestClientZoneChange, sizeof(RequestClientZoneChange_Struct));
-			RequestClientZoneChange_Struct* gmg = (RequestClientZoneChange_Struct*)outapp->pBuffer;
-
-			gmg->zone_id = zoneID;
-			gmg->x = x;
-			gmg->y = y;
-			gmg->z = z;
-			gmg->heading = heading;
-			gmg->type = 0x01;	//an observed value, not sure of meaning
-			outapp->priority = 6;
-			FastQueuePacket(&outapp);
-		}
-		else if(zm == EvacToSafeCoords)
-		{
-			LogEQMacDetail("Zoning packet about to be sent (ETSC). We are headed to zone: [{}], at [{}], [{}], [{}]", zoneID, x, y, z);
-			auto outapp = new EQApplicationPacket(OP_RequestClientZoneChange, sizeof(RequestClientZoneChange_Struct));
-			RequestClientZoneChange_Struct* gmg = (RequestClientZoneChange_Struct*) outapp->pBuffer;
-
-			if (this->GetZoneID() == Zones::QEYNOS) {
-				gmg->zone_id = Zones::QEYNOS2;
-			}
-			else {
-				gmg->zone_id = Zones::QEYNOS;
-			}
-
-			gmg->x = x;
-			gmg->y = y;
-			gmg->z = z;
-			gmg->heading = heading;
-			gmg->type = 0x01;				// '0x01' was an observed value for the type field, not sure of meaning
-
-			// we hide the real zoneid we want to evac/succor to here
-			zonesummon_id = zoneID;
-
-			outapp->priority = 6;
-			FastQueuePacket(&outapp);
-		}
-		else {
-			if(zoneID == GetZoneID()) {
-				LogEQMacDetail("Zoning packet about to be sent (GOTO). We are headed to zone: [{}], at [{}], [{}], [{}]", zoneID, x, y, z);
-				//properly handle proximities
-				entity_list.ProcessMove(this, glm::vec3(m_Position));
-				m_Proximity = glm::vec3(m_Position);
-
-				//send out updates to people in zone.
-				SendPosition(true);
-			}
-
-			auto outapp = new EQApplicationPacket(OP_RequestClientZoneChange, sizeof(RequestClientZoneChange_Struct));
-			RequestClientZoneChange_Struct* gmg = (RequestClientZoneChange_Struct*) outapp->pBuffer;
-
-			gmg->zone_id = zoneID;
-			gmg->x = x;
-			gmg->y = y;
-			gmg->z = z;
-			gmg->heading = heading * 2.0f; // this doubling is necessary because we are storing halved headings for players/mobs and this packet expects the normal 512 range heading
-			gmg->type = 0x01;	//an observed value, not sure of meaning
-			outapp->priority = 6;
-			FastQueuePacket(&outapp);
-		}
-
-		LogEQMacDetail("Player [{}] has requested a zoning to LOC x=[{}], y=[{}], z=[{}], heading=[{}] in zoneid=[{}]", GetName(), x, y, z, heading, zoneID);
-		//Clear zonesummon variables if we're zoning to our own zone
-		//Client wont generate a zone change packet to the server in this case so
-		//They aren't needed and it keeps behavior on next zone attempt from being undefined.
-		if(zoneID == zone->GetZoneID())
-		{
-			if(zm != EvacToSafeCoords && zm != ZoneToSafeCoords && zm != ZoneToBindPoint)
-			{
-				m_ZoneSummonLocation = glm::vec4();
-				zonesummon_id = 0;
-				zonesummon_ignorerestrictions = 0;
-				zone_mode = ZoneUnsolicited;
-			}
-		}
+		SetLooting(0);
 	}
 
-	safe_delete_array(pZoneName);
-}
+	if (Trader)
+		Trader_EndTrader();
 
+	const glm::vec4 committed_destination = ResolveClientTeleportDestination(zoneID, destination);
+
+	if (transfer)
+	{
+		// Store the destination after applying the changes the client will make when it receives the teleport packet.
+		SetPendingZoneTransfer(zm, zoneID, committed_destination, ignorerestrictions);
+
+		// Send the original destination. The client applies the same changes before it starts zoning.
+		SendTeleportPacket(zoneID, destination);
+	}
+	else
+	{
+		if (GetPetID() != 0 && GetGM())
+		{
+			Mob *pet = GetPet();
+			if (pet != nullptr)
+			{
+				pet->SetPetOrder(SPO_Follow);
+				pet->GMMove(committed_destination.x + 15.0f, committed_destination.y, committed_destination.z);
+			}
+		}
+
+		m_Position.x = committed_destination.x;
+		m_Position.y = committed_destination.y;
+		m_Position.z = committed_destination.z;
+		m_Position.w = committed_destination.w * 0.5f; // MovePC takes the full 512 scale heading; internal heading is 256 scale.
+
+		// Send the original destination so the client resolves the same sentinel values.
+		SendTeleportPacket(zoneID, destination);
+
+		// Proximity events may move the client again, so process them after sending this move.
+		entity_list.ProcessMove(this, glm::vec3(m_Position));
+		m_Proximity = glm::vec3(m_Position);
+		SendPosition(true);
+	}
+
+	LogEQMacDetail(
+		"Player [{}] has requested a move to LOC x=[{}], y=[{}], z=[{}], heading=[{}] in zoneid=[{}]",
+		GetName(),
+		destination.x,
+		destination.y,
+		destination.z,
+		destination.w,
+		zoneID
+	);
+}
 
 void Client::GoToSafeCoords(uint16 zone_id) {
 	if(zone_id == 0)
@@ -872,10 +842,74 @@ void Client::GoToBind(uint8 bindnum) {
 		MovePC(m_pp.binds[bindnum].zoneId, m_pp.binds[bindnum].x, m_pp.binds[bindnum].y, m_pp.binds[bindnum].z, m_pp.binds[bindnum].heading, 1);
 }
 
-void Client::GoToDeath() {
-	//Client will request a zone in EQMac era clients, but let's make sure they get there:
-	zone_mode = ZoneToBindPoint;
-	MovePC(m_pp.binds[0].zoneId, 0.0f, 0.0f, 0.0f, 0.0f, 1, ZoneToBindPoint);
+void Client::GoToDeath()
+{
+	dead = true;
+	ClearPendingZoneTransfer();
+	ClearPendingTranslocate();
+	ClearPendingResurrection();
+	ClearPendingSacrifice();
+
+	// This is a back stop for a dead client which never begins the transfer.  It is restarted if the transfer fails.
+	dead_timer.Start(DeadClientRemovalTimeoutMs, true);
+
+	if (IsLooting())
+	{
+		Corpse *corpse = entity_list.GetCorpseByID(entity_id_being_looted);
+		if (corpse == nullptr)
+		{
+			Corpse::SendLootReqErrorPacket(this);
+		}
+		else
+		{
+			Corpse::SendEndLootErrorPacket(this);
+			corpse->EndLoot(this, nullptr);
+		}
+		SetLooting(0);
+	}
+
+	CloseTradeskillObject();
+	CloseTraderSession();
+
+	const auto &bind = m_pp.binds[0];
+	if (!IsLD())
+	{
+		m_pp.zone_id = bind.zoneId;
+		database.MoveCharacterToZone(CharacterID(), m_pp.zone_id);
+	}
+	else
+	{
+		m_pp.zone_id = database.MoveCharacterToBind(CharacterID());
+		m_Position = glm::vec4(bind.x, bind.y, bind.z, bind.heading * 0.5f);
+	}
+
+	m_pp.x = bind.x;
+	m_pp.y = bind.y;
+	m_pp.z = bind.z;
+	m_pp.heading = bind.heading;
+	m_lock_save_position = true;
+
+	m_pp.intoxication = 0;
+	m_pp.air_remaining = CalculateLungCapacity();
+	Save();
+
+	if (IsLD())
+		return;
+
+	glm::vec4 destination(bind.x, bind.y, bind.z, bind.heading);
+
+	LogInfo(
+		"Player [{}] has died and will be zoned to bind point in zone: [{}] at LOC x=[{}], y=[{}], z=[{}], heading=[{}]",
+		GetName(),
+		ZoneLongName(bind.zoneId),
+		destination.x,
+		destination.y,
+		destination.z,
+		destination.w
+	);
+
+	cheat_manager.SetExemptStatus(Port, true);
+	SetPendingZoneTransfer(ZoneSolicited, bind.zoneId, destination, 1);
 }
 
 void Client::SetZoneFlag(uint32 zone_id) {

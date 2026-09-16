@@ -1,91 +1,82 @@
 #pragma once
 
 #include "../eq_packet.h"
-#include "../eq_stream_intf.h"
 #include "../opcodemgr.h"
 #include "reliable_stream_connection.h"
-#include <vector>
+
 #include <deque>
-#include <unordered_map>
-#include <mutex> // for old eqstream
+#include <functional>
+#include <map>
+#include <memory>
+#include <utility>
 
 namespace EQ
 {
 	namespace Net
 	{
-		class EQStream;
-		class EQStreamManager : public EQStreamManagerInterface
+		struct EQStreamManagerOptions
 		{
-		public:
-			EQStreamManager(const EQStreamManagerInterfaceOptions &options);
-			~EQStreamManager();
+			EQStreamManagerOptions() = default;
 
-			virtual void SetOptions(const EQStreamManagerInterfaceOptions& options);
-			void OnNewConnection(std::function<void(std::shared_ptr<EQStream>)> func) { m_on_new_connection = func; }
-			void OnConnectionStateChange(std::function<void(std::shared_ptr<EQStream>, DbProtocolStatus, DbProtocolStatus)> func) { m_on_connection_state_change = func; }
-		private:
-			ReliableStreamConnectionManager m_reliable_stream;
-			std::function<void(std::shared_ptr<EQStream>)> m_on_new_connection;
-			std::function<void(std::shared_ptr<EQStream>, DbProtocolStatus, DbProtocolStatus)> m_on_connection_state_change;
-			std::map<std::shared_ptr<ReliableStreamConnection>, std::shared_ptr<EQStream>> m_streams;
+			EQStreamManagerOptions(int port, bool encoded, bool compressed)
+			{
+				if (compressed) {
+					reliable_stream_options.encode_passes[0] = EncodeCompression;
+				}
+				else if (encoded) {
+					reliable_stream_options.encode_passes[0] = EncodeXOR;
+				}
 
-			void ReliableStreamNewConnection(std::shared_ptr<ReliableStreamConnection> connection);
-			void ReliableStreamConnectionStateChange(std::shared_ptr<ReliableStreamConnection> connection, DbProtocolStatus from, DbProtocolStatus to);
-			void ReliableStreamPacketRecv(std::shared_ptr<ReliableStreamConnection> connection, const Packet &p);
-			friend class EQStream;
+				reliable_stream_options.port = port;
+			}
+
+			int opcode_size = 2;
+			ReliableStreamConnectionManagerOptions reliable_stream_options;
 		};
 
-		class EQStream : public EQStreamInterface
+		class EQStream;
+
+		class EQStreamManager
 		{
 		public:
-			EQStream(EQStreamManagerInterface *parent, std::shared_ptr<ReliableStreamConnection> connection);
-			~EQStream();
+			explicit EQStreamManager(const EQStreamManagerOptions &options);
 
-			virtual void QueuePacket(const EQApplicationPacket *p, bool ack_req = true);
-			virtual void FastQueuePacket(EQApplicationPacket **p, bool ack_req = true);
-			virtual EQApplicationPacket *PopPacket();
-			virtual void Close();
-			virtual void ReleaseFromUse() { };
-			virtual void RemoveData() { };
-			virtual std::string GetRemoteAddr() const;
-			virtual uint32 GetRemoteIP() const;
-			virtual uint16 GetRemotePort() const { return m_connection->RemotePort(); }
-			virtual bool CheckState(EQStreamState state);
-			virtual std::string Describe() const { return "Direct EQStream"; }
-			virtual void SetActive(bool val) { }
-			virtual MatchState CheckSignature(const Signature *sig);
-			virtual EQStreamState GetState();
-			virtual void SetOpcodeManager(OpcodeManager **opm) {
-				m_opcode_manager = opm;
-			}
-			virtual OpcodeManager * GetOpcodeManager() const
-			{
-				return (*m_opcode_manager);
-			};
+			void OnNewConnection(std::function<void(std::shared_ptr<EQStream>)> func) { m_on_new_connection = func; }
 
-			virtual Stats GetStats() const;
-			virtual void ResetStats();
-			virtual EQStreamManagerInterface* GetManager() const;
 		private:
-			EQStreamManagerInterface *m_owner;
+			void ReliableStreamNewConnection(std::shared_ptr<ReliableStreamConnection> connection);
+			void ReliableStreamConnectionStateChange(std::shared_ptr<ReliableStreamConnection> connection, DbProtocolStatus, DbProtocolStatus to);
+			void ReliableStreamPacketRecv(std::shared_ptr<ReliableStreamConnection> connection, const Packet &p);
+
+			int m_opcode_size;
+			ReliableStreamConnectionManager m_reliable_stream;
+			std::function<void(std::shared_ptr<EQStream>)> m_on_new_connection;
+			std::map<std::shared_ptr<ReliableStreamConnection>, std::shared_ptr<EQStream>> m_streams;
+		};
+
+		class EQStream
+		{
+		public:
+			EQStream(int opcode_size, std::shared_ptr<ReliableStreamConnection> connection);
+
+			void QueuePacket(const EQApplicationPacket *p, bool ack_req = true);
+			EQApplicationPacket *PopPacket();
+			void Close();
+
+			uint32 GetRemoteIP() const;
+			uint16 GetRemotePort() const { return m_connection->RemotePort(); }
+			bool IsClosed() const { return m_connection->GetStatus() == StatusDisconnected; }
+
+			void SetOpcodeManager(const std::shared_ptr<OpcodeManager> &opm) { m_opcode_manager = opm; }
+			OpcodeManager *GetOpcodeManager() const { return m_opcode_manager.get(); }
+
+		private:
+			int m_opcode_size;
 			std::shared_ptr<ReliableStreamConnection> m_connection;
-			OpcodeManager **m_opcode_manager;
-			std::deque<std::unique_ptr<EQ::Net::Packet>> m_packet_queue;
-			std::unordered_map<int, int> m_packet_recv_count;
-			std::unordered_map<int, int> m_packet_sent_count;
+			std::shared_ptr<OpcodeManager> m_opcode_manager;
+			std::deque<std::unique_ptr<Packet>> m_packet_queue;
+
 			friend class EQStreamManager;
-
-		public: 
-			// these virtual function is needed to make it work with EQStream / EQOldStream class
-			uint8 active_users;
-			std::mutex MInUse;
-
-			virtual bool IsInUse() { 
-				bool flag; 
-				std::lock_guard<std::mutex> lock(MInUse); 
-				flag = (active_users > 0); 
-				return flag; 
-			}
 		};
 	}
 }

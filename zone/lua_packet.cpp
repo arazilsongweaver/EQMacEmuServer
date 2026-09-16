@@ -519,7 +519,6 @@ luabind::scope lua_register_packet_opcodes() {
 			luabind::value("Disarm", static_cast<int>(OP_Disarm)),
 			luabind::value("FriendsWho", static_cast<int>(OP_FriendsWho)),
 			luabind::value("GMSearchCorpse", static_cast<int>(OP_GMSearchCorpse)),
-			luabind::value("MobHealth", static_cast<int>(OP_MobHealth)),
 			luabind::value("RaidInvite", static_cast<int>(OP_RaidInvite)),
 			luabind::value("Report", static_cast<int>(OP_Report)),
 			luabind::value("SenseHeading", static_cast<int>(OP_SenseHeading)),

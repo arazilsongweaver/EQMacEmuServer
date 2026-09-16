@@ -1,26 +1,22 @@
 #include "../global_define.h"
-#include "../eqemu_config.h"
 #include "../eqemu_logsys.h"
+#include "../eq_packet.h"
+#include "../eq_packet_translator.h"
 #include "mac.h"
 #include "../opcodemgr.h"
-#include "../eq_stream_ident.h"
 #include "../crc32.h"
 
 #include "../eq_packet_structs.h"
-#include "../packet_dump_file.h"
 #include "../misc_functions.h"
 #include "../packet_functions.h"
 #include "../strings.h"
 #include "../inventory_profile.h"
 #include "mac_structs.h"
 #include "../rulesys.h"
-#include "../path_manager.h"
 #include "../content/world_content_service.h"
 
 namespace Mac {
 
-	static const char *name = "Mac";
-	static OpcodeManager *opcodes = nullptr;
 	static Strategy struct_strategy;
 
 	structs::Item_Struct* MacItem(const EQ::ItemInstance *inst, int16 slot_id_in, int type = 0);
@@ -31,95 +27,19 @@ namespace Mac {
 	static inline uint32 MacToServerSlot(int16 MacSlot);
 	static inline uint32 MacToServerCorpseSlot(int16 MacCorpse);
 
-	void Register(EQStreamIdentifier &into)
+	void Register(EQPacketTranslator &translator)
 	{
-		//create our opcode manager if we havent already
-		if(opcodes == nullptr) 
-		{
-			std::string opfile = fmt::format("{}/patch_{}.conf", PathManager::Instance()->GetPatchPath(), name);
-			//load up the opcode manager.
-			//TODO: figure out how to support shared memory with multiple patches...
-			opcodes = new RegularOpcodeManager();
-			if(!opcodes->LoadOpcodes(opfile.c_str())) 
-			{
-				LogNetcode("[OPCODES] Error loading opcodes file {}. Not registering patch {}.", opfile.c_str(), name);
-				return;
-			}
-		}
-
-		//ok, now we have what we need to register.
-
-		EQStreamInterface::Signature signature;
-		std::string pname;
-
-		signature.ignore_eq_opcode = 0;
-
-		// Intel version's OP_SendLoginInfo is 200 bytes
-		pname = std::string(name) + "_world";
-		//register our world signature.
-		signature.first_length = sizeof(structs::LoginInfo_Struct) + 4;
-		signature.first_eq_opcode = opcodes->EmuToEQ(OP_SendLoginInfo);
-		into.RegisterOldPatch(signature, pname.c_str(), &opcodes, &struct_strategy);
-
-		// PPC version's OP_SendLoginInfo is 196 bytes
-		pname = std::string(name) + "_world_PPC";
-		//register our world signature.
-		signature.first_length = sizeof(structs::LoginInfo_Struct);
-		signature.first_eq_opcode = opcodes->EmuToEQ(OP_SendLoginInfo);
-		into.RegisterOldPatch(signature, pname.c_str(), &opcodes, &struct_strategy);
-
-		pname = std::string(name) + "_zone";
-		//register our zone signature.
-		signature.first_length = sizeof(structs::SetDataRate_Struct);
-		signature.first_eq_opcode = opcodes->EmuToEQ(OP_DataRate);
-		into.RegisterOldPatch(signature, pname.c_str(), &opcodes, &struct_strategy);
-		
-		LogNetcode("[StreamIdentify] Registered patch [{}]", name);
+		struct_strategy.Register(translator);
 	}
 
-	void Reload() 
+	void Strategy::Register(EQPacketTranslator &translator) const
 	{
-
-		//we have a big problem to solve here when we switch back to shared memory
-		//opcode managers because we need to change the manager pointer, which means
-		//we need to go to every stream and replace it's manager.
-
-		if(opcodes != nullptr) 
-		{
-			std::string opfile = fmt::format("{}/patch_{}.conf", PathManager::Instance()->GetPatchPath(), name);
-			if(!opcodes->ReloadOpcodes(opfile.c_str()))
-			{
-				LogNetcode("[OPCODES] Error reloading opcodes file [{}] for patch [{}]", opfile.c_str(), name);
-				return;
-			}
-			LogNetcode("[OPCODES] Reloaded opcodes for patch [{}]", name);
-		}
-	}
-
-
-
-	Strategy::Strategy()
-	: StructStrategy()
-	{
-		//all opcodes default to passthrough.
-		#include "ss_register.h"
+		#define E(x) translator.SetEncoder(x, Encode_##x);
+		#define D(x) translator.SetDecoder(x, Decode_##x);
 		#include "mac_ops.h"
 	}
 
-	std::string Strategy::Describe() const 
-	{
-		std::string r;
-		r += "Patch ";
-		r += name;
-		return(r);
-	}
-
 	#include "ss_define.h"
-
-	const EQ::versions::ClientVersion Strategy::ClientVersion() const
-	{
-		return EQ::versions::ClientVersion::Mac;
-	}
 
 	DECODE(OP_SendLoginInfo)
 	{
@@ -278,14 +198,14 @@ namespace Mac {
 		}
 		OUT(LastModulated);
 
-		LogNetcode("[STRUCTS] Player Profile Packet is {} bytes uncompressed", sizeof(structs::PlayerProfile_Struct));
+		LogNetcodeDetail("[STRUCTS] Player Profile Packet is {} bytes uncompressed", sizeof(structs::PlayerProfile_Struct));
 
 		CRC32::SetEQChecksum(__packet->pBuffer, sizeof(structs::PlayerProfile_Struct)-4);
 		auto outapp = new EQApplicationPacket(OP_PlayerProfile, 8192);
 		outapp->size = DeflatePacket((unsigned char*)__packet->pBuffer, sizeof(structs::PlayerProfile_Struct), outapp->pBuffer, 8192);
 		EncryptProfilePacket(outapp->pBuffer, outapp->size);
-		LogNetcode("[STRUCTS] Player Profile Packet is {} bytes compressed", outapp->size);
-		dest->FastQueuePacket(&outapp);
+		LogNetcodeDetail("[STRUCTS] Player Profile Packet is {} bytes compressed", outapp->size);
+		result->SetPacket(&outapp);
 		delete[] __emu_buffer;
 		delete __packet;
 	}
@@ -363,7 +283,7 @@ namespace Mac {
 		int entrycount = in->size / sizeof(Spawn_Struct);
 		if(entrycount == 0 || (in->size % sizeof(Spawn_Struct)) != 0) 
 		{
-			LogNetcode("[STRUCTS] Wrong size on outbound {}: Got {}, expected multiple of {}", opcodes->EmuToName(in->GetOpcode()), in->size, sizeof(Spawn_Struct));
+			LogNetcode("[STRUCTS] Wrong size on outbound {}: Got {}, expected multiple of {}", OpcodeManager::EmuToName(in->GetOpcode()), in->size, sizeof(Spawn_Struct));
 			delete in;
 			return;
 		}
@@ -455,7 +375,7 @@ namespace Mac {
 		EncryptZoneSpawnPacket(outapp->pBuffer, outapp->size);
 		delete in;
 		delete out;
-		dest->FastQueuePacket(&outapp, ack_req);
+		result->SetPacket(&outapp, reliable);
 	}
 
 	ENCODE(OP_CancelTrade)
@@ -521,7 +441,7 @@ namespace Mac {
 			if(outapp->size != sizeof(structs::Item_Struct))
 				LogNetcode("Invalid size on OP_ItemPacket packet. Expected: {}, Got: {}", sizeof(structs::Item_Struct), outapp->size);
 
-			dest->FastQueuePacket(&outapp);
+			result->SetPacket(&outapp);
 			delete mac_item;
 		}
 		delete in;
@@ -555,7 +475,7 @@ namespace Mac {
 			myitem->fromid = old_item_pkt->fromid;
 			myitem->slotid = int_struct->slot_id;
 			memcpy(&myitem->item,mac_item,sizeof(structs::Item_Struct));
-			dest->FastQueuePacket(&outapp);
+			result->SetPacket(&outapp);
 			delete mac_item;
 		}
 		delete in;
@@ -572,7 +492,7 @@ namespace Mac {
 			in->size = 2;
 			in->pBuffer = new uchar[in->size];
 			*((uint16 *) in->pBuffer) = 0;
-			dest->FastQueuePacket(&in);
+			result->SetPacket(&in);
 			return;
 		}
 
@@ -582,7 +502,7 @@ namespace Mac {
 		int16 itemcount = in->size / sizeof(EQ::InternalSerializedItem_Struct);
 		if(itemcount == 0 || (in->size % sizeof(EQ::InternalSerializedItem_Struct)) != 0)
 		{
-			LogNetcode("[STRUCTS] Wrong size on outbound {}: Got {}, expected multiple of {}", opcodes->EmuToName(in->GetOpcode()), in->size, sizeof(EQ::InternalSerializedItem_Struct));
+			LogNetcode("[STRUCTS] Wrong size on outbound {}: Got {}, expected multiple of {}", OpcodeManager::EmuToName(in->GetOpcode()), in->size, sizeof(EQ::InternalSerializedItem_Struct));
 			delete in;
 			return;
 		}
@@ -621,7 +541,7 @@ namespace Mac {
 		outapp->size = buffer + DeflatePacket((uchar*)mac_item_string.c_str(), mac_item_string.length(), &outapp->pBuffer[buffer], 16382);
 		outapp->pBuffer[0] = itemcount;
 		
-		dest->FastQueuePacket(&outapp);
+		result->SetPacket(&outapp);
 		delete in;
 	}
 
@@ -637,7 +557,7 @@ namespace Mac {
 		int16 itemcount = in->size / sizeof(EQ::InternalSerializedItem_Struct);
 		if(itemcount == 0 || (in->size % sizeof(EQ::InternalSerializedItem_Struct)) != 0)
 		{
-			LogNetcode("Wrong size on outbound {}: Got {}, expected multiple of {}", opcodes->EmuToName(in->GetOpcode()), in->size, sizeof(EQ::InternalSerializedItem_Struct));
+			LogNetcode("Wrong size on outbound {}: Got {}, expected multiple of {}", OpcodeManager::EmuToName(in->GetOpcode()), in->size, sizeof(EQ::InternalSerializedItem_Struct));
 			delete in;
 			return;
 		}
@@ -673,7 +593,7 @@ namespace Mac {
 		auto outapp = new EQApplicationPacket(OP_ShopInventoryPacket, 5000);
 		outapp->size = buffer + DeflatePacket((uchar*)mac_item_string.c_str(), mac_item_string.length(), &outapp->pBuffer[buffer], 4998);
 		outapp->pBuffer[0] = itemcount;
-		dest->FastQueuePacket(&outapp);
+		result->SetPacket(&outapp);
 		delete in;
 	}
 
@@ -722,7 +642,7 @@ namespace Mac {
 				myitem->type = 5;
 				memcpy(&myitem->item,mac_item,sizeof(structs::Item_Struct));
 
-				dest->FastQueuePacket(&outapp);
+				result->SetPacket(&outapp);
 				delete mac_item;
 			}
 			delete in;
@@ -754,26 +674,6 @@ namespace Mac {
 		OUT(number_in_stack);
 		LogInventory("EQMAC ENCODE OUTPUT to_slot: {}, from_slot: {}, number_in_stack: {}", eq->to_slot, eq->from_slot, eq->number_in_stack);
 
-		FINISH_ENCODE();
-	}
-
-	ENCODE(OP_HPUpdate)
-	{
-		ENCODE_LENGTH_EXACT(SpawnHPUpdate_Struct);
-		SETUP_DIRECT_ENCODE(SpawnHPUpdate_Struct, structs::SpawnHPUpdate_Struct);
-		OUT(spawn_id);
-		OUT(cur_hp);
-		OUT(max_hp);
-		FINISH_ENCODE();
-	}
-
-	ENCODE(OP_MobHealth)
-	{
-		ENCODE_LENGTH_EXACT(SpawnHPUpdate_Struct2);
-		SETUP_DIRECT_ENCODE(SpawnHPUpdate_Struct2, structs::SpawnHPUpdate_Struct);
-		OUT(spawn_id);
-		eq->cur_hp=emu->hp;
-		eq->max_hp=100;
 		FINISH_ENCODE();
 	}
 
@@ -1101,7 +1001,7 @@ namespace Mac {
 		EQApplicationPacket *in = *p;
 		*p = nullptr;
 
-		LogPacketClientServer("Dropped an invalid packet: {}", opcodes->EmuToName(in->GetOpcode()));
+		LogPacketClientServer("Dropped an invalid packet: {}", OpcodeManager::EmuToName(in->GetOpcode()));
 
 		delete in;
 		return;

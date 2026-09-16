@@ -3,7 +3,7 @@
 #include "../eqemu_logsys.h"
 
 EQ::Net::ServertalkClient::ServertalkClient(const std::string &addr, int port, bool ipv6, const std::string &identifier, const std::string &credentials)
-	: m_timer(std::make_unique<EQ::Timer>(100, true, std::bind(&EQ::Net::ServertalkClient::Connect, this)))
+	: m_timer(std::make_unique<EQ::Timer>(INTERSERVER_TIMER, true, std::bind(&EQ::Net::ServertalkClient::Connect, this)))
 {
 	m_port = port;
 	m_ipv6 = ipv6;
@@ -12,6 +12,7 @@ EQ::Net::ServertalkClient::ServertalkClient(const std::string &addr, int port, b
 	m_connecting = false;
 	DNSLookup(addr, port, false, [this](const std::string &address) {
 		m_addr = address;
+		Connect();
 	});
 }
 

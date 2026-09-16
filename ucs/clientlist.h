@@ -20,6 +20,7 @@
 #ifndef CHATSERVER_CLIENTLIST_H
 #define CHATSERVER_CLIENTLIST_H
 
+#include "../common/emu_versions.h"
 #include "../common/opcodemgr.h"
 #include "../common/net/eqstream.h"
 #include "../common/rulesys.h"
@@ -88,10 +89,10 @@ struct CharacterEntry {
 class Client {
 
 public:
-	Client(std::shared_ptr<EQStreamInterface> eqs);
+	Client(std::shared_ptr<EQ::Net::EQStream> eqs);
 	~Client();
 
-	std::shared_ptr<EQStreamInterface> ClientStream;
+	std::shared_ptr<EQ::Net::EQStream> ClientStream;
 	void AddCharacter(int CharID, const char *CharacterName, int Level, int Race, int Class);
 	void ClearCharacters() { Characters.clear(); }
 	void SendChatlist();
@@ -198,7 +199,7 @@ private:
 
 	std::list<Client *> ClientChatConnections;
 
-	OpcodeManager *ChatOpMgr;
+	std::shared_ptr<OpcodeManager> ChatOpMgr;
 };
 
 #endif

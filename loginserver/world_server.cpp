@@ -17,7 +17,7 @@
 */
 #include "world_server.h"
 #include "login_server.h"
-#include "login_types.h"
+#include "../common/eq_packet.h"
 #include "../common/eqemu_logsys.h"
 #include "../common/ip_util.h"
 
@@ -107,10 +107,10 @@ void WorldServer::ProcessUsertoWorldResp(uint16_t opcode, const EQ::Net::Packet&
 	UsertoWorldResponse*user_to_world_response = (UsertoWorldResponse*)p.Data();
 	LogInfo("Trying to find client with user id of [{0}].", user_to_world_response->lsaccountid);
 	Client* c = server.client_manager->GetClient(user_to_world_response->lsaccountid);
-	if (c && (c->GetClientVersion() == cv_old))
+	if (c)
 	{
 		in_addr in{};
-		in.s_addr = c->GetConnection()->GetRemoteIP();
+		in.s_addr = c->GetIP();
 		std::string client_addr = inet_ntoa(in);
 		if (user_to_world_response->response > 0) {
 			SendClientAuth(client_addr, c->GetAccountName(), c->GetKey(), c->GetAccountID(), c->GetMacClientVersion());
@@ -122,86 +122,32 @@ void WorldServer::ProcessUsertoWorldResp(uint16_t opcode, const EQ::Net::Packet&
 		}
 		case UserToWorldStatusWorldUnavail: {
 			c->FatalError("\nError 1020: Your chosen World Server is DOWN.\n\nPlease select another.");
-			break;
+			return;
 		}
 		case UserToWorldStatusSuspended: {
 			c->FatalError("You have been suspended from the worldserver.");
-			break;
+			return;
 		}
 		case UserToWorldStatusBanned: {
 			c->FatalError("You have been banned from the worldserver.");
-			break;
+			return;
 		}
 		case UserToWorldStatusWorldAtCapacity: {
 			c->FatalError("That server is full.");
-			break;
+			return;
 		}
 		case UserToWorldStatusAlreadyOnline: {
 			c->FatalError("Error 1018: You currently have an active character on that EverQuest Server, please allow a minute for synchronization and try again.");
-			break;
+			return;
 		}
 		case UserToWorldStatusIPLimitExceeded: {
 			c->FatalError("Error IP Limit Exceeded: \n\nYou have exceeded the maximum number of allowed IP addresses for this account.");
-			break;
+			return;
 		}
 		}
 		LogInfo("Found client with user id of {0} and account name of {1}.", user_to_world_response->lsaccountid, c->GetAccountName().c_str());
 		EQApplicationPacket* outapp = new EQApplicationPacket(OP_PlayEverquestRequest, 17);
 		strncpy((char*)&outapp->pBuffer[1], c->GetKey().c_str(), c->GetKey().size());
-
-		c->SendPlayResponse(outapp);
-		delete outapp;
-	}
-	else if (c) {
-		LogInfo("Found client with user id of [{0}] and account name of [{1}].", user_to_world_response->lsaccountid, c->GetAccountName().c_str());
-		auto outapp = new EQApplicationPacket(OP_PlayEverquestResponse, sizeof(PlayEverquestResponse_Struct));
-		PlayEverquestResponse_Struct* per = (PlayEverquestResponse_Struct*)outapp->pBuffer;
-		per->Sequence = c->GetPlaySequence();
-		per->ServerNumber = c->GetPlayServerID();
-		LogInfo("Found sequence and play of [{0}] [{1}]", c->GetPlaySequence(), c->GetPlayServerID());
-		LogDebug("[Size: {0}] [{1}]", outapp->size, DumpPacketToString(outapp).c_str());
-
-		in_addr in{};
-		in.s_addr = c->GetConnection()->GetRemoteIP();
-		std::string client_addr = inet_ntoa(in);
-		if (user_to_world_response->response > 0) {
-			per->Allowed = 1;
-			SendClientAuth(client_addr, c->GetAccountName(), c->GetKey(), c->GetAccountID());
-		}
-
-		switch (user_to_world_response->response) {
-		case UserToWorldStatusSuccess: {
-			per->Message = LS::ErrStr::NON_ERROR;
-			break;
-		}
-		case UserToWorldStatusWorldUnavail: {
-			per->Message = LS::ErrStr::SERVER_UNAVAILABLE;
-			break;
-		}
-		case UserToWorldStatusSuspended: {
-			per->Message = LS::ErrStr::ACCOUNT_SUSPENDED;
-			break;
-		}
-		case UserToWorldStatusBanned: {
-			per->Message = LS::ErrStr::ACCOUNT_BANNED;
-			break;
-		}
-		case UserToWorldStatusWorldAtCapacity: {
-			per->Message = LS::ErrStr::WORLD_MAX_CAPACITY;
-			break;
-		}
-		case UserToWorldStatusAlreadyOnline: {
-			per->Message = LS::ErrStr::ERROR_1018_ACTIVE_CHARACTER;
-			break;
-		}
-		case UserToWorldStatusIPLimitExceeded: {
-			per->Message = LS::ErrStr::IP_ADDR_MAX;
-			break;
-		}
-		}
-
-		LogInfo("Sending play response with following data, allowed {} , sequence {} , server number {} , message {} ",
-			per->Allowed, per->Sequence, per->ServerNumber, per->Message);
 
 		c->SendPlayResponse(outapp);
 		delete outapp;

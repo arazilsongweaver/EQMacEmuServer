@@ -20,6 +20,7 @@ Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA 04111-1307 USA
 
 //this is the highest opcode possibly used in the regular EQ protocol
 #define MAX_EQ_OPCODE 0xFFFF
+#define EQ_OPCODE_COUNT (MAX_EQ_OPCODE + 1)
 
 
 /*

@@ -420,13 +420,12 @@ enum ZoningMessage : int32
 	// this one moves to the safe coords
 	// For planes where the level limit is coded into the client: Your will is not strong enough to leave the material plane.
 	// otherwise: That zone is currently down, moving you to safe point within your current zone.
-	ZoneNoMessage = 0,
+	ZoneDown = 0,
 	ZoneSuccess = 1,
 	ZoneNotReady = -1,     // This zone is not ready to receive visitors yet.  Please try again in a few moments.
 	ZoneValidPC = -2,      // An unknown force prevents you from entering this zone.  (This zone can only be entered by player characters.)
 	ZoneStoryZone = -3,    // An unknown force prevents you from entering this zone. (This zone can only be entered once this part of the storyline is revealed in normal play.  A valid player character must arrive first.)
-	// this happens if the zone status check fails due to loss of connection
-	ZoneDisconnected = -4,
+	ZoneDisconnected = -4, // this happens if the zone status check fails due to loss of connection, client side only, not a server failure reason
 	ZoneNoExpansion = -6,  // The zone that you are attempting to enter is part of an expansion that you do not yet own.  You may need to return to the Login screen and enter an account key for that expansion.  If you have received this message in error, please /petition or send an email to EQAccounts@soe.sony.com
 	ZoneNoExperience = -7  // You are not yet experienced enough to pass through an inter-planar portal.
 };

@@ -27,6 +27,11 @@ void command_reload(Client *c, const Seperator *sep)
 
 	auto args = Strings::Split(full_command, ' ');
 
+	if (args.size() > 1 && Strings::EqualFold(args[1], "opcodes")) {
+		c->Message(Chat::White, "Opcode reloading is not implemented.");
+		return;
+	}
+
 	bool found_command = false;
 
 	for (auto &t : ServerReload::GetTypes()) {

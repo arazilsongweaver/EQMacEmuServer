@@ -96,10 +96,6 @@ Copyright (C) 2001-2002 EQEMu Development Team (http://eqemu.org)
 	#include "../common/unix.h"
 #endif
 
-#ifdef _GOTFRAGS
-	#include "../common/packet_dump_file.h"
-#endif
-
 #include "mob_movement_manager.h"
 #include "client.h"
 #include "mob.h"
@@ -2590,6 +2586,9 @@ bool Mob::SpellOnTarget(uint16 spell_id, Mob* spelltar, bool reflect, bool use_r
 		return false;
 	}
 
+	if (spelltar->IsClient() && (spelltar->CastToClient()->IsDead() || spelltar->CastToClient()->IsZoningOut()))
+		return false;
+
 	// don't allow these mana-tap-over-time spells to apply to things without mana.  this is also checked in DoCastSpell but checking again here stops procs too (Drakkel Wolf Claws)
 	if(spelltar && spelltar->GetCasterClass() == 'N' &&
 		(IsEffectInSpell(spell_id, SE_CurrentMana) && IsValidSpell(spells[spell_id].RecourseLink)) /* Wandering Mind, Mind Wrack, Scryer's Trespass */)
@@ -2598,19 +2597,25 @@ bool Mob::SpellOnTarget(uint16 spell_id, Mob* spelltar, bool reflect, bool use_r
 		return false;
 	}
 
-	//We have to check for Gate failure before its cast, because the client resolves on its own.
+	// Gate is resolved by the client. It can fail locally and never send a zone query, so this only arms the expected destination.
 	if(IsGateSpell(spell_id)) {
-		if (spellbonuses.AntiGate) {
+		if (spelltar->spellbonuses.AntiGate) {
 			InterruptSpell(spell_id);
 			return false;
 		}
 		else if (spelltar->IsClient()) {
-			if (spelltar->CastToClient()->GetBindZoneID() != zone->GetZoneID()) {
-				CastToClient()->zone_mode = GateToBindPoint;
+			auto client = spelltar->CastToClient();
+			// for same zone gate, client will move itself and we don't have to do anything
+			if (client->GetBindZoneID() != zone->GetZoneID()) {
+				client->SetPendingZoneTransfer(
+					GateToBindPoint,
+					client->GetBindZoneID(),
+					glm::vec4(client->GetBindX(), client->GetBindY(), client->GetBindZ(), client->GetBindHeading()),
+					1
+				);
 			}
 			else {
-				CastToClient()->GoToBind();
-				return false;
+				client->cheat_manager.SetExemptStatus(Port, true);
 			}
 		}
 	}

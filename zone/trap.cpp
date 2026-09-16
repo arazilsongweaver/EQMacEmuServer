@@ -304,6 +304,8 @@ Mob* EntityList::GetTrapTrigger(Trap* trap)
 	for (auto it = client_list.begin(); it != client_list.end(); ++it) 
 	{
 		Client* cur = it->second;
+		if (!cur->InZone())
+			continue;
 
 		auto diff = glm::vec3(cur->GetPosition()) - trap->m_Position;
 		diff.z = std::abs(diff.z);

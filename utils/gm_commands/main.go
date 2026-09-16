@@ -110,9 +110,6 @@ func main() {
 				if strings.Contains(chunk, "MobStuckBehavior::") {
 					includes = fmt.Sprintf("%v%v\n", includes, "#include \"../mob_movement_manager.h\"")
 				}
-				if strings.Contains(chunk, "ReloadAllPatches") {
-					includes = fmt.Sprintf("%v%v\n", includes, "#include \"../../common/patches/patches.h\"")
-				}
 				if strings.Contains(chunk, "ProfanityManager") {
 					includes = fmt.Sprintf("%v%v\n", includes, "#include \"../../common/profanity_manager.h\"")
 				}

@@ -25,12 +25,14 @@ public:
 	~ClientList();
 
 	void Process();
+	void Clear();
 
 	//from old ClientList
 	void	Add(Client* client);
 	Client*	Get(uint32 ip, uint16 port);
-	Client* FindByAccountID(uint32 account_id);
+	Client* FindByWorldEntranceRequest(const WorldToZone_Struct &request);
 	Client* FindByName(char* charname);
+	uint32 GetNextWorldEntranceRequestID();
 
 	void	ZoneBootup(ZoneServer* zs);
 	void	RemoveCLEReferances(ClientListEntry* cle);
@@ -51,6 +53,7 @@ public:
 	void	SendGuildPacket(uint32 guild_id, ServerPacket* pack);
 
 	void	ClientUpdate(ZoneServer* zoneserver, ServerClientList_Struct* scl);
+	void	CharacterOffline(uint32 account_id, uint32 character_id, const char *character_name);
 	void	CLERemoveZSRef(ZoneServer* iZS);
 	ClientListEntry* CheckAuth(uint32 iLSID, const char* iKey);
 	ClientListEntry* CheckAuth(const char* iName, const char* iPassword);
@@ -89,12 +92,13 @@ private:
 	void OnTick(EQ::Timer* t);
 	inline uint32 GetNextCLEID() { return NextCLEID++; }
 
-	//this is the list of people actively connected to zone
+	// short lived game transports connected to the world client port
 	LinkedList<Client*> list;
 
-	//this is the list of people in any zone, not nescesarily connected to world
+	// logical sessions at character select, zoning, or in a zone
 	Timer	CLStale_timer;
 	uint32 NextCLEID;
+	uint32 NextWorldEntranceRequestID;
 	LinkedList<ClientListEntry *> clientlist;
 
 	std::unique_ptr<EQ::Timer> m_tick;

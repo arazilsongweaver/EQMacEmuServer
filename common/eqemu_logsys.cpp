@@ -227,9 +227,14 @@ void EQEmuLogSys::ProcessConsoleMessage(
 		log_category == Logs::LogCategory::Warning
 		);
 
+	char time_stamp[80];
+	EQEmuLogSys::SetCurrentTimeStamp(time_stamp);
+
 	(!is_error ? std::cout : std::cerr)
 		<< ""
 		<< rang::fgB::black
+		<< time_stamp
+		<< " "
 		<< rang::style::bold
 		<< fmt::format("{:>6}", GetPlatformName().substr(0, 6))
 		<< rang::style::reset
@@ -487,11 +492,15 @@ void EQEmuLogSys::Out(
  */
 void EQEmuLogSys::SetCurrentTimeStamp(char* time_stamp)
 {
-	time_t    raw_time;
-	struct tm* time_info;
+	time_t raw_time;
+	struct tm time_info{};
 	time(&raw_time);
-	time_info = localtime(&raw_time);
-	strftime(time_stamp, 80, "[%m-%d-%Y %H:%M:%S]", time_info);
+#ifdef _WINDOWS
+	localtime_s(&time_info, &raw_time);
+#else
+	localtime_r(&raw_time, &time_info);
+#endif
+	strftime(time_stamp, 80, "[%m-%d-%Y %H:%M:%S]", &time_info);
 }
 
 /**

@@ -151,11 +151,11 @@ ProcLauncher::ProcRef ProcLauncher::Launch(Spec *&to_launch) {
 		saAttr.lpSecurityDescriptor = nullptr;
 		logOut = CreateFile(
 			it->logFile.c_str(),	//lpFileName
-			FILE_WRITE_DATA,		//dwDesiredAccess
+			FILE_APPEND_DATA,		//dwDesiredAccess
 			FILE_SHARE_READ,		//dwShareMode
 			&saAttr,				//lpSecurityAttributes
-			CREATE_ALWAYS,			//dwCreationDisposition
-			FILE_FLAG_NO_BUFFERING,	//dwFlagsAndAttributes
+			OPEN_ALWAYS,			//dwCreationDisposition
+			FILE_ATTRIBUTE_NORMAL,	//dwFlagsAndAttributes
 			nullptr );					//hTemplateFile
 
 		//configure the startup info to redirect output appropriately.
@@ -238,7 +238,11 @@ ProcLauncher::ProcRef ProcLauncher::Launch(Spec *&to_launch) {
 		//handle output redirection if requested.
 		if(it->logFile.length() > 0) {
 			//we will put their output directly into a file.
-			int outfd = creat(it->logFile.c_str(), S_IRUSR | S_IWUSR | S_IRGRP); // S_I + R/W/X + USR/GRP/OTH
+			int outfd = open(
+				it->logFile.c_str(),
+				O_WRONLY | O_CREAT | O_APPEND,
+				S_IRUSR | S_IWUSR | S_IRGRP
+			);
 			if(outfd == -1) {
 				fprintf(stderr, "Unable to open log file %s: %s.\n", it->logFile.c_str(), strerror(errno));
 				close(STDOUT_FILENO);

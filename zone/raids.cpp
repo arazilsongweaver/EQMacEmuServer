@@ -1708,7 +1708,7 @@ void Raid::SendHPPacketsFrom(Mob *m)
 		{
 			if(!m->IsClient() || ((members[x].member != m->CastToClient()) && (members[x].GroupNumber == gid)))
 			{
-				members[x].member->QueuePacket(&hpapp, true);
+				members[x].member->QueuePacket(&hpapp, false);
 			}
 		}
 	}

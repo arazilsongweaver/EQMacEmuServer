@@ -26,7 +26,7 @@ namespace EQ
 			ServertalkServer();
 			~ServertalkServer();
 
-			void Listen(const ServertalkServerOptions& opts);
+			int Listen(const ServertalkServerOptions& opts);
 			void OnConnectionIdentified(const std::string &type, std::function<void(std::shared_ptr<ServertalkServerConnection>)> cb);
 			void OnConnectionRemoved(const std::string &type, std::function<void(std::shared_ptr<ServertalkServerConnection>)> cb);
 

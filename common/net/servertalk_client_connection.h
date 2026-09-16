@@ -20,7 +20,7 @@ namespace EQ
 			void OnConnect(std::function<void(ServertalkClient*)> cb) { m_on_connect_cb = cb; }
 			void OnMessage(uint16_t opcode, std::function<void(uint16_t, EQ::Net::Packet&)> cb);
 			void OnMessage(std::function<void(uint16_t, EQ::Net::Packet&)> cb);
-			bool Connected() const { return m_connecting != true; }
+			bool Connected() const { return m_connection && m_connection->IsConnected(); }
 
 			std::shared_ptr<EQ::Net::TCPConnection> Handle() { return m_connection; }
 

@@ -1380,8 +1380,8 @@ uint16 Database::MoveCharacterToBind(uint32 CharID)
 	double heading = 0;
 	for (auto row = results.begin(); row != results.end(); ++row) {
 		zone_id = atoi(row[0]);
-		x = atof(row[2]);
-		y = atof(row[3]);
+		x = atof(row[1]);
+		y = atof(row[2]);
 		z = atof(row[3]);
 		heading = atof(row[4]);
 	}

@@ -24,22 +24,25 @@ class Group;
 class Mob;
 class NPC;
 class Object;
+class RDPStream;
 class Raid;
 class Seperator;
 class ServerPacket;
 struct ItemData;
+struct rdplib_connection_perf_stats_t;
 
 #include "../common/timer.h"
 #include "../common/ptimer.h"
 #include "../common/emu_opcodes.h"
 #include "../common/eq_packet_structs.h"
 #include "../common/emu_constants.h" // inv2 watch
-#include "../common/eq_stream_intf.h"
 #include "../common/eq_packet.h"
 #include "../common/linked_list.h"
 #include "../common/extprofile.h"
 #include "../common/races.h"
+#include "../common/rdp/rdp_packet_loss.h"
 #include "../common/seperator.h"
+#include "../common/servertalk.h"
 #include "../common/inventory_profile.h"
 #include "../common/guilds.h"
 #include "../common/item_data.h"
@@ -66,10 +69,10 @@ struct ItemData;
 #include <float.h>
 #include <set>
 #include <algorithm>
+#include <memory>
 
 
 #define CLIENT_TIMEOUT		90000
-#define CLIENT_LD_TIMEOUT	30000 // length of time client stays in zone after LDing
 #define TARGETING_RANGE		200	// range for /target
 #define ASSIST_RANGE		250 // range for /assist
 #define MAX_SPECIALIZED_SKILL 50
@@ -109,18 +112,65 @@ enum { //scribing argument to MemorizeSpell
 	memSpellSpellbar = 3
 };
 
-//Modes for the zoning state of the client.
+// Describes how a pending destination was selected.
 typedef enum {
-	ZoneToSafeCoords, // Always send ZonePlayerToBind_Struct to client: Succor/Evac
-	GMSummon,         // Always send ZonePlayerToBind_Struct to client: Only a GM Summon
-	ZoneToBindPoint,  // Always send ZonePlayerToBind_Struct to client: Death Only
-	ZoneSolicited,    // Always send ZonePlayerToBind_Struct to client: Portal, Translocate, Evac spells that have a x y z coord in the spell data
-	ZoneUnsolicited,
-	GateToBindPoint,  // Always send RequestClientZoneChange_Struct to client: Gate spell or Translocate To Bind Point spell
-	SummonPC,         // In-zone GMMove() always: Call of the Hero spell or some other type of in zone only summons
-	Rewind,           // Summon to /rewind location.
-	EvacToSafeCoords
+	ZoneToSafeCoords = 0,
+	GMSummon = 1,
+	ZoneSolicited = 3,
+	ZoneUnsolicited = 4,
+	GateToBindPoint = 5,
+	SummonPC = 6,
+	Rewind = 7
 } ZoneMode;
+
+enum class ZoneTransferPhase
+{
+	None,
+	AwaitingZoneStatusRequest,
+	AwaitingWorldResponse,
+	AwaitingDeleteSpawn
+};
+
+enum class ClientRemovalDisposition
+{
+	Offline,
+	ReturnToWorld,
+	ZoneTransfer
+};
+
+struct PendingZoneTransfer
+{
+	ZoneTransferPhase phase = ZoneTransferPhase::None;
+	ZoneMode mode = ZoneUnsolicited;
+	uint32 zone_id = 0;
+	glm::vec4 destination = glm::vec4(0.0f);
+	uint8 ignore_restrictions = 0;
+	uint32 transaction_id = 0;
+};
+
+struct PendingResurrection
+{
+	Timer expiration_timer;
+	int experience = 0;
+	uint32 corpse_db_id = 0;
+	Resurrect_Struct packet = {};
+};
+
+struct PendingSacrifice
+{
+	Timer expiration_timer;
+	uint16 caster_id = 0;
+	char caster[64] = {};
+};
+
+struct PendingTranslocate
+{
+	Timer expiration_timer;
+	uint16 spell_id = 0;
+	uint32 zone_id = 0;
+	char caster[64] = {};
+	glm::vec4 destination = glm::vec4(0.0f);
+};
 
 enum {
 	HideCorpseNone = 0,
@@ -160,7 +210,7 @@ public:
 	//pull in opcode mappings:
 	#include "client_packet.h"
 
-	Client(EQStreamInterface * ieqs);
+	Client(std::unique_ptr<RDPStream> stream);
 	~Client();
 
 	bool is_client_moving;
@@ -254,6 +304,7 @@ public:
 	virtual bool Process();
 	void QueuePacket(const EQApplicationPacket* app, bool ack_req = true, CLIENT_CONN_STATUS = CLIENT_CONNECTINGALL, eqFilterType filter=FilterNone);
 	void FastQueuePacket(EQApplicationPacket** app, bool ack_req = true, CLIENT_CONN_STATUS = CLIENT_CONNECTINGALL);
+	void FlushPositionUpdates();
 	void ChannelMessageReceived(uint8 chan_num, uint8 language, uint8 lang_skill, const char* orig_message, const char* targetname=nullptr);
 	void ChannelMessageSend(const char* from, const char* to, uint8 chan_num, uint8 language, uint8 lang_skill, const char* message, ...);
 	void Message(uint32 type, const char* message, ...);
@@ -266,6 +317,9 @@ public:
 	inline bool		GetHideMe()			const { return gmhideme; }
 	void			SetHideMe(bool hm);
 	inline uint16	GetPort()		const { return port; }
+	bool GetNetworkStatistics(rdplib_connection_perf_stats_t &statistics) const;
+	int SimulatePacketLoss(const RDPPacketLoss::Options &options);
+	bool GetSimulatedPacketLossOptions(RDPPacketLoss::Options *options) const;
 	bool			IsDead() const { return(dead); }
 	bool			IsUnconscious() const { return ((cur_hp <= 0 && cur_hp > -10 && !dead) ? true : false); }
 	inline bool		GetRunMode() const { return runmode; }
@@ -280,13 +334,18 @@ public:
 
 	inline bool ClientDataLoaded() const { return client_data_loaded; }
 	inline bool Connected() const { return (client_state == CLIENT_CONNECTED); }
-	inline bool InZone() const { return (client_state == CLIENT_CONNECTED || client_state == CLIENT_LINKDEAD); }
-	inline void Kick() { client_state = CLIENT_KICKED; }
-	inline void Disconnect() { eqs->Close(); client_state = DISCONNECTED; }
-	inline void HardDisconnect() { eqs->Close(); client_state = DISCONNECTED; }
-	inline void SetZoningState() { client_state = ZONING; }
-	inline void	PreDisconnect() { client_state = PREDISCONNECTED; }
-	inline void	Reconnect() { client_state = CLIENT_CONNECTED; }
+	inline bool HasWorldSession() const { return (client_state == CLIENT_CONNECTED || client_state == CLIENT_LINKDEAD); }
+	inline bool IsZoningOut() const
+	{
+		return m_pending_zone_transfer.phase == ZoneTransferPhase::AwaitingWorldResponse ||
+			m_pending_zone_transfer.phase == ZoneTransferPhase::AwaitingDeleteSpawn;
+	}
+	inline bool InZone() const { return HasWorldSession() && !IsZoningOut(); }
+	inline void Kick() { m_removal_disposition = ClientRemovalDisposition::Offline; client_state = CLIENT_KICKED; }
+	// Send the client its reply, then request a full disconnect.
+	void Logout();
+	// Request a full disconnect without sending an application packet.
+	void Disconnect();
 	inline bool IsLD() const { return (bool) (client_state == CLIENT_LINKDEAD); }
 	void Kick(const std::string& reason);
 	void WorldKick();
@@ -508,15 +567,14 @@ public:
 	void SetBindPoint(int to_zone = -1, const glm::vec3& location = glm::vec3());
 	void SetBindPoint2(int to_zone = -1, const glm::vec4& location = glm::vec4());
 	uint32 GetStartZone(void);
-	void MovePC(const char* zonename, float x, float y, float z, float heading, uint8 ignorerestrictions = 0, ZoneMode zm = ZoneSolicited);
 	void MovePC(uint32 zoneID, float x, float y, float z, float heading, uint8 ignorerestrictions = 0, ZoneMode zm = ZoneSolicited);
-	void MovePC(float x, float y, float z, float heading, uint8 ignorerestrictions = 0, ZoneMode zm = ZoneSolicited);
 	bool CheckLoreConflict(const EQ::ItemData* item);
 	void ChangeLastName(const char* in_lastname);
 	void SacrificeConfirm(Mob* caster);
 	void Sacrifice(Mob* caster);
 	void GoToDeath();
-	void SetZoning(bool in) { zoning = in; }
+	void SendZoneStatusResponse(uint32 zone_id, ZoningMessage result);
+	void HandleZoneTransferResponse(uint32 current_zone_id, uint32 requested_zone_id, uint32 transaction_id, int8 response);
 
 	FACTION_VALUE GetReverseFactionCon(Mob* iOther);
 	FACTION_VALUE GetFactionLevel(uint32 char_id, uint32 p_race, uint32 p_class, uint32 p_deity, int32 pFaction, Mob* tnpc, bool lua = false);
@@ -539,7 +597,7 @@ public:
 	inline uint32 CharacterID() const { return character_id; }
 	void UpdateAdmin(bool iFromDB = true);
 	void UpdateGroupID(uint32 group_id);
-	void UpdateWho(uint8 remove = 0);
+	void UpdateWho(WorldSessionStatus status = WorldSessionStatus::InZone);
 	bool GMHideMe(Client* client = 0);
 
 	inline bool IsInAGuild() const { return(guild_id != GUILD_NONE && guild_id != 0); }
@@ -580,8 +638,6 @@ public:
 	void DiscoverItem(uint32 itemid);
 
 	bool TGB() const { return tgb; }
-
-	void OnDisconnect(bool hard_disconnect);
 
 	uint16 GetSkillPoints() { return m_pp.points;}
 	void SetSkillPoints(int inp) { m_pp.points = inp;}
@@ -651,10 +707,6 @@ public:
 	/// this cures timing issues cuz dead animation isn't done but server side feigning is?
 	inline bool IsFeigned() const { return(feigned); }
 	uint32 GetFeignedTime() { return feigned_time; }
-	EQStreamInterface* Connection() { return eqs; }
-#ifdef PACKET_PROFILER
-	void DumpPacketProfile() { if(eqs) eqs->DumpPacketProfile(); }
-#endif
 	uint32 GetEquipment(uint8 material_slot) const; // returns item id
 	uint32 GetEquipmentColor(uint8 material_slot) const;
 	virtual void UpdateEquipmentLight() { m_Light.Type[EQ::lightsource::LightEquipment] = m_inv.FindBrightestLightType(); m_Light.Level[EQ::lightsource::LightEquipment] = EQ::lightsource::TypeToLevel(m_Light.Type[EQ::lightsource::LightEquipment]); }
@@ -823,11 +875,6 @@ public:
 	int GetNextAvailableSpellBookSlot(int starting_slot = 0);
 	inline uint32 GetSpellByBookSlot(int book_slot) { return m_pp.spell_book[book_slot]; }
 	inline bool HasSpellScribed(int spellid) { return (FindSpellBookSlotBySpellID(spellid) != -1 ? true : false); }
-	bool	PendingTranslocate;
-	time_t	TranslocateTime;
-	bool	PendingSacrifice;
-	uint16 sacrifice_caster_id;
-	PendingTranslocate_Struct PendingTranslocateData;
 	void	SendOPTranslocateConfirm(Mob *Caster, uint16 SpellID);
 
 	inline const EQ::versions::ClientVersion ClientVersion() const { return m_ClientVersion; }
@@ -865,8 +912,19 @@ public:
 	void SendTargetCommand(uint32 EntityID);
 	bool MoveItemToInventory(EQ::ItemInstance *BInst, bool UpdateClient = false);
 	std::list<RespawnOption> respawn_options;
-	void SetPendingRezzData(int XP, uint32 DBID, uint16 SpellID, const char *CorpseName, Resurrect_Struct *rps) { PendingRezzXP = XP; PendingRezzDBID = DBID; PendingRezzSpellID = SpellID; PendingRezzCorpseName = CorpseName; memcpy(&PendingRezzPacket, rps, sizeof(Resurrect_Struct)); }
-	bool IsRezzPending() { return PendingRezzSpellID > 0; }
+
+	void SetPendingResurrection(int experience, uint32 corpse_db_id, const Resurrect_Struct &packet);
+	bool IsResurrectionPending();
+	void ClearPendingResurrection();
+
+	void SetPendingSacrifice(uint16 caster_id, const char *caster);
+	bool IsSacrificePending();
+	void ClearPendingSacrifice();
+
+	void SetPendingTranslocate(uint16 spell_id, uint32 zone_id, const char *caster, const glm::vec4 &destination);
+	bool IsTranslocatePending();
+	void ClearPendingTranslocate();
+
 	bool IsDraggingCorpse(uint16 CorpseID);
 	inline bool IsDraggingCorpse() { return (DraggedCorpses.size() > 0); }
 	void DragCorpses();
@@ -988,7 +1046,6 @@ public:
 	int32 pet_interval[10];
 
 	bool camping;
-	bool camp_desktop;
 	void ClearGroupInvite();
 	void ClearTimersOnDeath();
 	void UpdateLFG(bool value = false, bool ignoresender = false);
@@ -1107,7 +1164,9 @@ private:
 
 	uint8 playeraction;
 
-	EQStreamInterface* eqs;
+	// RDPStream is destroyed first so rdplib stops borrowing the packet loss object before it is destroyed.
+	std::unique_ptr<RDPPacketLoss> m_packet_loss;
+	std::unique_ptr<RDPStream> m_stream;
 	EQApplicationPacket* zoneentry;
 
 	uint32				ip;
@@ -1155,10 +1214,6 @@ private:
 	bool				WithCustomer;
 
 	bool m_lock_save_position = false;
-public:
-	bool IsLockSavePosition() const;
-	void SetLockSavePosition(bool lock_save_position);
-private:
 	bool dev_tools_enabled;
 
 	PlayerProfile_Struct		m_pp;
@@ -1169,27 +1224,61 @@ private:
 	PetInfo						m_suspendedminion; // pet data for our suspended minion.
 
 	void SendLogoutPackets();
+	void SendLogoutReply();
+	void SendToStream(EQApplicationPacket **packet, bool reliable);
+	void CloseTradeskillObject();
+	void CloseTraderSession();
+	enum class RDPConnectionDisposition
+	{
+		Offline,
+		Camp,
+		ZoneTransfer,
+		Kick,
+		Linkdead,
+		ZoneShutdown
+	};
+	void LogRDPConnectionSummary(RDPConnectionDisposition disposition) const;
+	void CloseStream(RDPConnectionDisposition disposition);
+	void CloseStream(RDPConnectionDisposition disposition, uint32 linger_timeout_ms);
+	// An approved zone transfer preserves the world session while the source zone removes the client.
+	void DisconnectForZoneTransfer();
+	bool FinishRequestedRemoval();
+	void FinishDisconnect();
+	void FinishLogout();
+	void FinishRemoval();
 	bool AddPacket(const EQApplicationPacket *, bool);
 	bool AddPacket(EQApplicationPacket**, bool);
 	bool SendAllPackets();
 	std::deque<std::unique_ptr<CLIENTPACKET>> clientpackets;
 
 	//Zoning related stuff
-	void SendZoneCancel(ZoneChange_Struct *zc);
-	void SendZoneError(ZoneChange_Struct *zc, int32 err);
-	void DoZoneSuccess(ZoneChange_Struct *zc, uint16 zone_id, float dest_x, float dest_y, float dest_z, float dest_h, int8 ignore_r);
-	void ZonePC(uint32 zoneID, float x, float y, float z, float heading, uint8 ignorerestrictions, ZoneMode zm);
-	void ProcessMovePC(uint32 zoneID, float x, float y, float z, float heading, uint8 ignorerestrictions = 0, ZoneMode zm = ZoneSolicited);
+	void RequestZoneTransferApproval(ZoneMode mode, uint32 zone_id, const glm::vec4 &destination, uint8 ignore_restrictions);
+	bool CommitPendingZoneTransfer();
+	bool FinishPendingZoneTransfer();
+	void HandlePendingZoneTransferTimeout();
+	glm::vec4 ResolveClientTeleportDestination(uint32 zone_id, const glm::vec4 &requested) const;
+	void SendTeleportPacket(uint32 zone_id, const glm::vec4 &destination, uint32 reason = 1);
+	void SendPendingTranslocatePacket(bool complete);
 
-	glm::vec4 m_ZoneSummonLocation;
-	uint16 zonesummon_id;
-	uint8 zonesummon_ignorerestrictions;
-	ZoneMode zone_mode;
+	void SetPendingZoneTransfer(ZoneMode mode, uint32 zone_id, const glm::vec4 &destination, uint8 ignore_restrictions);
+	void ClearPendingZoneTransfer();
+
+	static constexpr uint32 ZoneTransferRequestTimeoutMs = 180000; // waiting for the client's OP_ZoneChange
+	static constexpr uint32 ZoneTransferApprovalTimeoutMs = 180000; // waiting for world
+	static constexpr uint32 ZoneTransferDepartureTimeoutMs = 180000; // waiting for OP_DeleteSpawn after the destination was saved
+	static constexpr uint32 DeadClientRemovalTimeoutMs = 25000;
+	static constexpr uint32 InitialConnectionTimeoutMs = 10000;
+	static constexpr uint32 PendingConfirmationTimeoutMs = 3610000; // client dialogs expire after one hour; allow a small grace period
+	PendingZoneTransfer m_pending_zone_transfer;
+	PendingResurrection m_pending_resurrection;
+	PendingSacrifice m_pending_sacrifice;
+	PendingTranslocate m_pending_translocate;
 
 	Timer position_timer;
 	uint8 position_timer_counter;
 
 	PTimerList p_timers; //persistent timers
+	Timer initial_connection_timer;
 	Timer get_auth_timer;
 	Timer camp_timer;
 	Timer process_timer;
@@ -1212,16 +1301,14 @@ private:
 	Timer afk_toggle_timer;
 	Timer helm_toggle_timer;
 	Timer trade_timer;
-	Timer door_check_timer;
 	Timer mend_reset_timer;
 
 	Timer disc_ability_timer;
 	Timer rest_timer;
-	Timer client_ld_timer;
 	Timer apperance_timer; //This gets set to 500 milliseconds when we receive an invis packet in, and allows us to also fade sneak if another action happens within the timer's window.
 	Timer underwater_timer;
 
-	Timer zoning_timer;
+	Timer pending_zone_transfer_timer;
 
     glm::vec3 m_Proximity;
 
@@ -1246,9 +1333,8 @@ private:
 	bool npcflag;
 	uint8 npclevel;
 	bool feigned;
-	bool zoning;
+	ClientRemovalDisposition m_removal_disposition;
 	bool tgb;
-	bool instalog;
 	int32 last_reported_mana;
 
 	unsigned int AggroCount; // How many mobs are aggro on us.
@@ -1292,11 +1378,6 @@ private:
 
 	uint8 HideCorpseMode;
 	bool PendingGuildInvitation;
-	int PendingRezzXP;
-	uint32 PendingRezzDBID;
-	uint16 PendingRezzSpellID; // Only used for resurrect while hovering.
-	std::string PendingRezzCorpseName; // Only used for resurrect while hovering.
-	Resurrect_Struct PendingRezzPacket;
 
 	std::list<std::pair<std::string, uint16> > DraggedCorpses;
 

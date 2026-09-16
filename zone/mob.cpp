@@ -299,6 +299,7 @@ Mob::Mob(const char* in_name,
 	spellbonuses.AssistRange = -1;
 	SetPetID(0);
 	SetOwnerID(0);
+	SetCorpseID(0);
 	typeofpet = petCharmed;		//default to charmed...
 	summonerid = 0;
 	summonedClientPet = false;
@@ -416,11 +417,13 @@ Mob::~Mob()
 		}
 	}
 
-	EQApplicationPacket app;
-	CreateDespawnPacket(&app, !IsCorpse());
-	Corpse* corpse = entity_list.GetCorpseByID(GetID());
-	if(!corpse || (corpse && !corpse->IsPlayerCorpse()))
+	const uint16 entity_id = GetID();
+	if (entity_id != 0 && Spawned())
+	{
+		EQApplicationPacket app;
+		CreateDespawnPacket(&app, !IsCorpse());
 		entity_list.QueueClients(this, &app, true);
+	}
 
 	entity_list.RemoveFromTargets(this);
 	entity_list.RemoveFromDuelTargets(this);
@@ -1060,21 +1063,22 @@ void Mob::CreateDespawnPacket(EQApplicationPacket* app, bool Decay)
 void Mob::CreateHPPacket(EQApplicationPacket* app)
 {
 	this->IsFullHP=(cur_hp>=max_hp);
-	app->SetOpcode(OP_MobHealth);
-	app->size = sizeof(SpawnHPUpdate_Struct2);
+	app->SetOpcode(OP_HPUpdate);
+	app->size = sizeof(SpawnHPUpdate_Struct);
 	safe_delete_array(app->pBuffer);
 	app->pBuffer = new uchar[app->size];
 	memset(app->pBuffer, 0, app->size);
-	SpawnHPUpdate_Struct2* ds = (SpawnHPUpdate_Struct2*)app->pBuffer;
+	SpawnHPUpdate_Struct* ds = (SpawnHPUpdate_Struct*)app->pBuffer;
 
 	ds->spawn_id = GetID();
 	// they don't need to know the real hp
-	ds->hp = (int)GetHPRatio();
+	ds->cur_hp = (int)GetHPRatio();
+	ds->max_hp = 100;
 
 	// hp event
 	if (IsNPC() && (GetNextHPEvent() > 0))
 	{
-		if (ds->hp < GetNextHPEvent())
+		if (ds->cur_hp < GetNextHPEvent())
 		{
 			std::string export_string = fmt::format("{}", GetNextHPEvent());
 			SetNextHPEvent(-1);
@@ -1084,7 +1088,7 @@ void Mob::CreateHPPacket(EQApplicationPacket* app)
 
 	if (IsNPC() && (GetNextIncHPEvent() > 0))
 	{
-		if (ds->hp > GetNextIncHPEvent())
+		if (ds->cur_hp > GetNextIncHPEvent())
 		{
 			std::string export_string = fmt::format("{}", GetNextIncHPEvent());
 			SetNextIncHPEvent(-1);
@@ -1099,7 +1103,7 @@ void Mob::SendHPUpdate(bool skipnpc, bool sendtoself)
 	if (IsNPC() && skipnpc && RuleB(AlKabor, NPCsSendHPUpdatesPerTic))
 		return;
 
-	if (IsClient() && !CastToClient()->Connected())
+	if (IsClient() && !CastToClient()->InZone())
 		return;
 
 	if(IsClient())
@@ -1112,7 +1116,7 @@ void Mob::SendHPUpdate(bool skipnpc, bool sendtoself)
 	CreateHPPacket(&hp_app);
 
 	// send to people who have us targeted
-	entity_list.QueueClientsByTarget(this, &hp_app, false, 0, true, true, EQ::versions::bit_AllClients);
+	entity_list.QueueClientsByTarget(this, &hp_app, false, 0, false, true, EQ::versions::bit_AllClients);
 
 	// send to group
 	if(IsGrouped())
@@ -1144,18 +1148,18 @@ void Mob::SendHPUpdate(bool skipnpc, bool sendtoself)
 	// send to pet
 	if(GetPet() && GetPet()->IsClient())
 	{
-		GetPet()->CastToClient()->QueuePacket(&hp_app, true);
+		GetPet()->CastToClient()->QueuePacket(&hp_app, false);
 	}
 
 	// send to self - we need the actual hps here
-	if(IsClient() && sendtoself)
+	if(IsClient() && sendtoself && CastToClient()->Connected())
 	{
 		auto hp_app2 = new EQApplicationPacket(OP_HPUpdate, sizeof(SpawnHPUpdate_Struct));
 		SpawnHPUpdate_Struct* ds = (SpawnHPUpdate_Struct*)hp_app2->pBuffer;
-		ds->cur_hp = CastToClient()->GetHP() - itembonuses.HP;
+		ds->cur_hp = CastToClient()->GetHP() - itembonuses.HP; // client adds item HP on its own
 		ds->spawn_id = GetID();
-		ds->max_hp = CastToClient()->GetMaxHP() - itembonuses.HP;
-		CastToClient()->QueuePacket(hp_app2, true, Client::CLIENT_CONNECTED);
+		ds->max_hp = CastToClient()->GetMaxHP(); // client ignores this field for its self hp but the AK server sent the total max, including item HP
+		CastToClient()->QueuePacket(hp_app2, false, Client::CLIENT_CONNECTED);
 		safe_delete(hp_app2);
 	}
 }
@@ -1200,7 +1204,7 @@ void Mob::SendRealPosition()
 		SpawnPositionUpdates_Struct *spu = (SpawnPositionUpdates_Struct *)app->pBuffer;
 		spu->num_updates = 1; // hack - only one spawn position per update
 		MakeSpawnUpdateNoDelta(&spu->spawn_update);
-		entity_list.QueueClientsPosUpdate(this, app, true);
+		entity_list.QueueClientsPosUpdate(this, app, true, false);
 		safe_delete(app);
 	}
 }
@@ -1233,7 +1237,7 @@ void Mob::SendPosUpdate(uint8 iSendToSelf)
 		if (IsClient())
 		{
 			if (CastToClient()->gmhideme)
-				entity_list.QueueClientsStatus(this, app, (iSendToSelf == 0), CastToClient()->Admin(), 255);
+				entity_list.QueueClientsStatus(this, app, (iSendToSelf == 0), CastToClient()->Admin(), 255, false);
 			else
 				entity_list.QueueCloseClientsPrecalc(this, app, nullptr, (iSendToSelf == 0), nullptr, false);
 		}
@@ -2173,7 +2177,7 @@ bool Mob::HateSummon(Mob* summoned) {
 			if (newz != BEST_Z_INVALID && !in_liquid)
 				dest.z = newz;
 			if (target->IsClient()) {
-				target->CastToClient()->MovePC(zone->GetZoneID(), dest.x, dest.y, dest.z, target->GetHeading(), 0, SummonPC);
+				target->CastToClient()->MovePC(zone->GetZoneID(), dest.x, dest.y, dest.z, target->GetHeading() * 2.0f, 0, SummonPC);
 			}
 			else {
 				target->GMMove(dest.x, dest.y, dest.z, target->GetHeading());
@@ -3290,28 +3294,29 @@ bool Mob::DoKnockback(Mob *caster, float pushback, float pushup, bool send_packe
 
 	// this should not be sent if the client is being tossed from a spell OP_Action already but is useful for gfluxed NPCs and #push
 	// NPCs will need to move or send another position update or they look like they keep falling from sky after a fling like this
+	float heading = caster->GetHeading() / 128.0f * glm::pi<float>();
+	float dx = sinf(heading) * pushback;
+	float dy = cosf(heading) * pushback;
+	float dz = pushup;
+
 	if (send_packet)
 	{
 		auto app = new EQApplicationPacket(OP_MobUpdate, sizeof(SpawnPositionUpdates_Struct));
 		SpawnPositionUpdates_Struct *spu = (SpawnPositionUpdates_Struct *)app->pBuffer;
 		spu->num_updates = 1;
 		MakeSpawnUpdate(&spu->spawn_update);
-		float heading = caster->GetHeading() / 128.0f * glm::pi<float>();
-		float dx = sinf(heading) * std::min(std::max(pushback, -32.0f), 32.0f);
-		float dy = cosf(heading) * std::min(std::max(pushback, -32.0f), 32.0f);
-		// the limit for this is -64 to 63.  a negative Z delta around -10 to -15 can kill the client for 20k falling damage
-		float dz = std::min(std::max(pushup, -64.0f), 63.0f);
-		//Message(MT_Broadcasts, "dx %0.2f dy %0.2f dz %0.2f", dx, dy, dz);
 		spu->spawn_update.delta_yzx.SetValue(dx, dy, dz);
-		entity_list.QueueCloseClients(this, app, false, 350, nullptr, true, FilterPCSpells);
+		dx = spu->spawn_update.delta_yzx.GetX();
+		dy = spu->spawn_update.delta_yzx.GetY();
+		dz = spu->spawn_update.delta_yzx.GetZ();
+		entity_list.QueueCloseClients(this, app, false, 350, nullptr, false, FilterPCSpells);
 		safe_delete(app);
 	}
 
-	glm::vec3 newloc(GetX(), GetY(), GetZ() + pushup);
+	glm::vec3 newloc(GetX() + dx, GetY() + dy, GetZ() + dz);
 	float newz = GetZ();
 
-	GetPushHeadingMod(caster, pushback, newloc.x, newloc.y);
-	if (pushup == 0 && zone->zonemap)
+	if (dz == 0.0f && zone->zonemap)
 	{
 		newz = zone->zonemap->FindBestZ(newloc, nullptr);
 		if (newz != BEST_Z_INVALID)

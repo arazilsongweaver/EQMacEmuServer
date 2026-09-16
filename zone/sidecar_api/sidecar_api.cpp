@@ -33,7 +33,6 @@ void SidecarApi::BootWebserver(int port, const std::string &key)
 
 	std::signal(SIGINT, CatchSidecarSignal);
 	std::signal(SIGTERM, CatchSidecarSignal);
-	std::signal(SIGKILL, CatchSidecarSignal);
 
 	if (!key.empty()) {
 		authorization_key = key;

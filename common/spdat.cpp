@@ -910,6 +910,13 @@ bool IsTeleportSpell(uint16 spell_id)
 	return false;
 }
 
+bool IsTranslocateToBindSpell(uint16 spell_id)
+{
+	return spell_id == SPELL_TRANSLOCATE_GROUP ||
+		spell_id == SPELL_TRANSLOCATE ||
+		spell_id == SPELL_TELEPORT;
+}
+
 bool IsGateSpell(uint16 spell_id)
 {
 	if (IsEffectInSpell(spell_id, SE_Gate))

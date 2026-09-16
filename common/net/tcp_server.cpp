@@ -14,20 +14,19 @@ EQ::Net::TCPServer::~TCPServer() {
 	Close();
 }
 
-void EQ::Net::TCPServer::Listen(int port, bool ipv6, std::function<void(std::shared_ptr<TCPConnection>)> cb)
+int EQ::Net::TCPServer::Listen(int port, bool ipv6, std::function<void(std::shared_ptr<TCPConnection>)> cb)
 {
 	if (ipv6) {
-		Listen("::", port, ipv6, cb);
+		return Listen("::", port, ipv6, cb);
 	}
-	else {
-		Listen("0.0.0.0", port, ipv6, cb);
-	}
+
+	return Listen("0.0.0.0", port, ipv6, cb);
 }
 
-void EQ::Net::TCPServer::Listen(const std::string &addr, int port, bool ipv6, std::function<void(std::shared_ptr<TCPConnection>)> cb)
+int EQ::Net::TCPServer::Listen(const std::string &addr, int port, bool ipv6, std::function<void(std::shared_ptr<TCPConnection>)> cb)
 {
 	if (m_socket) {
-		return;
+		return 0;
 	}
 
 	m_on_new_connection = cb;
@@ -35,20 +34,35 @@ void EQ::Net::TCPServer::Listen(const std::string &addr, int port, bool ipv6, st
 	auto loop = EQ::EventLoop::Get().Handle();
 	m_socket = new uv_tcp_t;
 	memset(m_socket, 0, sizeof(uv_tcp_t));
-	uv_tcp_init(loop, m_socket);
+	int result = uv_tcp_init(loop, m_socket);
+	if (result != 0) {
+		delete m_socket;
+		m_socket = nullptr;
+		return result;
+	}
 
-	sockaddr_storage iaddr;
+	sockaddr_storage iaddr{};
 	if (ipv6) {
-		uv_ip6_addr(addr.c_str(), port, (sockaddr_in6*)&iaddr);
+		result = uv_ip6_addr(addr.c_str(), port, (sockaddr_in6*)&iaddr);
 	}
 	else {
-		uv_ip4_addr(addr.c_str(), port, (sockaddr_in*)&iaddr);
+		result = uv_ip4_addr(addr.c_str(), port, (sockaddr_in*)&iaddr);
 	}
 
-	uv_tcp_bind(m_socket, (sockaddr*)&iaddr, 0);
+	if (result != 0) {
+		Close();
+		return result;
+	}
+
+	result = uv_tcp_bind(m_socket, (sockaddr*)&iaddr, 0);
+	if (result != 0) {
+		Close();
+		return result;
+	}
+
 	m_socket->data = this;
 
-	uv_listen((uv_stream_t*)m_socket, 128, [](uv_stream_t* server, int status) {
+	result = uv_listen((uv_stream_t*)m_socket, 128, [](uv_stream_t* server, int status) {
 		if (status < 0) {
 			return;
 		}
@@ -66,6 +80,12 @@ void EQ::Net::TCPServer::Listen(const std::string &addr, int port, bool ipv6, st
 		EQ::Net::TCPServer *s = (EQ::Net::TCPServer*)server->data;
 		s->AddClient(client);
 	});
+	if (result != 0) {
+		Close();
+		return result;
+	}
+
+	return 0;
 }
 
 void EQ::Net::TCPServer::Close()

@@ -152,6 +152,14 @@ void EQEmuApiWorldDataService::reload(Json::Value& r, const std::vector<std::str
 		return;
 	}
 
+	if (
+		command == std::to_string(ServerReload::Type::Opcodes) ||
+		Strings::EqualFold(command, "opcodes")
+	) {
+		message(r, "Opcode reloading is not implemented");
+		return;
+	}
+
 	ServerPacket* pack = nullptr;
 
 	bool found_command = false;

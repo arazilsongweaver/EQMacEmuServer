@@ -353,7 +353,7 @@ void Group::SendHPPacketsFrom(Mob *member)
 	for(i = 0; i < MAX_GROUP_MEMBERS; i++) {
 		if(members[i] && members[i] != member && members[i]->IsClient())
 		{
-			members[i]->CastToClient()->QueuePacket(&hp_app);
+			members[i]->CastToClient()->QueuePacket(&hp_app, false);
 		}
 	}
 }

@@ -391,7 +391,7 @@ bool Mob::SpellEffect(Mob* caster, uint16 spell_id, int buffslot, int caster_lev
 					bool expect_zone_reload = zoneid != GetZoneID();
 
 					// This will only prevent the server side zone. Our client will often initiate the zoning process
-					// as an unsoliciated request after the spell is cast. The server will then cancel that using SendZoneCancel().
+					// as an unsoliciated request after the spell is cast. The server will reject that status query.
 					if (!CastToClient()->CanBeInZone(zoneid))
 					{
 						break;
@@ -422,11 +422,12 @@ bool Mob::SpellEffect(Mob* caster, uint16 spell_id, int buffslot, int caster_lev
 					{
 						// arm for zoning, but let the client take the next step - it may not end up zoning, there is a client side random element to this
 						zone->ApplyRandomLoc(zoneid, x, y);
-						CastToClient()->zone_mode = ZoneSolicited;
-						CastToClient()->m_ZoneSummonLocation = glm::vec4(x, y, z, heading);
-						CastToClient()->zonesummon_id = zoneid;
-						CastToClient()->zonesummon_ignorerestrictions = 0;
-						CastToClient()->zoning_timer.Start();
+						CastToClient()->SetPendingZoneTransfer(
+							ZoneSolicited,
+							zoneid,
+							glm::vec4(x, y, z, heading),
+							0
+						);
 					}
 					else
 					{
@@ -1792,7 +1793,7 @@ bool Mob::SpellEffect(Mob* caster, uint16 spell_id, int buffslot, int caster_lev
 						entity_list.AddHealAggro(this, caster, CheckHealAggroAmount(spell_id, this, (GetMaxHP() - GetHP())));
 					}
 
-					CastToClient()->MovePC(zone->GetZoneID(), caster->GetX(), caster->GetY(), caster->GetZ(), caster->GetHeading(), 2, SummonPC);
+					CastToClient()->MovePC(zone->GetZoneID(), caster->GetX(), caster->GetY(), caster->GetZ(), caster->GetHeading() * 2.0f, 2, SummonPC);
 				}
 				else
 					caster->Message(Chat::Red, "This spell can only be cast on players.");
@@ -2708,14 +2709,19 @@ void Mob::ApplyPeriodicHPEffects()
 				if (died)
 				{
 					// it's Eagle Strike in the client when dying from a DoT
-					Death(firstDoTCaster, hp_mod, SPELL_UNKNOWN, EQ::skills::SkillEagleStrike, 0, true);
+					const bool death_completed = Death(firstDoTCaster, hp_mod, SPELL_UNKNOWN, EQ::skills::SkillEagleStrike, 0, true);
 
-					/* After this point, "this" is still a valid object, but its entityID is 0.*/
-					if (firstDoTCaster && firstDoTCaster->IsNPC())
+					// A completed Death leaves "this" valid, but its entityID is 0.
+					if (death_completed)
 					{
-						uint32 emoteid = firstDoTCaster->GetEmoteID();
-						if (emoteid != 0)
-							firstDoTCaster->CastToNPC()->DoNPCEmote(EQ::constants::EmoteEventTypes::Killed, emoteid, this);
+						if (firstDoTCaster && firstDoTCaster->IsNPC())
+						{
+							uint32 emoteid = firstDoTCaster->GetEmoteID();
+							if (emoteid != 0)
+								firstDoTCaster->CastToNPC()->DoNPCEmote(EQ::constants::EmoteEventTypes::Killed, emoteid, this);
+						}
+
+						return;
 					}
 				}
 			}
@@ -3431,6 +3437,8 @@ void Mob::BuffFadeBySlot(int slot, bool iRecalcBonuses, bool message, bool updat
 						bool is_charmed = FindType(SE_Charm);
 						if (is_charmed) {
 							charmed = true;
+						}
+						if (CastToClient()->IsLD() || is_charmed) {
 							CastToClient()->AI_Start();
 						}
 					}

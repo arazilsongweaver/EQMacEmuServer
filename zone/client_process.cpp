@@ -40,6 +40,7 @@
 #include "../common/spdat.h"
 #include "../common/strings.h"
 #include "../common/zone_store.h"
+#include "../common/rdp/rdp_stream.h"
 #include "event_codes.h"
 #include "guild_mgr.h"
 #include "map.h"
@@ -61,23 +62,27 @@ extern EntityList entity_list;
 bool Client::Process() {
 	bool ret = true;
 
-	if (linkdead_timer.Check())
+	if (conn_state == NoPacketsReceived && initial_connection_timer.Check(false))
 	{
-		if (ClientDataLoaded())
-		{
-			Raid *myraid = entity_list.GetRaidByClient(this);
-			if (myraid)
-			{
-				myraid->DisbandRaidMember(GetName());
-			}
-			if (IsGrouped())
-				LeaveGroup();
-			Save();
-		}
-		return false; //delete client
+		LogInfo("Client timed out before sending an initial zone entry packet");
+		Kick();
 	}
 
-	if(ClientDataLoaded() && (Connected() || IsLD()))
+	if (client_state == CLIENT_LINKDEAD && linkdead_timer.Check())
+		Disconnect();
+
+	if (FinishRequestedRemoval())
+		return false;
+
+	// The transfer timer must continue while normal gameplay is stopped.
+	if (ClientDataLoaded() && HasWorldSession() && pending_zone_transfer_timer.Check())
+	{
+		HandlePendingZoneTransferTimeout();
+		if (FinishRequestedRemoval())
+			return false;
+	}
+
+	if (ClientDataLoaded() && InZone())
 	{
 		// try to send all packets that weren't sent before
 		if(!IsLD() && zoneinpacket_timer.Check())
@@ -85,11 +90,21 @@ bool Client::Process() {
 			SendAllPackets();
 		}
 
-		if(dead)
+		if (dead)
 		{
 			SetHP(-100);
-		}
 
+			if (dead_timer.Check())
+			{
+				Disconnect();
+				if (FinishRequestedRemoval())
+					return false;
+			}
+		}
+	}
+
+	if (ClientDataLoaded() && InZone() && !dead)
+	{
 		if (IsSitting())
 		{
 			if (!rested)
@@ -122,60 +137,12 @@ bool Client::Process() {
 		if(mana_timer.Check())
 			SendManaUpdatePacket();
 
-		if(dead && dead_timer.Check()) 
-		{
-			m_pp.zone_id = m_pp.binds[0].zoneId;
-			database.MoveCharacterToZone(GetName(), m_pp.zone_id);
-
-			glm::vec4 bindpts(m_pp.binds[0].x, m_pp.binds[0].y, m_pp.binds[0].z, m_pp.binds[0].heading);
-			m_Position = bindpts;
-			Save();
-
-			Group *mygroup = GetGroup();
-			if (mygroup)
-			{
-				entity_list.MessageGroup(this,true,15,"%s died.", GetName());
-				mygroup->MemberZoned(this);
-			}
-			Raid *myraid = entity_list.GetRaidByClient(this);
-			if (myraid)
-			{
-				myraid->MemberZoned(this);
-			}
-			return(false);
-		}
-
-		if (zoning_timer.Check())
-		{
-			zone_mode = ZoneUnsolicited;
-			zoning_timer.Disable();
-		}
-
 		if (camp_timer.Check())
 		{
 			// If a player starts to camp and then cancels it by typing /camp the server gets no packet telling us to set camping to false.
 			// So, we let the timer continue to tick and set it false when it is checked. 
 			camp_timer.Disable();
 			camping = false;
-			camp_desktop = false;
-		}
-
-		if (client_ld_timer.Check())
-		{
-			if (IsGrouped())
-				LeaveGroup();
-
-			Raid *myraid = entity_list.GetRaidByClient(this);
-			if (myraid)
-			{
-				myraid->DisbandRaidMember(GetName());
-			}
-
-			RecordPlayerEventLog(PlayerEvent::WENT_OFFLINE, PlayerEvent::EmptyEvent{});
-
-			Save();
-			instalog = true;
-			database.ClearAccountActive(this->AccountID());
 		}
 
 		if (IsStunned() && stunned_timer.Check()) {
@@ -425,28 +392,6 @@ bool Client::Process() {
 			}
 		}
 
-		if (position_timer.Check()) {
-			if (IsAIControlled())
-			{
-				if (!IsMoving())
-				{
-					animation = 0;
-					m_Delta = glm::vec4(0.0f, 0.0f, 0.0f, m_Delta.w);
-					SendPosUpdate(2);
-				}
-			}
-
-			// Send a position packet every 9 seconds - if not done, other clients
-			// see this char disappear after 10-12 seconds of inactivity
-			if (position_timer_counter >= 36) { // Approx. 4 ticks per second
-				entity_list.SendPositionUpdates(this);
-				position_timer_counter = 0;
-			}
-			else {
-				position_timer_counter++;
-			}
-		}
-
 		if (GetClass() == Class::Warrior && GetShieldTarget())
 		{
 			if (GetShieldTarget()->IsCorpse() || GetShieldTarget()->GetHP() < 1 || GetShieldTarget()->CastToClient()->IsDead()
@@ -515,12 +460,6 @@ bool Client::Process() {
 			apperance_timer.Disable();
 		}
 
-		// Right now, only veeshan has floor teleports. If more are discovered, create a method to determine which zones need the timer.
-		if (GetZoneID() == Zones::VEESHAN && !door_check_timer.Enabled())
-		{
-			door_check_timer.Start();
-		}
-
 		if (mend_reset_timer.Check())
 		{
 			ResetSkill(EQ::skills::SkillMend);
@@ -528,24 +467,37 @@ bool Client::Process() {
 		}
 	}
 
-	if (client_state == CLIENT_KICKED) {
-		Save();
-		OnDisconnect(true);
-		LogInfo("Client disconnected (cs=k): [{}]", GetName());
-		return false;
+	// Keep the source spawn visible while the client waits for world or finishes zoning.
+	// AI movement remains part of normal gameplay and stops while zoning out.
+	if (ClientDataLoaded() && HasWorldSession() && !dead && position_timer.Check())
+	{
+		if (InZone() && IsAIControlled() && !IsMoving())
+		{
+			animation = 0;
+			m_Delta = glm::vec4(0.0f, 0.0f, 0.0f, m_Delta.w);
+			SendPosUpdate(2);
+		}
+
+		// Send a position packet every 9 seconds - if not done, other clients
+		// see this char disappear after 10-12 seconds of inactivity
+		if (position_timer_counter >= 36) // Approx. 4 ticks per second
+		{
+			entity_list.SendPositionUpdates(this);
+			position_timer_counter = 0;
+		}
+		else
+		{
+			position_timer_counter++;
+		}
 	}
 
-	if (client_state == DISCONNECTED) {
-		OnDisconnect(true);
-		LogInfo("Client disconnected (cs=d): [{}]", GetName());
-		RecordPlayerEventLog(PlayerEvent::POSSIBLE_HACK, PlayerEvent::PossibleHackEvent{ .message = "/MQInstantCamp: Possible instant camp disconnect" });
+	if (FinishRequestedRemoval())
 		return false;
-	}
 
 	if (client_state == CLIENT_WAITING_FOR_AUTH || client_state == CLIENT_AUTH_RECEIVED) {
 		if (get_auth_timer.Check()) {
 			LogInfo("GetAuth() timed out waiting, kicking client");
-			client_state = CLIENT_KICKED;
+			Kick();
 			return true;
 		}
 		if (zone->CheckAuth(GetName())) {
@@ -559,10 +511,11 @@ bool Client::Process() {
 				zoneentry = nullptr;
 			}
 			else {
-				client_state = CLIENT_KICKED;
+				Kick();
 				return true;
 			}
-			client_state = CLIENT_CONNECTING;
+			if (client_state != CLIENT_KICKED && client_state != DISCONNECTED)
+				client_state = CLIENT_CONNECTING;
 		}
 		else {
 			return true;
@@ -571,100 +524,143 @@ bool Client::Process() {
 
 	/************ Get all packets from packet manager out queue and process them ************/
 	EQApplicationPacket *app = nullptr;
+	bool transport_ended = false;
 
-	//Predisconnecting is a state where we expect a zone change packet, and the next packet HAS to be a zone change packet once you request to zone. Otherwise, bad things happen!
-	if(!eqs->CheckState(CLOSING) && client_state != PREDISCONNECTED && client_state != ZONING)
+	if(m_stream != nullptr && client_state != CLIENT_KICKED && client_state != DISCONNECTED)
 	{
-		while(ret && (app = (EQApplicationPacket *)eqs->PopPacket())) {
-			if(app)
+		while(ret && m_stream != nullptr)
+		{
+			RDPStream::ReceiveResult receive_result = m_stream->Receive(&app);
+			if (receive_result == RDPStream::NoData)
+				break;
+
+			if (receive_result == RDPStream::PacketReceived)
+			{
 				ret = HandlePacket(app);
-			safe_delete(app);
+				safe_delete(app);
+				if (client_state == CLIENT_KICKED || client_state == DISCONNECTED)
+					break;
+				continue;
+			}
+
+			transport_ended = true;
+			break;
 		}
 	}
+
+	if (transport_ended)
+	{
+		CloseStream(
+			m_pending_zone_transfer.phase == ZoneTransferPhase::AwaitingDeleteSpawn
+				? RDPConnectionDisposition::ZoneTransfer
+				: RDPConnectionDisposition::Linkdead
+		);
+		if (FinishPendingZoneTransfer() && FinishRequestedRemoval())
+			return false;
+	}
+
+	if (FinishRequestedRemoval())
+		return false;
 
 	//At this point, we are still connected, everything important has taken
 	//place, now check to see if anybody wants to aggro us.
 	// only if client is not feigned
-	if(ClientDataLoaded() && ret && m_client_npc_aggro_scan_timer.Check()) {
+	if (ClientDataLoaded() && InZone() && !dead && ret && !transport_ended && m_client_npc_aggro_scan_timer.Check())
+	{
 		entity_list.CheckClientAggro(this);
 	}
 
-	if (client_state != CLIENT_LINKDEAD && (client_state == PREDISCONNECTED || client_state == CLIENT_ERROR || client_state == DISCONNECTED || client_state == CLIENT_KICKED || !eqs->CheckState(ESTABLISHED)))
-	{
-		//client logged out or errored out
-		//ResetTrade();
-		if (client_state != CLIENT_KICKED) {
-			Save();
-		}
-
-		client_state = CLIENT_LINKDEAD;
-		if (zoning || instalog || GetGM())
-		{
-			Group *mygroup = GetGroup();
-			if (mygroup)
-			{
-				if (!zoning)
-				{
-					entity_list.MessageGroup(this,true,Chat::Yellow,"%s logged out.",GetName());
-					mygroup->DelMember(this);
-				}
-				else
-				{
-					mygroup->MemberZoned(this);
-				}
-
-			}
-			Raid *myraid = entity_list.GetRaidByClient(this);
-			if (myraid)
-			{
-				if (!zoning)
-				{
-					myraid->DisbandRaidMember(GetName());
-				}
-				else
-				{
-					myraid->MemberZoned(this);
-				}
-			}
-			OnDisconnect(false);
-			return false;
-		}
-		else
-		{
-			if (camping && camp_timer.Enabled() && camp_timer.GetRemainingTime() < 10000) {
-				auto outapp = new EQApplicationPacket(OP_LogoutReply, 2);
-				FastQueuePacket(&outapp);
-				OnDisconnect(true);
-			}
-			else {
-				LinkDead();
-			}
-		}
-	}
+	if (client_state != CLIENT_LINKDEAD && transport_ended && !IsZoningOut())
+		LinkDead();
 
 	return ret;
 }
 
-/* Just a set of actions preformed all over in Client::Process */
-void Client::OnDisconnect(bool hard_disconnect) {
+bool Client::FinishRequestedRemoval()
+{
+	bool kicked = client_state == CLIENT_KICKED;
+	if (!kicked && client_state != DISCONNECTED)
+		return false;
+
+	FinishDisconnect();
+
+	LogInfo(
+		"Client disconnected (cs={}, disposition={}): [{}]",
+		kicked ? "k" : "d",
+		static_cast<int>(m_removal_disposition),
+		GetName()
+	);
+
+	return true;
+}
+
+void Client::FinishLogout()
+{
 	database.CharacterQuit(this->CharacterID());
-	if(hard_disconnect)
-	{
+
+	// A player may already have been detached locally for death or zoning. Leave the database membership for the world backstop in that case.
+	if (GetGroup())
 		LeaveGroup();
 
-		Raid *MyRaid = entity_list.GetRaidByClient(this);
+	Raid *raid = entity_list.GetRaidByClient(this);
+	if (raid)
+		raid->DisbandRaidMember(GetName());
 
-		if (MyRaid)
-			MyRaid->DisbandRaidMember(GetName());
+	parse->EventPlayer(EVENT_DISCONNECT, this, "", 0);
+	RecordPlayerEventLog(PlayerEvent::WENT_OFFLINE, PlayerEvent::EmptyEvent{});
+}
 
-		parse->EventPlayer(EVENT_DISCONNECT, this, "", 0);
-		RecordPlayerEventLog(PlayerEvent::WENT_OFFLINE, PlayerEvent::EmptyEvent{});
+void Client::FinishDisconnect()
+{
+	bool kicked = client_state == CLIENT_KICKED;
+	client_state = DISCONNECTED;
+
+	if (ClientDataLoaded())
+		Save();
+
+	WorldSessionStatus world_status = WorldSessionStatus::Offline;
+	if (m_removal_disposition == ClientRemovalDisposition::ZoneTransfer)
+	{
+		world_status = WorldSessionStatus::Zoning;
+
+		Group *group = GetGroup();
+		if (group)
+			group->MemberZoned(this);
+
+		Raid *raid = entity_list.GetRaidByClient(this);
+		if (raid)
+			raid->MemberZoned(this);
+
+		database.CharacterQuit(this->CharacterID());
 	}
+	else
+	{
+		FinishLogout();
+		if (m_removal_disposition == ClientRemovalDisposition::ReturnToWorld)
+			world_status = WorldSessionStatus::Online;
+	}
+
+	FinishRemoval();
+	UpdateWho(world_status);
+
+	RDPConnectionDisposition disposition = RDPConnectionDisposition::Offline;
+	if (kicked)
+		disposition = RDPConnectionDisposition::Kick;
+	else if (m_removal_disposition == ClientRemovalDisposition::ReturnToWorld)
+		disposition = RDPConnectionDisposition::Camp;
+	else if (m_removal_disposition == ClientRemovalDisposition::ZoneTransfer)
+		disposition = RDPConnectionDisposition::ZoneTransfer;
+	CloseStream(disposition);
+}
+
+void Client::FinishRemoval()
+{
+	CloseTraderSession();
 
 	Mob *Other = trade->With();
 	if(Other)
 	{
-		LogTradingDetail("Client disconnected during a trade. Returning their items."); 
+		LogTradingDetail("Client disconnected during a trade. Returning their items.");
 		FinishTrade(this);
 
 		if(Other->IsClient())
@@ -679,25 +675,6 @@ void Client::OnDisconnect(bool hard_disconnect) {
 
 	/* Remove ourself from all proximities */
 	ClearAllProximities();
-
-	//Prevent GMs from being kicked all the way when camping.
-	if(GetGM())
-	{
-		auto outapp = new EQApplicationPacket(OP_LogoutReply, 2);
-		FastQueuePacket(&outapp);
-		
-		Disconnect();
-	}
-	else
-	{
-		if (camp_desktop) {
-			HardDisconnect();
-		}
-		else {
-			Disconnect();
-		}
-	}
-
 }
 
 // Sends the client complete inventory used in character login
@@ -1124,29 +1101,35 @@ void Client::MerchantWelcome(int merchant_id, int npcid)
 
 void Client::OPRezzAnswer(const EQApplicationPacket *app)
 {
-	if(PendingRezzXP < 0) {
-		// pendingrezexp is set to -1 if we are not expecting an OP_RezzAnswer
+	if (dead || IsZoningOut())
+	{
+		ClearPendingResurrection();
+		return;
+	}
+
+	if (!IsResurrectionPending()) {
 		LogSpellsDetail("Unexpected OP_RezzAnswer. Ignoring it.");
 		Message(Chat::Red, "You have already been resurrected.\n");
 		return;
 	}
 
-	// the packet we just got from the client should be the same as what is in this->PendingRezzPacket
+	// the packet we just got from the client should be the same as our pending packet
 	// which is the same as what we originally sent them but we'll use our copy to be safe
-	Resurrect_Struct *ra = &PendingRezzPacket;
+	Resurrect_Struct *ra = &m_pending_resurrection.packet;
 
 	Resurrect_Struct *client_response = (Resurrect_Struct *)app->pBuffer;
 	if (client_response->action == 1)
 	{
 		if (!IsValidSpell(ra->spellid))
 		{
+			ClearPendingResurrection();
 			return;
 		}
 		ra->action = 1;
 
 		// Mark the corpse as rezzed in the database, just in case the corpse has buried, or the zone the
 		// corpse is in has shutdown since the rez spell was cast.
-		database.MarkCorpseAsRezzed(PendingRezzDBID);
+		database.MarkCorpseAsRezzed(m_pending_resurrection.corpse_db_id);
 		LogSpellsDetail("Player [{}] got a [{}] Rezz, spellid [{}] in zone [{}]",
 				this->name, (uint16)spells[ra->spellid].base[0],
 				ra->spellid, ra->zone_id);
@@ -1195,12 +1178,12 @@ void Client::OPRezzAnswer(const EQApplicationPacket *app)
 		}
 
 		// restore experience
-		if(spells[ra->spellid].base[0] < 100 && spells[ra->spellid].base[0] > 0 && PendingRezzXP > 0)
+		if(spells[ra->spellid].base[0] < 100 && spells[ra->spellid].base[0] > 0 && m_pending_resurrection.experience > 0)
 		{
-			SetEXP(((int)(GetEXP()+((float)((PendingRezzXP / 100) * spells[ra->spellid].base[0])))),GetAAXP(),true);
+			SetEXP(((int)(GetEXP()+((float)((m_pending_resurrection.experience / 100) * spells[ra->spellid].base[0])))),GetAAXP(),true);
 		}
-		else if (spells[ra->spellid].base[0] == 100 && PendingRezzXP > 0) {
-			SetEXP((GetEXP() + PendingRezzXP), GetAAXP(), true);
+		else if (spells[ra->spellid].base[0] == 100 && m_pending_resurrection.experience > 0) {
+			SetEXP((GetEXP() + m_pending_resurrection.experience), GetAAXP(), true);
 		}
 
 		entity_list.RemoveFromTargets(this);
@@ -1220,32 +1203,35 @@ void Client::OPRezzAnswer(const EQApplicationPacket *app)
 		// Send the OP_RezzComplete to the world server. This finds it's way to the zone that
 		// the rezzed corpse is in to mark the corpse as rezzed.
 		{
-			EQApplicationPacket *outapp = new EQApplicationPacket(OP_RezzComplete, (const unsigned char *)&PendingRezzPacket, sizeof(Resurrect_Struct));
-			worldserver.RezzPlayer(outapp, 0, 0, 0, OP_RezzComplete);
+			EQApplicationPacket *outapp = new EQApplicationPacket(OP_RezzComplete, (const unsigned char *)&m_pending_resurrection.packet, sizeof(Resurrect_Struct));
+			worldserver.RezzPlayer(outapp, 0, m_pending_resurrection.corpse_db_id, 0, OP_RezzComplete);
 			safe_delete(outapp);
 		}
 
 		// arm for zoning, but let client take the next step
 		if (ra->zone_id != GetZoneID())
 		{
-			CastToClient()->zone_mode = ZoneSolicited;
-			CastToClient()->m_ZoneSummonLocation = glm::vec4(ra->x, ra->y, ra->z, 0.0f);
-			CastToClient()->zonesummon_id = ra->zone_id;
-			CastToClient()->zonesummon_ignorerestrictions = 0;
-			CastToClient()->zoning_timer.Start();
+			SetPendingZoneTransfer(
+				ZoneSolicited,
+				ra->zone_id,
+				glm::vec4(ra->x, ra->y, ra->z, 0.0f),
+				0
+			);
+		}
+		else
+		{
+			cheat_manager.SetExemptStatus(Port, true);
 		}
 
 		// send the packet back to the client - this causes the client to teleport/zone, set its HP/mana and apply the rez effect buff based on race
 		{
-			EQApplicationPacket *outapp = new EQApplicationPacket(OP_RezzComplete, (const unsigned char *)&PendingRezzPacket, sizeof(Resurrect_Struct));
+			EQApplicationPacket *outapp = new EQApplicationPacket(OP_RezzComplete, (const unsigned char *)&m_pending_resurrection.packet, sizeof(Resurrect_Struct));
 			QueuePacket(outapp);
 			safe_delete(outapp);
 		}
 	}
 
-	PendingRezzXP = -1;
-	PendingRezzSpellID = 0;
-	memset(&PendingRezzPacket, 0, sizeof(Resurrect_Struct));
+	ClearPendingResurrection();
 }
 
 void Client::OPTGB(const EQApplicationPacket *app)
@@ -1909,8 +1895,8 @@ void Client::OPGMSummon(const EQApplicationPacket *app)
 			}
 
 			Message(Chat::White, "Local: Summoning %s to %f, %f, %f", gms->charname, (float)gms->x, (float)gms->y, (float)gms->z);
-			if (st->IsClient() && (st->CastToClient()->GetAnon() != 1 || this->Admin() >= st->CastToClient()->Admin()))
-				st->CastToClient()->MovePC(zone->GetZoneID(), (float)gms->x, (float)gms->y, (float)gms->z, this->GetHeading(), true);
+			if (st->IsClient())
+				st->CastToClient()->MovePC(zone->GetZoneID(), (float)gms->x, (float)gms->y, (float)gms->z, this->GetHeading() * 2.0f, true, GMSummon);
 			else
 				st->GMMove(this->GetX(), this->GetY(), this->GetZ(),this->GetHeading());
 		}
@@ -1932,6 +1918,7 @@ void Client::OPGMSummon(const EQApplicationPacket *app)
 				szp->x_pos = (float)gms->x;
 				szp->y_pos = (float)gms->y;
 				szp->z_pos = (float)gms->z;
+				szp->heading = GetHeading();
 				szp->ignorerestrictions = 2;
 				worldserver.SendPacket(pack);
 				safe_delete(pack);

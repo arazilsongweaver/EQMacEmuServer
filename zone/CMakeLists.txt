@@ -258,6 +258,7 @@ set(gm_command_sources
     gm_commands/keyring.cpp
     gm_commands/kick.cpp
     gm_commands/kill.cpp
+    gm_commands/linkdead.cpp
     gm_commands/list.cpp
     gm_commands/listnpcs.cpp
     gm_commands/loc.cpp
@@ -289,6 +290,7 @@ set(gm_command_sources
     gm_commands/nukeitem.cpp
     gm_commands/numauths.cpp
     gm_commands/optest.cpp
+    gm_commands/packetloss.cpp
     gm_commands/path.cpp
     gm_commands/petition.cpp
     gm_commands/pf.cpp
@@ -359,6 +361,7 @@ set(gm_command_sources
 )
 add_library(gm_commands_zone STATIC ${gm_command_sources})
 set_target_properties(gm_commands_zone PROPERTIES UNITY_BUILD ON UNITY_BUILD_BATCH_SIZE 32)
+target_link_libraries(gm_commands_zone PRIVATE rdplib)
 
 # zone combine sources and headers
 ADD_EXECUTABLE(zone ${zone_sources} ${zone_headers})
@@ -377,6 +380,7 @@ ADD_DEFINITIONS(-DZONE)
 
 # link lua_zone unity build against luabind
 target_link_libraries(lua_zone PRIVATE luabind)
+target_link_libraries(lua_zone PRIVATE rdplib)
 if (EQEMU_BUILD_STATIC AND LUA_LIBRARY)
     target_link_libraries(zone PRIVATE ${LUA_LIBRARY})
 endif()

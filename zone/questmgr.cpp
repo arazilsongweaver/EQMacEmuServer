@@ -413,17 +413,14 @@ void QuestManager::Zone(const char *zone_name) {
 	QuestManagerCurrentQuestVars();
 	if (initiator && initiator->IsClient())
 	{
-		auto pack = new ServerPacket(ServerOP_ZoneToZoneRequest, sizeof(ZoneToZone_Struct));
-		ZoneToZone_Struct* ztz = (ZoneToZone_Struct*) pack->pBuffer;
-		ztz->response = 0;
-		ztz->current_zone_id = zone->GetZoneID();
-		ztz->requested_zone_id = ZoneID(zone_name);
-		ztz->admin = initiator->Admin();
-		strcpy(ztz->name, initiator->GetName());
-		ztz->guild_id = initiator->GuildID();
-		ztz->ignorerestrictions = 3;
-		worldserver.SendPacket(pack);
-		safe_delete(pack);
+		uint32 zone_id = ZoneID(zone_name);
+		if (zone_id == 0)
+		{
+			LogError("Quest requested an unknown zone [{}] for client [{}]", zone_name, initiator->GetName());
+			return;
+		}
+
+		initiator->MovePC(zone_id, 0.0f, 0.0f, 0.0f, 0.0f, 3, ZoneToSafeCoords);
 	}
 }
 

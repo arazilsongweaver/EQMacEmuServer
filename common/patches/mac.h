@@ -1,29 +1,20 @@
 #ifndef MAC_H_
 #define MAC_H_
 
-#include "../struct_strategy.h"
-
-class EQStreamIdentifier;
+class EQApplicationPacket;
+class EQPacketEncodeResult;
+class EQPacketTranslator;
 
 namespace Mac {
 
-	//these are the only public member of this namespace.
-	extern void Register(EQStreamIdentifier &into);
-	extern void Reload();
+	// Register the Mac packet encoders and decoders with the application packet translator.
+	extern void Register(EQPacketTranslator &translator);
 
-
-
-	//you should not directly access anything below..
-	//I just dont feel like making a seperate header for it.
-
-	class Strategy : public StructStrategy {
+	class Strategy {
 	public:
-		Strategy();
+		void Register(EQPacketTranslator &translator) const;
 
-	protected:
-
-		virtual std::string Describe() const;
-		virtual const EQ::versions::ClientVersion ClientVersion() const;
+	private:
 		//magic macro to declare our opcodes
 		#include "ss_declare.h"
 		#include "mac_ops.h"
@@ -35,4 +26,4 @@ namespace Mac {
 
 
 
-#endif /*TEMPLATE_H_*/
+#endif /*MAC_H_*/

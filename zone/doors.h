@@ -46,7 +46,7 @@ public:
 	void DumpDoor();
 	void ForceClose(Mob *sender, bool alt_mode = false);
 	void ForceOpen(Mob *sender, bool alt_mode = false);
-	void HandleClick(Client* sender, uint8 trigger, bool floor_port = false);
+	void HandleClick(Client* sender, uint8 trigger);
 	void HandleLift(Client* sender);
 	void NPCOpen(NPC* sender, bool alt_mode=false);
 	void OpenDoor(Mob *sender, bool force = false);
@@ -72,6 +72,7 @@ public:
 	float GetZ();
 			
 private:
+	void HandleTeleport(Client *sender);
 
 	bool      m_has_destination_zone = false;
 	bool      m_same_destination_zone = false;

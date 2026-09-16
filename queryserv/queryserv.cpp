@@ -1,6 +1,5 @@
 #include "../common/global_define.h"
 #include "../common/eqemu_logsys.h"
-#include "../common/opcodemgr.h"
 #include "../common/rulesys.h"
 #include "../common/platform.h"
 #include "../common/crash.h"

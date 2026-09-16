@@ -53,7 +53,6 @@
 #include "zone.h"
 #include "zone_config.h"
 #include "queryserv.h"
-#include "../common/patches/patches.h"
 #include "../common/skill_caps.h"
 #include "../common/server_reload_types.h"
 #include "../common/events/player_event_logs.h"
@@ -347,11 +346,13 @@ void WorldServer::HandleMessage(uint16 opcode, const EQ::Net::Packet& p)
 				break;
 			}
 
+			ZoneToZone_Struct* ztz = (ZoneToZone_Struct*) pack->pBuffer;
+
 			if (!is_zone_loaded) {
+				ztz->response = 0;
+				SendPacket(pack);
 				break;
 			}
-
-			ZoneToZone_Struct* ztz = (ZoneToZone_Struct*) pack->pBuffer;
 
 			if(ztz->current_zone_id == zone->GetZoneID()) {
 				// it's a response
@@ -360,50 +361,8 @@ void WorldServer::HandleMessage(uint16 opcode, const EQ::Net::Packet& p)
 					break;
 				}
 
-				auto outapp = new EQApplicationPacket(OP_ZoneChange,sizeof(ZoneChange_Struct));
-				ZoneChange_Struct* zc2=(ZoneChange_Struct*)outapp->pBuffer;
-				if(ztz->response <= 0) {
-					zc2->success = ZoningMessage::ZoneNotReady;
-					entity->CastToMob()->SetZone(ztz->current_zone_id);
-					entity->CastToClient()->SetZoning(false);
-					entity->CastToClient()->SetLockSavePosition(false);
-				}
-				else {
-					entity->CastToClient()->UpdateWho(1);
-					strn0cpy(zc2->char_name,entity->CastToMob()->GetName(),64);
-					zc2->zoneID=ztz->requested_zone_id;
-					zc2->success = 1;
-
-					entity->CastToMob()->SetZone(ztz->requested_zone_id);
-
-					if (ztz->ignorerestrictions == 3) {
-						entity->CastToClient()->GoToSafeCoords(ztz->requested_zone_id);
-					}
-				}
-				outapp->priority = 6;
-				LogInfo("ZTZ response {} current_zone_id {} -> requested_zone_id {} response {}", ztz->name, ztz->current_zone_id, ztz->requested_zone_id, ztz->response);
-				entity->CastToClient()->QueuePacket(outapp, true, Mob::ZONING);
-				safe_delete(outapp);
-				if (ztz->response <= 0) {
-					entity->CastToClient()->Reconnect();
-				}
-				else {
-					entity->CastToClient()->PreDisconnect();
-				}
-				switch(ztz->response) {
-					case -2: {
-						entity->CastToClient()->Message(Chat::Red,"You do not own the required locations to enter this zone.");
-						break;
-					}
-					case -1: {
-						entity->CastToClient()->Message(Chat::Red,"The zone is currently full, please try again later.");
-						break;
-					}
-					case 0:	{
-						entity->CastToClient()->Message(Chat::Red,"All zone servers are taken at this time, please try again later.");
-						break;
-					}
-				}
+				LogInfo("ZTZ response {} transaction {} current_zone_id {} -> requested_zone_id {} response {}", ztz->name, ztz->transaction_id, ztz->current_zone_id, ztz->requested_zone_id, ztz->response);
+				entity->CastToClient()->HandleZoneTransferResponse(ztz->current_zone_id, ztz->requested_zone_id, ztz->transaction_id, ztz->response);
 			}
 			else {
 				// it's a request
@@ -414,7 +373,7 @@ void WorldServer::HandleMessage(uint16 opcode, const EQ::Net::Packet& p)
 				else {
 					ztz->response = 1;
 				}
-				LogInfo("ZTZ request {} current_zone_id {} -> requested_zone_id {} response {}", ztz->name, ztz->current_zone_id, ztz->requested_zone_id, ztz->response);
+				LogInfo("ZTZ request {} transaction {} current_zone_id {} -> requested_zone_id {} response {}", ztz->name, ztz->transaction_id, ztz->current_zone_id, ztz->requested_zone_id, ztz->response);
 
 				SendPacket(pack);
 				break;
@@ -577,6 +536,11 @@ void WorldServer::HandleMessage(uint16 opcode, const EQ::Net::Packet& p)
 				break;
 			}
 			ServerZoneIncomingClient_Struct* szic = (ServerZoneIncomingClient_Struct*) pack->pBuffer;
+			if (szic->lsid == 0) {
+				LogError("Ignoring incoming client [{}] for account [{}] because world did not provide an LSID", szic->charname, szic->accid);
+				break;
+			}
+
 			if (is_zone_loaded) {
 				SetZoneData(zone->GetZoneID());
 
@@ -616,7 +580,7 @@ void WorldServer::HandleMessage(uint16 opcode, const EQ::Net::Packet& p)
 				else {
 					SendEmoteMessage(szp->adminname, 0, 0, "Summoning %s to %s %1.1f, %1.1f, %1.1f", szp->name, szp->zone, szp->x_pos, szp->y_pos, szp->z_pos);
 				}
-				client->MovePC(ZoneID(szp->zone), szp->x_pos, szp->y_pos, szp->z_pos, client->GetHeading(), szp->ignorerestrictions, GMSummon);
+				client->MovePC(ZoneID(szp->zone), szp->x_pos, szp->y_pos, szp->z_pos, szp->heading * 2.0f, szp->ignorerestrictions, GMSummon);
 			}
 			break;
 		}
@@ -697,6 +661,7 @@ void WorldServer::HandleMessage(uint16 opcode, const EQ::Net::Packet& p)
 				szp->x_pos = client->GetX();
 				szp->y_pos = client->GetY();
 				szp->z_pos = client->GetZ();
+				szp->heading = client->GetHeading();
 				SendPacket(outpack);
 				safe_delete(outpack);
 			}
@@ -750,7 +715,7 @@ void WorldServer::HandleMessage(uint16 opcode, const EQ::Net::Packet& p)
 				// so we send the request to their client which will bring up the confirmation box.
 				Client* client = entity_list.GetClientByName(srs->rez.your_name);
 				if (client && client->CharacterID() == srs->corpse_character_id) {
-					if(client->IsRezzPending()) {
+					if(client->IsDead() || client->IsZoningOut() || client->IsResurrectionPending()) {
 						auto Response = new ServerPacket(ServerOP_RezzPlayerReject,
 										 strlen(srs->rez.rezzer_name) + 1);
 
@@ -760,9 +725,8 @@ void WorldServer::HandleMessage(uint16 opcode, const EQ::Net::Packet& p)
 						safe_delete(Response);
 						break;
 					}
-					//pendingrezexp is the amount of XP on the corpse. Setting it to a value >= 0
-					//also serves to inform Client::OPRezzAnswer to expect a packet.
-					client->SetPendingRezzData(srs->exp, srs->dbid, srs->rez.spellid, srs->rez.corpse_name, &srs->rez);
+					// Keep the corpse data and the packet together until the client answers.
+					client->SetPendingResurrection(srs->exp, srs->dbid, srs->rez);
 					LogSpellsDetail("OP_RezzRequest in zone [{}] for [{}], spellid:[{}]",
 					zone->GetShortName(), client->GetName(), srs->rez.spellid);
 					auto outapp = new EQApplicationPacket(OP_RezzRequest,
@@ -776,10 +740,14 @@ void WorldServer::HandleMessage(uint16 opcode, const EQ::Net::Packet& p)
 			if (srs->rezzopcode == OP_RezzComplete){
 				// We get here when the Rezz complete packet has come back via the world server
 				// to the zone that the corpse is in.
-				Corpse* corpse = entity_list.GetCorpseByName(srs->rez.corpse_name);
-				if (corpse && corpse->IsCorpse()) {
-					LogSpellsDetail("OP_RezzComplete received in zone [{}] for corpse [{}]",
-								zone->GetShortName(), srs->rez.corpse_name);
+				if (srs->dbid == 0) {
+					break;
+				}
+
+				Corpse* corpse = entity_list.GetCorpseByDBID(srs->dbid);
+				if (corpse) {
+					LogSpellsDetail("OP_RezzComplete received in zone [{}] for corpse [{}] database id [{}]",
+								zone->GetShortName(), corpse->GetName(), srs->dbid);
 
 					LogSpellsDetail("Found corpse. Marking corpse as rezzed.");
 					corpse->CompleteResurrection();
@@ -2119,6 +2087,11 @@ void WorldServer::QueueReload(ServerReload::Request r)
 
 void WorldServer::ProcessReload(const ServerReload::Request &request)
 {
+	if (request.type == ServerReload::Type::Opcodes) {
+		LogInfo("Opcode reloading is not implemented");
+		return;
+	}
+
 	LogInfo(
 		"Reloading [{}] ({}) zone booted required [{}]",
 		ServerReload::GetName(request.type),
@@ -2138,10 +2111,6 @@ void WorldServer::ProcessReload(const ServerReload::Request &request)
 	switch (request.type) {
 	case ServerReload::Type::AAData:
 		zone->LoadAlternateAdvancement();
-		break;
-
-	case ServerReload::Type::Opcodes:
-		ReloadAllPatches();
 		break;
 
 	case ServerReload::Type::BlockedSpells:

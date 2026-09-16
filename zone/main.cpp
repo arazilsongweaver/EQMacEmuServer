@@ -16,22 +16,21 @@
 	Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA 02111-1307 USA
 */
 
-#define DONT_SHARED_OPCODES
 #define PLATFORM_ZONE 1
 
 #include "../common/global_define.h"
 #include "../common/features.h"
 #include "../common/queue.h"
-#include "../common/eq_stream.h"
-#include "../common/eq_stream_factory.h"
+#include "../common/eq_packet_translator.h"
 #include "../common/eq_packet_structs.h"
 #include "../common/mutex.h"
 #include "../common/version.h"
-#include "../common/packet_dump_file.h"
-#include "../common/opcodemgr.h"
 #include "../common/guilds.h"
-#include "../common/eq_stream_ident.h"
-#include "../common/patches/patches.h"
+#include "../common/patches/mac.h"
+#include "../common/rdp/rdp_connection.h"
+#include "../common/rdp/rdp_endpoint.h"
+#include "../common/rdp/rdp_runtime.h"
+#include "../common/rdp/rdp_stream.h"
 #include "../common/rulesys.h"
 #include "../common/profanity_manager.h"
 #include "../common/misc_functions.h"
@@ -72,6 +71,9 @@
 #include <time.h>
 #include <ctime>
 #include <chrono>
+#include <memory>
+#include <new>
+#include <utility>
 
 #ifdef _CRTDBG_MAP_ALLOC
 	#undef new
@@ -86,6 +88,7 @@
 #include "../common/unix.h"
 #endif
 
+volatile bool RunLoops = true;
 extern volatile bool is_zone_loaded;
 
 #include "../common/file.h"
@@ -99,8 +102,6 @@ uint32      numclients = 0;
 char        errorname[32];
 extern Zone *zone;
 
-TimeoutManager        timeout_manager;
-EQStreamFactory       eqsf;
 TitleManager          title_manager;
 QueryServ             *QServ = 0;
 QuestParserCollection *parse = 0;
@@ -377,9 +378,25 @@ int main(int argc, char** argv) {
 		zone = nullptr;
 	}
 
-	//register all the patches we have avaliable with the stream identifier.
-	EQStreamIdentifier stream_identifier;
-	RegisterAllPatches(stream_identifier);
+	// load opcodes and configure packet encode/decode
+	std::string opcode_file = fmt::format("{}/patch_Mac.conf", PathManager::Instance()->GetPatchPath());
+	EQPacketTranslator packet_translator;
+	if (!packet_translator.LoadOpcodes(opcode_file.c_str()))
+	{
+		LogError("Failed to load opcode file [{}]", opcode_file);
+		return 1;
+	}
+	Mac::Register(packet_translator);
+
+	// RDP init
+	RDPRuntime rdp_runtime;
+	int rdp_result = rdp_runtime.Open();
+	if (rdp_result != RDPLIB_OK)
+	{
+		LogError("Failed to open the RDP runtime, result [{}]", rdp_result);
+		return 1;
+	}
+	RDPEndpoint rdp_endpoint;
 
 #ifdef __linux__
 	LogDebug("Main thread running with thread id [{}]", pthread_self());
@@ -392,13 +409,20 @@ int main(int argc, char** argv) {
 
 	Timer quest_timers(100);
 	UpdateWindowTitle(nullptr);
-	std::shared_ptr<EQOldStream> eqoss;
-	EQStreamInterface *eqsi;
 	std::chrono::time_point<std::chrono::steady_clock> frame_prev = std::chrono::steady_clock::now();
 	std::unique_ptr<EQ::Net::WebsocketServer>          ws_server;
 
 	auto loop_fn = [&](EQ::Timer* t) {
 		{	
+			if (!RunLoops)
+			{
+				EQ::EventLoop::Get().Shutdown();
+				// Client teardown still consults zone state and releases streams before endpoint shutdown.
+				entity_list.Clear();
+				Zone::Shutdown(true);
+				return;
+			}
+
 			//profiler block to omit the sleep from times
 			//Advance the timer to our current point in time
 			Timer::SetCurrentTime();
@@ -420,41 +444,87 @@ int main(int argc, char** argv) {
 				websocker_server_opened = true;
 			}
 
-			if (!eqsf.IsOpen() && Config->ZonePort != 0) {
+			// start listening if network port is configured
+			if (!rdp_endpoint.IsOpen() && Config->ZonePort != 0) {
 				LogInfo("Starting EQ Network server on port {} ", Config->ZonePort);
-				if (!eqsf.Open(Config->ZonePort)) {
-					LogError("Failed to open port {} ", Config->ZonePort);
+				int open_result = rdp_endpoint.Open(rdp_runtime, Config->ZonePort);
+				if (open_result != RDPLIB_OK) {
+					LogError("Failed to open port {}, RDP result [{}]", Config->ZonePort, open_result);
 					ZoneConfig::SetZonePort(0);
 					worldwasconnected = false;
 				}
 			}
 
-			//check the factory for any new incoming streams.
-			while ((eqoss = eqsf.PopOld())) {
-				//pull the stream out of the factory and give it to the stream identifier
-				//which will figure out what patch they are running, and set up the dynamic
-				//structures and opcodes for that patch.
-				struct in_addr	in;
-				in.s_addr = eqoss->GetRemoteIP();
-				LogInfo("New connection from [{0}]:[{1}]", inet_ntoa(in), ntohs(eqoss->GetRemotePort()));
-				stream_identifier.AddOldStream(eqoss);	//takes the stream
+			if (rdp_endpoint.IsOpen())
+			{
+				// consume incoming network traffic
+				int process_result = rdp_endpoint.Process();
+				if (process_result < 0)
+				{
+					LogError("Unable to process the RDP endpoint, result [{}]", process_result);
+					RunLoops = false;
+				}
+				else
+				{
+					int accept_result = RDPLIB_OK;
+					for (;;)
+					{
+						std::unique_ptr<RDPConnection> connection(rdp_endpoint.Accept(&accept_result));
+						if (connection == nullptr)
+							break;
+
+						std::unique_ptr<RDPStream> stream;
+						try
+						{
+							stream.reset(new RDPStream(packet_translator, std::move(connection)));
+						}
+						catch (const std::bad_alloc &)
+						{
+							accept_result = RDPLIB_ERROR_OUT_OF_MEMORY;
+							break;
+						}
+
+						uint8 remote_address[4] = {};
+						uint16 remote_port = 0;
+						int setup_result = stream->GetRemoteAddress(remote_address, remote_port);
+						// solar: the AK server used the default 10 second keepalive frequency.  the client also uses a 10 second keepalive.
+						// The 500ms configuration here is only to keep the network status meter in the client at 0.0%.
+						// This is a deviation from AKurate; the meter did not stay at 0.0% on AK.  Verified in AK pcaps.
+						// The client meter adds a gap every 500ms if no reliable packet was received, but it is normal to go up
+						// to 6 seconds between reliable packets in an otherwise quiet zone.
+						if (setup_result == RDPLIB_OK)
+							setup_result = stream->EnableKeepalive(500);
+						if (setup_result == RDPLIB_OK)
+							setup_result = stream->SetDataRate();
+						if (setup_result == RDPLIB_OK)
+							setup_result = stream->SetSendBufferSize();
+
+						if (setup_result != RDPLIB_OK)
+						{
+							LogError("Unable to configure a new RDP client, result [{}]", setup_result);
+							stream->Close(0);
+							continue;
+						}
+
+						LogInfo(
+							"New client from [{}.{}.{}.{}]:[{}]",
+							static_cast<uint32>(remote_address[0]),
+							static_cast<uint32>(remote_address[1]),
+							static_cast<uint32>(remote_address[2]),
+							static_cast<uint32>(remote_address[3]),
+							remote_port
+						);
+						auto client = new Client(std::move(stream));
+						entity_list.AddClient(client);
+					}
+
+					if (accept_result != RDPLIB_OK)
+					{
+						LogError("Unable to accept an RDP client, result [{}]", accept_result);
+						RunLoops = false;
+					}
+				}
 			}
-
-			//give the stream identifier a chance to do its work....
-			stream_identifier.Process();
-
-			//check the stream identifier for any now-identified streams
-			while ((eqsi = stream_identifier.PopIdentified())) {
-				//now that we know what patch they are running, start up their client object
-				struct in_addr	in;
-				in.s_addr = eqsi->GetRemoteIP();
-				LogInfo("New client from [{0}]:[{1}]", inet_ntoa(in), ntohs(eqsi->GetRemotePort()));
-				auto client = new Client(eqsi);
-				entity_list.AddClient(client);
-			}
-
-			//check for timeouts in other threads
-			timeout_manager.CheckTimeouts();
 
 			if (worldserver.Connected()) {
 				worldwasconnected = true;
@@ -499,6 +569,8 @@ int main(int argc, char** argv) {
 					quest_manager.Process();
 				}
 
+				entity_list.FlushPositionUpdates();
+
 			}
 
 			QServ->CheckForConnectState();
@@ -540,8 +612,16 @@ int main(int argc, char** argv) {
 	if (zone != 0) {
 		Zone::Shutdown(true);
 	}
-	//Fix for Linux world server problem.
-	eqsf.Close();
+	rdp_result = rdp_endpoint.Close();
+	if (rdp_result != RDPLIB_OK)
+		LogError("Failed to close the RDP endpoint, result [{}]", rdp_result);
+
+	int runtime_close_result = rdp_runtime.Close();
+	if (runtime_close_result != RDPLIB_OK)
+		LogError("Failed to close the RDP runtime, result [{}]", runtime_close_result);
+	if (rdp_result == RDPLIB_OK)
+		rdp_result = runtime_close_result;
+
 	command_deinit();
 	safe_delete(parse);
 	LogInfo("Proper zone shutdown complete.");
@@ -549,13 +629,13 @@ int main(int argc, char** argv) {
 
 	safe_delete(QServ);
 
-	return 0;
+	return rdp_result == RDPLIB_OK ? 0 : 1;
 }
 
 void Shutdown()
 {
 	LogInfo("Shutting down...");
-	EQ::EventLoop::Get().Shutdown();
+	RunLoops = false;
 }
 
 void CatchSignal(int sig_num) {

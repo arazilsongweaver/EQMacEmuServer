@@ -29,7 +29,6 @@
 #include "web_interface.h"
 #include "../common/zone_store.h"
 #include "../common/events/player_event_logs.h"
-#include "../common/patches/patches.h"
 #include "../common/skill_caps.h"
 #include "../common/content/world_content_service.h"
 #include "world_boot.h"
@@ -810,6 +809,11 @@ void ZSList::UpdateUCSServerAvailable(bool ucss_available) {
 
 void ZSList::SendServerReload(ServerReload::Type type, uchar *packet)
 {
+	if (type == ServerReload::Type::Opcodes) {
+		LogInfo("Opcode reloading is not implemented");
+		return;
+	}
+
 	static auto pack = ServerPacket(ServerOP_ServerReloadRequest, sizeof(ServerReload::Request));
 	auto        r = (ServerReload::Request *)pack.pBuffer;
 
@@ -824,7 +828,6 @@ void ZSList::SendServerReload(ServerReload::Type type, uchar *packet)
 	LogInfo("Sending reload to all zones for type [{}]", ServerReload::GetName(type));
 
 	static const std::unordered_set<ServerReload::Type> no_zone_boot_required = {
-		ServerReload::Type::Opcodes,
 		ServerReload::Type::Rules,
 		ServerReload::Type::ContentFlags,
 		ServerReload::Type::Logs,
@@ -841,10 +844,7 @@ void ZSList::SendServerReload(ServerReload::Type type, uchar *packet)
 	}
 
 	// reload at the world level
-	if (type == ServerReload::Type::Opcodes) {
-		ReloadAllPatches();
-	}
-	else if (type == ServerReload::Type::Rules) {
+	if (type == ServerReload::Type::Rules) {
 		RuleManager::Instance()->LoadRules(&database, RuleManager::Instance()->GetActiveRuleset(), true);
 	}
 	else if (type == ServerReload::Type::SkillCaps) {

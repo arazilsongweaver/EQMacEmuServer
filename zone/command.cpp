@@ -164,6 +164,7 @@ int command_init(void)
 		command_add("keyring", "Displays target's keyring items.", AccountStatus::EQSupport, command_keyring) ||
 		command_add("kick", "[charname] - Disconnect charname.", AccountStatus::EQSupport, command_kick) ||
 		command_add("kill", "Kill your target.", AccountStatus::GMLeadAdmin, command_kill) ||
+		command_add("linkdead", "[charname] - Make a local client linkdead for testing.", AccountStatus::GMCoder, command_linkdead) ||
 
 		command_add("listnpcs", "[name/range] - Search NPCs.", AccountStatus::EQSupport, command_listnpcs) ||
 		command_add("list", "[npc] [name|all] - Search entities", AccountStatus::SeniorGuide, command_list) ||
@@ -199,8 +200,9 @@ int command_init(void)
 		command_add("nukeitem", "[itemid] - Remove itemid from your player target's inventory.", AccountStatus::GMLeadAdmin, command_nukeitem) ||
 		command_add("numauths", "TODO: describe this command.", AccountStatus::Max, command_numauths) ||
 
-		command_add("opcode", "Reloads all opcodes from server patch files", AccountStatus::GMMgmt, command_reload) ||
+		command_add("opcode", "Opcode reloading is not implemented", AccountStatus::GMMgmt, command_reload) ||
 		command_add("optest", "solar's private test command.", AccountStatus::GMCoder, command_optest) ||
+		command_add("packetloss", "[percentage] [inbound|outbound|both] - Set or show simulated packet loss for your client target.", AccountStatus::GMCoder, command_packetloss) ||
 
 		command_add("path", "view and edit pathing.", AccountStatus::GMImpossible, command_path) ||
 		command_add("petition", "Handles everything petition related. Use with no args or with 'help' for how to use.", AccountStatus::ApprenticeGuide, command_petition) ||

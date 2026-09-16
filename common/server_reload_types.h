@@ -115,6 +115,10 @@ namespace ServerReload {
 		std::vector<ServerReload::Type> types;
 		types.reserve(ServerReload::Type::Max);
 		for (int i = 1; i < ServerReload::Type::Max; i++) {
+			// Keep the wire value reserved without advertising the removed reload path.
+			if (i == ServerReload::Type::Opcodes) {
+				continue;
+			}
 			types.push_back(static_cast<ServerReload::Type>(i));
 		}
 		return types;

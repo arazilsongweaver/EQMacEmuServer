@@ -270,8 +270,12 @@ void NPC::PauseWandering(int pausetime)
 	}
 
 	// this stops them from auto changing direction, in AI_DoMovement()
-	AIhail_timer->Start((RuleI(NPC, SayPauseTimeInSec)-1)*1000);
-	
+	if (pausetime > 1) {
+		AIhail_timer->Start((pausetime - 1) * 1000);
+	}
+	else {
+		AIhail_timer->Disable();
+	}
 }
 
 void NPC::MoveTo(const glm::vec4& position, bool saveguardspot, uint32 delay)

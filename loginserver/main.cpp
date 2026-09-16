@@ -1,7 +1,5 @@
 #include "../common/global_define.h"
 #include "../common/types.h"
-#include "../common/opcodemgr.h"
-#include "../common/eq_stream_factory.h"
 #include "../common/timer.h"
 #include "../common/platform.h"
 #include "../common/crash.h"
@@ -17,7 +15,6 @@
 #include <sstream>
 #include <thread>
 
-TimeoutManager timeout_manager;
 LoginServer server;
 EQEmuLogSys LogSys;
 EQCrypto eq_crypto;
@@ -186,7 +183,6 @@ int main(int argc, char **argv)
 		}
 		
 		server.client_manager->Process();
-		timeout_manager.CheckTimeouts();
 	};
 
 	EQ::Timer proccess_timer(loop_fun);

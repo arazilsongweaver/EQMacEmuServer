@@ -394,7 +394,7 @@ Corpse::Corpse(Client* client, int32 in_rezexp, uint8 in_killedby) : Mob (
 				LogInventoryDetail("Skipping Soulbound item [{}] in slot [{}]", item->GetItem()->Name, i);
 		}
 
-		for (i = EQ::invslot::TRADE_BEGIN; i < EQ::invslot::TRADE_END; i++)
+		for (i = EQ::invslot::TRADE_BEGIN; i <= EQ::invslot::TRADE_END; i++)
 		{
 			item = client->GetInv().GetItem(i);
 			if (item )

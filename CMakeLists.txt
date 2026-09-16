@@ -1,4 +1,4 @@
-CMAKE_MINIMUM_REQUIRED(VERSION 3.12)
+CMAKE_MINIMUM_REQUIRED(VERSION 3.16)
 
 SET(CMAKE_MODULE_PATH "${CMAKE_SOURCE_DIR}/cmake/" ${CMAKE_MODULE_PATH})
 
@@ -18,6 +18,9 @@ SET(CMAKE_CXX_EXTENSIONS OFF)
 
 OPTION(EQEMU_BUILD_STATIC "Build with static linking" OFF)
 OPTION(EQEMU_BUILD_PCH "Build with precompiled headers (Windows)" ON)
+OPTION(EQEMU_BUILD_SERVER "Build the game server." ON)
+OPTION(EQEMU_BUILD_LOGIN "Build the login server." ON)
+OPTION(EQEMU_BUILD_TESTS "Build utility tests." OFF)
 
 IF (EQEMU_BUILD_STATIC)
 	SET(BUILD_SHARED_LIBS OFF)
@@ -30,6 +33,11 @@ ENDIF(EQEMU_BUILD_STATIC)
 IF(EQEMU_ADD_PROFILER)
 	SET(CMAKE_EXE_LINKER_FLAGS "-Wl,--no-as-needed,-lprofiler,--as-needed")
 ENDIF(EQEMU_ADD_PROFILER)
+
+IF(EQEMU_BUILD_SERVER OR EQEMU_BUILD_LOGIN OR EQEMU_BUILD_TESTS)
+	SET(RDPLIB_BUILD_SHARED OFF CACHE BOOL "Build the shared rdplib library")
+	ADD_SUBDIRECTORY(submodules/rdplib)
+ENDIF()
 
 IF(MSVC)
 	add_compile_options(/bigobj)
@@ -137,9 +145,6 @@ MESSAGE(STATUS "**************************************************")
 
 #options
 OPTION(EQEMU_COMMANDS_LOGGING "Enable GM Command logs" ON)
-OPTION(EQEMU_BUILD_SERVER "Build the game server." ON)
-OPTION(EQEMU_BUILD_LOGIN "Build the login server." ON)
-OPTION(EQEMU_BUILD_TESTS "Build utility tests." OFF)
 OPTION(EQEMU_BUILD_CLIENT_FILES "Build Client Import/Export Data Programs." OFF)
 OPTION(EQEMU_PREFER_LUA "Build with normal Lua even if LuaJIT is found." OFF)
 
@@ -395,6 +400,7 @@ ENDIF()
 
 IF(EQEMU_BUILD_SERVER OR EQEMU_BUILD_LOGIN OR EQEMU_BUILD_TESTS)
 	ADD_SUBDIRECTORY(common)
+	TARGET_LINK_LIBRARIES(common PUBLIC rdplib)
 	ADD_SUBDIRECTORY(libs)
 	ADD_SUBDIRECTORY(submodules/fmt)
 	ADD_SUBDIRECTORY(submodules/libuv)

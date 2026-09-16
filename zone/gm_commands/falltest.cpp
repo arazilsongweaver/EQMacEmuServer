@@ -12,7 +12,7 @@ void command_falltest(Client *c, const Seperator *sep)
 		else
 		{
 			zmod = c->GetZ() + atof(sep->arg[1]);
-			c->MovePC(zone->GetZoneID(), c->GetX(), c->GetY(), zmod, c->GetHeading());
+			c->MovePC(zone->GetZoneID(), c->GetX(), c->GetY(), zmod, c->GetHeading() * 2.0f);
 			c->Message(Chat::White, "Moving to X: %0.2f Y: %0.2f Z: %0.2f", c->GetX(), c->GetY(), zmod);
 		}
 	}

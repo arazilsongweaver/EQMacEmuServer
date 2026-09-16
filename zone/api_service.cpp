@@ -61,60 +61,11 @@ Json::Value ApiGetPacketStatistics(EQ::Net::WebsocketServerConnection *connectio
 	auto &list = entity_list.GetClientList();
 
 	for (auto &iter : list) {
-		auto client                = iter.second;
-		auto connection            = client->Connection();
-	    //auto opts                  = connection->GetManager()->GetOptions();
-		//auto eqs_stats             = connection->GetStats();
-		//auto &stats                = eqs_stats.DaybreakStats;
-		auto now                   = EQ::Net::Clock::now();
-		//auto sec_since_stats_reset = std::chrono::duration_cast<std::chrono::duration<double>>(now - stats.created).count();
-		
+		auto client = iter.second;
 		Json::Value row;
-		
-		row["client_id"]                = client->GetID();
-		row["client_name"]              = client->GetCleanName();
-	/*	row["seconds_since_reset"] = sec_since_stats_reset;
-		row["sent_bytes"]               = stats.sent_bytes;
-		row["receive_bytes"]            = stats.recv_bytes;
-		row["min_ping"]                 = stats.min_ping;
-		row["max_ping"]                 = stats.max_ping;
-		row["last_ping"]                = stats.last_ping;
-		row["average_ping"]             = stats.avg_ping;
-		row["realtime_receive_packets"] = stats.recv_packets;
-		row["realtime_sent_packets"]    = stats.sent_packets;
-		row["sync_recv_packets"]        = stats.sync_recv_packets;
-		row["sync_sent_packets"]        = stats.sync_sent_packets;
-		row["sync_remote_recv_packets"] = stats.sync_remote_recv_packets;
-		row["sync_remote_sent_packets"] = stats.sync_remote_sent_packets;
-		row["packet_loss_in"]           = (100.0 * (1.0 - static_cast<double>(stats.sync_recv_packets) /
-														  static_cast<double>(stats.sync_remote_sent_packets)));
-		row["packet_loss_out"]          = (100.0 * (1.0 - static_cast<double>(stats.sync_remote_recv_packets) /
-														  static_cast<double>(stats.sync_sent_packets)));
-		row["resent_packets"]           = stats.resent_packets;
-		row["resent_fragments"]         = stats.resent_fragments;
-		row["resent_non_fragments"]     = stats.resent_full;
-		row["dropped_datarate_packets"] = stats.dropped_datarate_packets;
-		
-		Json::Value sent_packet_types;
-		
-		for (auto i = 0; i < _maxEmuOpcode; ++i) {
-			auto count = eqs_stats.SentCount[i];
-			if (count > 0) {
-				sent_packet_types[OpcodeNames[i]] = count;
-			}
-		}
-		
-		Json::Value receive_packet_types;
-		
-		for (auto i = 0; i < _maxEmuOpcode; ++i) {
-			auto count = eqs_stats.RecvCount[i];
-			if (count > 0) {
-				receive_packet_types[OpcodeNames[i]] = count;
-			}
-		}
-		
-		row["sent_packet_types"]    = sent_packet_types;
-		row["receive_packet_types"] = receive_packet_types;*/
+
+		row["client_id"]   = client->GetID();
+		row["client_name"] = client->GetCleanName();
 
 		response.append(row);
 	}
@@ -675,7 +626,7 @@ Json::Value ApiGetClientListDetail(EQ::Net::WebsocketServerConnection *connectio
 		//row["is_leadership_exp_on"]                    = client->IsLeadershipEXPOn();
 		//row["is_lfp"]                                  = client->IsLFP();
 		row["is_medding"]                              = client->IsMedding();
-		row["is_rezz_pending"]                         = client->IsRezzPending();
+		row["is_rezz_pending"]                         = client->IsResurrectionPending();
 		row["is_sitting"]                              = client->IsSitting();
 		//row["is_starved"]                              = client->IsStarved();
 		//row["is_tracking"]                             = client->IsTracking();

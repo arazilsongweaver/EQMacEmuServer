@@ -2,35 +2,30 @@
 
 void command_zone(Client *c, const Seperator *sep)
 {
-	int arguments = sep->argnum;
-	if (!arguments) {
+	if (!sep->argnum)
+	{
 		c->Message(Chat::White, "Usage: #zone [Zone ID|Zone Short Name] [X] [Y] [Z]");
 		return;
 	}
 
-	std::string zone_identifier = sep->arg[1];
-
-	if (Strings::IsNumber(zone_identifier) && zone_identifier == "0") {
-		c->Message(Chat::White, "Sending you to the safe coordinates of this zone.");
-
-		c->MovePC(
-			0.0f,
-			0.0f,
-			0.0f,
-			0.0f,
-			0,
-			ZoneToSafeCoords
-		);
-		return;
+	const std::string zone_identifier = sep->arg[1];
+	uint32 zone_id = 0;
+	if (zone_identifier == "0")
+	{
+		zone_id = c->GetZoneID();
+	}
+	else if (!zone_identifier.empty() && Strings::IsNumber(zone_identifier) && zone_identifier[0] != '-')
+	{
+		zone_id = Strings::ToUnsignedInt(zone_identifier);
+	}
+	else
+	{
+		zone_id = ZoneID(zone_identifier);
 	}
 
-	auto zone_id = (
-		sep->IsNumber(1) ?
-		std::stoul(zone_identifier) :
-		ZoneID(zone_identifier)
-		);
-	auto zone_short_name = ZoneName(zone_id);
-	if (!zone_id || !zone_short_name) {
+	const char *zone_short_name = ZoneName(zone_id);
+	if (!zone_id || !zone_short_name)
+	{
 		c->Message(
 			Chat::White,
 			fmt::format(
@@ -41,27 +36,74 @@ void command_zone(Client *c, const Seperator *sep)
 		return;
 	}
 
-	auto min_status = database.GetMinStatus(zone_id);
-	if (c->Admin() < min_status) {
+	const int min_status = database.GetMinStatus(zone_id);
+	if (c->Admin() < min_status)
+	{
 		c->Message(Chat::White, "Your status is not high enough to go to this zone.");
 		return;
 	}
 
-	auto x = sep->IsNumber(2) ? std::stof(sep->arg[2]) : 0.0f;
-	auto y = sep->IsNumber(3) ? std::stof(sep->arg[3]) : 0.0f;
-	auto z = sep->IsNumber(4) ? std::stof(sep->arg[4]) : 0.0f;
-	auto zone_mode = sep->IsNumber(2) ? ZoneSolicited : ZoneToSafeCoords;
+	const bool has_x = sep->arg[2][0] != '\0';
+	const bool has_y = sep->arg[3][0] != '\0';
+	const bool has_z = sep->arg[4][0] != '\0';
+	const bool has_coordinates = has_x && has_y && has_z;
+	if ((has_x || has_y || has_z) && !has_coordinates)
+	{
+		c->Message(Chat::White, "Usage: #zone [Zone ID|Zone Short Name] [X] [Y] [Z]");
+		return;
+	}
 
-	auto zd = GetZone(zone_id);
+	auto zone_data = GetZone(zone_id);
+	if (!zone_data)
+	{
+		c->Message(Chat::White, "Unable to find the destination zone data.");
+		return;
+	}
+
+	float x = 0.0f;
+	float y = 0.0f;
+	float z = 0.0f;
+	float heading = 0.0f;
+	if (has_coordinates)
+	{
+		if (!Strings::IsFloat(sep->arg[2]) || !Strings::IsFloat(sep->arg[3]) || !Strings::IsFloat(sep->arg[4]))
+		{
+			c->Message(Chat::White, "Usage: #zone [Zone ID|Zone Short Name] [X] [Y] [Z]");
+			return;
+		}
+
+		x = Strings::ToFloat(sep->arg[2]);
+		y = Strings::ToFloat(sep->arg[3]);
+		z = Strings::ToFloat(sep->arg[4]);
+		if (!std::isfinite(x) || !std::isfinite(y) || !std::isfinite(z))
+		{
+			c->Message(Chat::White, "Usage: #zone [Zone ID|Zone Short Name] [X] [Y] [Z]");
+			return;
+		}
+
+		heading = zone_data->safe_heading;
+	}
+	else
+	{
+		x = zone_data->safe_x;
+		y = zone_data->safe_y;
+		z = zone_data->safe_z;
+		heading = zone_data->safe_heading;
+
+		if (zone_identifier == "0")
+		{
+			c->Message(Chat::White, "Sending you to the safe coordinates of this zone.");
+		}
+	}
 
 	c->MovePC(
 		zone_id,
 		x,
 		y,
 		z,
-		zd ? zd->safe_heading : 0.0f,
+		heading,
 		0,
-		zone_mode
+		ZoneSolicited
 	);
 }
 

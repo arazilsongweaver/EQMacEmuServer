@@ -560,7 +560,7 @@ void Mob::AI_Start() {
 	AIthink_timer->Trigger();
 	AIwalking_timer = std::unique_ptr<Timer>(new Timer(0));
 	AImovement_timer = std::unique_ptr<Timer>(new Timer(AImovement_duration));
-	if (zone->CanDoCombat() && CastToNPC()->GetNPCAggro()) {
+	if (IsNPC() && zone->CanDoCombat() && CastToNPC()->GetNPCAggro()) {
 		AI_scan_area_timer = std::make_unique<Timer>(RandomTimer(RuleI(NPC, NPCToNPCAggroTimerMin), RuleI(NPC, NPCToNPCAggroTimerMax)));
 	}
 	AIhail_timer = std::unique_ptr<Timer>(new Timer(100));
@@ -600,7 +600,6 @@ void Client::AI_Start() {
 	InterruptSpell(SPELL_UNKNOWN, true);
 
 	SetAttackTimer();
-	AI_SetLoiterTimer();
 	if(client_state != CLIENT_LINKDEAD)
 	{
 		SetFeigned(false);
@@ -654,6 +653,9 @@ void NPC::AI_Stop() {
 }
 
 void Client::AI_Stop() {
+	if (!IsAIControlled())
+		return;
+
 	Mob::AI_Stop();
 
 	auto app = new EQApplicationPacket(OP_UnfreezeClientControl, 65);
@@ -682,11 +684,6 @@ void Client::AI_Stop() {
 	if (!auto_attack) {
 		attack_timer.Disable();
 		attack_dw_timer.Disable();
-	}
-	if (IsLD())
-	{
-		Save();
-		OnDisconnect(true);
 	}
 }
 
@@ -937,7 +934,6 @@ void Client::AI_Process()
 		{
 			camp_timer.Disable();
 			camping = false;
-			camp_desktop = false;
 		}
 
 		if (!GetTarget())
@@ -1162,9 +1158,6 @@ void Client::AI_Process()
 			else {
 				StopNavigation();
 			}
-		}
-		if (IsLD() && !camping && !client_ld_timer.Enabled()) {
-			client_ld_timer.Start(CLIENT_LD_TIMEOUT, true);
 		}
 	}
 }
@@ -1969,14 +1962,6 @@ void Mob::AI_Process() {
 			{
 				if (!AIloiter_timer->Enabled() || AIloiter_timer->Check(false))
 				{
-					if (this->IsClient())
-					{
-						// clients use loiter timer as a LD timer; drop client out of world
-						if (this->CastToClient()->IsLD())
-							this->CastToClient()->OnDisconnect(true);
-						return;
-					}
-
 					if (AIloiter_timer->Enabled())
 						AIloiter_timer->Stop();
 
@@ -2508,11 +2493,6 @@ void Mob::AI_SetLoiterTimer()
 			min_time = max_time = 0;
 		}
 	}
-	else if (IsClient())
-	{
-		min_time = max_time = CLIENT_LD_TIMEOUT;
-	}
-
 	if (min_time == max_time)
 		time = min_time;
 	else

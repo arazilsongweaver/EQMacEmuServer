@@ -23,6 +23,7 @@
 #include <string>
 #include <list>
 #include <time.h>
+#include <algorithm>
 #include "../common/version.h"
 #include "textures.h"
 
@@ -1018,7 +1019,7 @@ struct ZoneChange_Struct {
 // Whatever you send to the client in RequestClientZoneChange_Struct.type, the client will send back
 // to the server in ZoneChange_Struct.zone_reason. My guess is this is a memo field of sorts.
 // This is a server initiated action, MSG_TELEPORT_PC, that will make the client zone to this location.
-// The function in the client will honor 99999.0 values to keep the current x/y/z position when it teleports itself
+// The function in the client will honor 999999.0 values to keep the current x/y/z position when it teleports itself
 struct RequestClientZoneChange_Struct {
 	/*000*/	uint32	zone_id;
 	/*004*/	float	y;
@@ -1159,10 +1160,21 @@ struct Consider_Struct
 			  return vz * 0.0625f;
 		  }
 
-		  // X and Y are reversed in this function to match the above
 		  uint32 SetValue(float vx, float vy, float vz)
 		  {
-			  value = ((int)(float)(vx * 16.0f) << 22) | (((int)(float)(vz * 16.0f) & 0x7FF) << 11) | ((int)(float)(vy * 16.0f) & 0x7FF);
+			  vx = std::clamp(vx, -32.0f, 31.0f);
+			  vy = std::clamp(vy, -64.0f, 63.0f);
+			  vz = std::clamp(vz, -64.0f, 63.0f);
+
+			  int32 x = static_cast<int32>(vx * 16.0f);
+			  int32 y = static_cast<int32>(vy * 16.0f);
+			  int32 z = static_cast<int32>(vz * 16.0f);
+
+			  uint32 x_bits = static_cast<uint32>(x) & 0x3FFu;
+			  uint32 y_bits = static_cast<uint32>(y) & 0x7FFu;
+			  uint32 z_bits = static_cast<uint32>(z) & 0x7FFu;
+
+			  value = (x_bits << 22) | (z_bits << 11) | y_bits;
 
 			  return value;
 		  }
@@ -1188,14 +1200,15 @@ struct PlayerPositionUpdates_Struct
 
 /*
 ** Spawn HP Update
-** Length: 10 Bytes
+** Length: 12 Bytes
 ** OpCode: OP_HPUpdate
 */
 struct SpawnHPUpdate_Struct
 {
-	/*000*/ uint32  spawn_id;		// Comment: Id of spawn to update
-	/*004*/ int32 cur_hp;		// Comment:  Current hp of spawn
-	/*008*/ int32 max_hp;		// Comment: Maximum hp of spawn
+	/*000*/ uint16 spawn_id; // entity id of spawn to update
+	/*002*/ uint8 _align02[2]; // struct alignment padding
+	/*004*/ int32 cur_hp; // for client's self hp this should not include the item HP, for everything else it's a percentage
+	/*008*/ int32 max_hp; // ignored for client's self hp, but real server sent the total max including item HP.  100 for npcs and other clients
 	/*012*/
 };
 
@@ -1204,13 +1217,6 @@ struct ManaUpdate_Struct
 /*00*/ uint16	spawn_id;
 /*02*/ uint16	cur_mana;
 /*04*/
-};
-
-struct SpawnHPUpdate_Struct2
-{
-/*00*/ int16	spawn_id;
-/*02*/ int8		hp;			//HP Percentage
-/*03*/
 };
 
 /*
@@ -1428,17 +1434,16 @@ struct GuildCommand_Struct {
 
 // Opcode OP_GMZoneRequest
 // Size = 88 bytes
-struct GMZoneRequest_Struct {
-/*0000*/	char	charname[64];
-/*0064*/	uint32	zone_id;
-/*0068*/	float	x;
-/*0072*/	float	y;
-/*0076*/	float	z;
-/*0080*/	float	heading;
-/*0084*/	uint32	success;		// 0 if command failed, 1 if succeeded?
-/*0088*/
-//	/*072*/	int8	success;		// =0 client->server, =1 server->client, -X=specific error
-//	/*073*/	uint8	unknown0073[3]; // =0 ok, =ffffff error
+struct GMZoneRequest_Struct
+{
+	/*0000*/ char charname[64];
+	/*0064*/ uint32 zone_id;
+	/*0068*/ float y;
+	/*0072*/ float x;
+	/*0076*/ float z;
+	/*0080*/ float heading;
+	/*0084*/ int32 result;
+	/*0088*/
 };
 
 struct GMSummon_Struct {
@@ -1996,30 +2001,22 @@ struct Resurrect_Struct {
 	/*092*/	char	rezzer_name[64];
 	/*156*/	int16	spellid;
 	/*158*/	char	corpse_name[64];
-	/*222*/	char	pad224[2];
+	/*222*/	char	_padding222[2];
 	/*224*/	uint32	action;
 	/*228*/
 };
 
+// The server sends Complete 0 to open the confirmation dialog.  An accepted reply only supplies the decision.
+// The server returns its saved packet with Complete 1 and the client performs the move.
 struct Translocate_Struct {
 /*000*/	uint32	ZoneID;
-/*004*/	uint32	SpellID;
-/*008*/	uint32	unknown008; //Heading ?
+/*004*/	int32	SpellID;
+/*008*/	int32	Response; // Present in the client schema, but unused by its handlers.
 /*012*/	char	Caster[64];
 /*076*/	float	y;
 /*080*/	float	x;
 /*084*/	float	z;
-/*088*/	uint32	Complete;
-};
-
-struct PendingTranslocate_Struct
-{
-	uint32 zone_id;
-	float heading;
-	float x;
-	float y;
-	float z;
-	uint32 spell_id;
+/*088*/	int32	Complete; // 0 opens the prompt, 1 accepts it, and -1 declines it.
 };
 
 struct Sacrifice_Struct {
