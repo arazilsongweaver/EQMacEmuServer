@@ -431,9 +431,8 @@ Mob::~Mob()
 
 	if(trade) {
 		Mob *with = trade->With();
-		if(with && with->IsClient()) {
-			with->CastToClient()->FinishTrade(with);
-			with->trade->Reset();
+		if(with && with != this && with->IsClient() && with->trade->GetWithID() == GetID()) {
+			with->CastToClient()->SendCancelTrade(this);
 		}
 		safe_delete(trade);
 	}
@@ -1685,7 +1684,7 @@ void Mob::SendAppearancePacket(uint32 type, uint32 value, bool WholeZone, bool i
 	if (WholeZone)
 		entity_list.QueueClients(this, outapp, iIgnoreSelf);
 	else if(specific_target != nullptr)
-		specific_target->QueuePacket(outapp, false, Client::CLIENT_CONNECTED);
+		specific_target->QueuePacket(outapp, true, Client::CLIENT_CONNECTED);
 	else if (this->IsClient())
 		this->CastToClient()->QueuePacket(outapp, true, Client::CLIENT_CONNECTED);
 	safe_delete(outapp);

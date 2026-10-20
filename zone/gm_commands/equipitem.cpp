@@ -11,9 +11,9 @@ void command_equipitem(Client *c, const Seperator *sep){
 		if (from_inst && from_inst->IsClassCommon()) {
 			auto outapp = new EQApplicationPacket(OP_MoveItem, sizeof(MoveItem_Struct));
 			MoveItem_Struct* mi = (MoveItem_Struct*)outapp->pBuffer;
-			mi->from_slot = EQ::invslot::slotCursor;
-			mi->to_slot = slot_id;
-			// mi->number_in_stack	= from_inst->GetCharges(); // replaced with con check for stacking
+			mi->from = EQ::invslot::slotCursor;
+			mi->to = slot_id;
+			// mi->qty	= from_inst->GetCharges(); // replaced with con check for stacking
 
 			// crude stackable check to only 'move' the difference count on client instead of entire stack when applicable
 			if (to_inst && to_inst->IsStackable() &&
@@ -21,17 +21,17 @@ void command_equipitem(Client *c, const Seperator *sep){
 				(to_inst->GetCharges() < EQMAC_STACKSIZE) &&
 				(from_inst->GetCharges() > EQMAC_STACKSIZE - to_inst->GetCharges())) {
 				movecount = EQMAC_STACKSIZE - to_inst->GetCharges();
-				mi->number_in_stack = (uint32)movecount;
+				mi->qty = (uint32)movecount;
 				partialmove = true;
 			}
 			else
-				mi->number_in_stack = from_inst->GetCharges();
+				mi->qty = from_inst->IsStackable() ? from_inst->GetCharges() : 0;
 
 			// Save move changes
 			// Added conditional check to packet send..would have sent change even on a swap failure..whoops!
 
 			if (partialmove) { // remove this con check if someone can figure out removing charges from cursor stack issue below
-				// mi->number_in_stack is always from_inst->GetCharges() when partialmove is false
+				// Whole nonstackable items use qty=0; stack moves carry a quantity.
 				c->Message(Chat::Red, "Error: Partial stack added to existing stack exceeds allowable stacksize");
 				safe_delete(outapp);
 				return;

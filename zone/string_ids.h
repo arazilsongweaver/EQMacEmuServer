@@ -78,6 +78,7 @@ namespace StringID {
 	const uint16 CAST_DAYTIME                   = 208; //Spell can only be cast during the day.
 	const uint16 CAST_NIGHTTIME                 = 209; //Spell can only be cast during the night.
 	const uint16 CANNOT_AFFECT_PC               = 210; //That spell can not affect this target PC.
+	const uint16 CAST_UPRIGHT_AND_STILL         = 213; //You must stand upright and still in order to cast!
 	const uint16 SPELL_NEED_TAR                 = 214; //You must first select a target for this spell!
 	const uint16 CORPSE_SUMMON_TAR              = 215; //You must first target a living group member whose corpse you wish to summon.
 	const uint16 ONLY_ON_CORPSES                = 221; //This spell only works on corpses.

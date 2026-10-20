@@ -1282,16 +1282,8 @@ bool Client::Death(Mob* killerMob, int32 damage, uint16 spell, EQ::skills::Skill
 	// We're in the middle of a trade and are not leaving a corpse.
 	if (trade && (GetGM() || !RuleB(Character, LeaveCorpses) || GetLevel() < RuleI(Character, DeathItemLossLevel)))
 	{
-		Mob *with = trade->With();
-		if (with && with->IsClient()) 
-		{
-			LogTrading("Canceling trade with [{}] due to death.", with->GetName());
-			FinishTrade(this);
-			trade->Reset();
-
-			with->CastToClient()->FinishTrade(with);
-			with->trade->Reset();
-		}
+		CancelTradeSession(GetID(), false);
+		CancelPendingTradeRequests();
 	}
 
 	int exploss = 0;
@@ -2445,8 +2437,8 @@ void Mob::DamageShield(Mob* attacker, bool spell_ds) {
 		cds->target = targetid;
 		cds->source = GetID();
 		cds->type = spellbonuses.DamageShieldType;
-		cds->spellid = spellid;
-		cds->damage = DS;
+		cds->spellid = SPELL_UNKNOWN;
+		cds->damage = DS; // this should be inverted as seen in packet captures but needs the ordering changed to avoid double subtracting on the client side
 
 		if (attacker && !attacker->HasDied())
 		{

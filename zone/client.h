@@ -298,6 +298,10 @@ public:
 		bool finalizer = false,
 		void *event_entry = nullptr
 	);
+	void	RefundOwnTrade();
+	void	CancelTradeSession(uint16 cancelled_by_id, bool notify_self = true);
+	void	CancelPendingTradeRequests();
+	bool	CanReceiveTradeMoney(const Trade& offer) const;
 	void	SendZonePoints();
 
 	void FillSpawnStruct(NewSpawn_Struct* ns, Mob* ForWho);
@@ -401,7 +405,7 @@ public:
 	const int32& SetMana(int32 amount);
 	int32 CalcManaRegenCap();
 
-	void ServerFilter(SetServerFilter_Struct* filter);
+	void ServerFilter(const UpdateFilters_Struct* filter);
 	void BulkSendTraderInventory(uint32 char_id);
 	void DisplayTraderInventory(Client* client);
 	void SendSingleTraderItem(uint32 char_id, int16 islotid, uint16 slotid);
@@ -556,6 +560,7 @@ public:
 	void	AddLevelBasedExp(uint8 exp_percentage, uint8 max_level=0);
 	void	InspectBuffs(Client* Inspector, int Rank);
 	virtual void SetLevel(uint8 set_level, bool command = false);
+	int		CalcExpLoss();
 	void	GetExpLoss(Mob* attacker, uint16 spell, int &exploss, uint8 killedby = 0);
 	uint32  GetEXPForLevel(uint16 level, bool aa = false);
 	bool	IsInExpRange(Mob* defender);
@@ -791,8 +796,20 @@ public:
 	bool	IsBankSlot(uint32 slot);
 
 	inline bool IsTrader() const { return(Trader); }
-	eqFilterMode GetFilter(eqFilterType filter_id) const { return ClientFilters[filter_id]; }
-	void SetFilter(eqFilterType filter_id, eqFilterMode filter_mode) { ClientFilters[filter_id] = filter_mode; }
+	bool IsServerFilterEnabled() const { return server_filter_enabled_; }
+	eqFilterMode GetFilter(eqFilterType filter_id) const {
+		// Keep the selections, but bypass every existing filter check while disabled.
+		return IsServerFilterEnabled() ? GetFilterSetting(filter_id) : FilterShow;
+	}
+	eqFilterMode GetFilterSetting(eqFilterType filter_id) const {
+		return filter_id != FilterNone && static_cast<unsigned>(filter_id) < _FilterCount
+			? ClientFilters[filter_id] : FilterShow;
+	}
+	void SetFilter(eqFilterType filter_id, eqFilterMode filter_mode) {
+		if (filter_id != FilterNone && static_cast<unsigned>(filter_id) < _FilterCount) {
+			ClientFilters[filter_id] = filter_mode;
+		}
+	}
 
 	void LeaveGroup();
 
@@ -1120,6 +1137,7 @@ protected:
 
 private:
 	eqFilterMode ClientFilters[_FilterCount];
+	bool server_filter_enabled_;
 	int32 HandlePacket(const EQApplicationPacket *app);
 	void OPTGB(const EQApplicationPacket *app);
 	void OPRezzAnswer(const EQApplicationPacket *app);

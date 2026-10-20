@@ -161,7 +161,8 @@ Client::Client(std::unique_ptr<RDPStream> stream) : Mob(
 	m_AutoAttackTargetLocation(0.0f, 0.0f, 0.0f),
 	m_stream(std::move(stream))
 {
-	for (auto client_filter = FilterNone; client_filter < _FilterCount; client_filter = eqFilterType(client_filter + 1)) {
+	server_filter_enabled_ = false;
+	for (auto client_filter = FilterDamageShields; client_filter < _FilterCount; client_filter = eqFilterType(client_filter + 1)) {
 		SetFilter(client_filter, FilterShow);
 	}
 	for (int aa_ix = 0; aa_ix < MAX_PP_AA_ARRAY; aa_ix++) { 
@@ -440,8 +441,8 @@ void Client::SendLogoutPackets()
 {
 	auto outapp = new EQApplicationPacket(OP_CancelTrade, sizeof(CancelTrade_Struct));
 	auto cancel = reinterpret_cast<CancelTrade_Struct *>(outapp->pBuffer);
-	cancel->fromid = GetID();
-	cancel->action = groupActUpdate;
+	cancel->target = GetID();
+	cancel->source = 0;
 	FastQueuePacket(&outapp);
 }
 
@@ -452,19 +453,11 @@ void Client::SendLogoutReply()
 	FastQueuePacket(&reply);
 }
 
-void Client::SendCancelTrade(Mob* with) {
-
-	auto outapp = new EQApplicationPacket(OP_CancelTrade, sizeof(CancelTrade_Struct));
-	CancelTrade_Struct* ct = (CancelTrade_Struct*) outapp->pBuffer;
-	ct->fromid = with->GetID();
-	FastQueuePacket(&outapp);
-
-	outapp = new EQApplicationPacket(OP_TradeReset, 0);
-	QueuePacket(outapp);
-	safe_delete(outapp);
-
-	FinishTrade(this);
-	trade->Reset();
+void Client::SendCancelTrade(Mob* with)
+{
+	CancelTradeSession(with ? with->GetID() : 0);
+	EQApplicationPacket reset(OP_TradeReset, 0);
+	QueuePacket(&reset);
 }
 
 void Client::ReportConnectingState() {
@@ -2137,10 +2130,10 @@ void Client::QuestReadBook(const char* text, uint8 type) {
 }
 
 void Client::SendClientMoneyUpdate(uint8 type,uint32 amount){
-	auto outapp = new EQApplicationPacket(OP_TradeMoneyUpdate, sizeof(TradeMoneyUpdate_Struct));
-	TradeMoneyUpdate_Struct* mus= (TradeMoneyUpdate_Struct*)outapp->pBuffer;
-	mus->amount=amount;
-	mus->trader=0;
+	auto outapp = new EQApplicationPacket(OP_TradeMoneyUpdate, sizeof(TradeMoney_Struct));
+	TradeMoney_Struct* mus= (TradeMoney_Struct*)outapp->pBuffer;
+	mus->amt=amount;
+	mus->id=0;
 	mus->type=type;
 	QueuePacket(outapp);
 	safe_delete(outapp);
@@ -2826,9 +2819,9 @@ bool Client::BindWound(uint16 bindmob_id, bool start, bool fail)
 					// delete item on cursor in client
 					auto app = new EQApplicationPacket(OP_DeleteCharge, sizeof(MoveItem_Struct));
 					MoveItem_Struct* delitem = (MoveItem_Struct*)app->pBuffer;
-					delitem->from_slot = EQ::invslot::slotCursor;
-					delitem->to_slot = 0xFFFFFFFF;
-					delitem->number_in_stack = 0xFFFFFFFF;
+					delitem->from = EQ::invslot::slotCursor;
+					delitem->to = -1;
+					delitem->qty = -1;
 					QueuePacket(app);
 					safe_delete(app);
 					// send to client new cursor item with updated charges.
@@ -3013,90 +3006,65 @@ void Client::SetMaterial(int16 in_slot, uint32 item_id) {
 	}
 }
 
-void Client::ServerFilter(SetServerFilter_Struct* filter){
+void Client::ServerFilter(const UpdateFilters_Struct* filter)
+{
+	server_filter_enabled_ = filter->server_filter == 1;
 
-/*	this code helps figure out the filter IDs in the packet if needed
-	static SetServerFilter_Struct ssss;
-	int r;
-	uint32 *o = (uint32 *) &ssss;
-	uint32 *n = (uint32 *) filter;
-	for(r = 0; r < (sizeof(SetServerFilter_Struct)/4); r++) {
-		if(*o != *n)
-			LogDebugDetail("Filter [{}] changed from [{}] to [{}]", r, *o, *n);
-		o++; n++;
-	}
-	memcpy(&ssss, filter, sizeof(SetServerFilter_Struct));
-*/
-#define Filter0(type) \
-	if(filter->filters[type] == 1) \
-		SetFilter(type, FilterShow); \
-	else \
-		SetFilter(type, FilterHide);
-#define Filter1(type) \
-	if(filter->filters[type] == 0) \
-		SetFilter(type, FilterShow); \
-	else \
-		SetFilter(type, FilterHide);
+	SetFilter(FilterDamageShields, filter->dmgshields == 0 ? FilterShow : FilterHide);
+	SetFilter(FilterNPCSpells, filter->npcspells == 0 ? FilterShow : FilterHide);
+	SetFilter(FilterGuildChat, filter->guild_chat == 1 ? FilterShow : FilterHide);
+	SetFilter(FilterSocials, filter->socials == 1 ? FilterShow : FilterHide);
+	SetFilter(FilterGroupChat, filter->group_chat == 1 ? FilterShow : FilterHide);
+	SetFilter(FilterShouts, filter->shouts == 1 ? FilterShow : FilterHide);
+	SetFilter(FilterAuctions, filter->auctions == 1 ? FilterShow : FilterHide);
+	SetFilter(FilterOOC, filter->oocs == 1 ? FilterShow : FilterHide);
+	SetFilter(FilterMyMisses, filter->my_misses == 1 ? FilterShow : FilterHide);
+	SetFilter(FilterOthersMiss, filter->other_miss == 1 ? FilterShow : FilterHide);
+	SetFilter(FilterOthersHit, filter->other_hit == 1 ? FilterShow : FilterHide);
+	SetFilter(FilterMissedMe, filter->atk_miss_me == 1 ? FilterShow : FilterHide);
 
-	Filter1(FilterNone);
-	Filter0(FilterGuildChat);
-	Filter0(FilterSocials);
-	Filter0(FilterGroupChat);
-	Filter0(FilterShouts);
-	Filter0(FilterAuctions);
-	Filter0(FilterOOC);
-
-	if (filter->filters[FilterPCSpells] == 0) {
+	if (filter->pcspells == 0) {
 		SetFilter(FilterPCSpells, FilterShow);
 	}
-	else if (filter->filters[FilterPCSpells] == 1) {
+	else if (filter->pcspells == 1) {
 		SetFilter(FilterPCSpells, FilterHide);
 	}
 	else {
 		SetFilter(FilterPCSpells, FilterShowGroupOnly);
 	}
 
-	//This filter is bugged client side (the client won't toggle the value when the button is pressed.)
-	Filter1(FilterNPCSpells);
-
-	if (filter->filters[FilterBardSongs] == 0) {
+	if (filter->bardsongs == 0) {
 		SetFilter(FilterBardSongs, FilterShow);
 	}
-	else if (filter->filters[FilterBardSongs] == 1) {
+	else if (filter->bardsongs == 1) {
 		SetFilter(FilterBardSongs, FilterShowSelfOnly);
 	}
-	else if (filter->filters[FilterBardSongs] == 2) {
+	else if (filter->bardsongs == 2) {
 		SetFilter(FilterBardSongs, FilterShowGroupOnly);
 	}
 	else {
 		SetFilter(FilterBardSongs, FilterHide);
 	}
 
-	if (filter->filters[FilterSpellCrits] == 0) {
+	if (filter->criticalspells == 0) {
 		SetFilter(FilterSpellCrits, FilterShow);
 	}
-	else if (filter->filters[FilterSpellCrits] == 1) {
+	else if (filter->criticalspells == 1) {
 		SetFilter(FilterSpellCrits, FilterShowSelfOnly);
 	}
 	else {
 		SetFilter(FilterSpellCrits, FilterHide);
 	}
 
-	if (filter->filters[FilterMeleeCrits] == 0) {
+	if (filter->criticalmelee == 0) {
 		SetFilter(FilterMeleeCrits, FilterShow);
 	}
-	else if (filter->filters[FilterMeleeCrits] == 1) {
+	else if (filter->criticalmelee == 1) {
 		SetFilter(FilterMeleeCrits, FilterShowSelfOnly);
 	}
 	else {
 		SetFilter(FilterMeleeCrits, FilterHide);
 	}
-
-	Filter0(FilterMyMisses);
-	Filter0(FilterOthersMiss);
-	Filter0(FilterOthersHit);
-	Filter0(FilterMissedMe);
-	Filter1(FilterDamageShields);
 }
 
 // this version is for messages with no parameters
@@ -3366,23 +3334,8 @@ void Client::LinkDead()
 	ClearPendingZoneTransfer();
 	CloseStream(RDPConnectionDisposition::Linkdead, 0);
 
-	Mob *trade_partner = trade->With();
-	if (trade_partner)
-	{
-		LogTrading("Canceling trade with [{}] due to linkdead.", trade_partner->GetName());
-
-		if (trade_partner->IsClient())
-		{
-			trade_partner->CastToClient()->SendCancelTrade(this);
-		}
-		else
-		{
-			trade_partner->trade->Reset();
-		}
-
-		FinishTrade(this);
-		trade->Reset();
-	}
+	CancelTradeSession(GetID(), false);
+	CancelPendingTradeRequests();
 
 	uint16 corpse_id = IsLooting();
 	if (corpse_id != 0)
@@ -3579,27 +3532,7 @@ void Client::Sacrifice(Mob *caster)
 
 	if(GetLevel() >= RuleI(Spells, SacrificeMinLevel) && GetLevel() <= RuleI(Spells, SacrificeMaxLevel)){
 		
-		float loss;
-		uint8 level = GetLevel();
-		if (level >= 1 && level <= 30)
-			loss = 0.08f;
-		if (level >= 31 && level <= 35)
-			loss = 0.075f;
-		if (level >= 36 && level <= 40)
-			loss = 0.07f;
-		if (level >= 41 && level <= 45)
-			loss = 0.065f;
-		if (level >= 46 && level <= 58)
-			loss = 0.06f;
-		if (level == 59)
-			loss = 0.05f;
-		if (level == 60)
-			loss = 0.16f;
-		if (level >= 61)
-			loss = 0.07f;
-
-		int requiredxp = GetEXPForLevel(level + 1) - GetEXPForLevel(level);
-		int exploss = (int)((float)requiredxp * (loss * RuleR(Character, EXPLossMultiplier)));
+		int exploss = CalcExpLoss();
 
 		if(exploss < GetEXP()){
 			SetEXP(GetEXP()-exploss, GetAAXP());
@@ -5421,7 +5354,7 @@ void Client::QuestReward(Mob* target, int32 copper, int32 silver, int32 gold, in
 	if (exp > 0)
 		AddQuestEXP(exp);
 
-	QueuePacket(outapp, false, Client::CLIENT_CONNECTED);
+	QueuePacket(outapp, true, Client::CLIENT_CONNECTED);
 	safe_delete(outapp);
 }
 
@@ -5457,7 +5390,7 @@ void Client::QuestReward(Mob* target, const QuestReward_Struct& reward)
 	if (reward.exp_reward > 0)
 		AddQuestEXP(reward.exp_reward);
 
-	QueuePacket(outapp, false, Client::CLIENT_CONNECTED);
+	QueuePacket(outapp, true, Client::CLIENT_CONNECTED);
 	safe_delete(outapp);
 }
 

@@ -65,30 +65,79 @@ void Trade::Reset()
 	cp = 0;
 }
 
-// Initiate a trade with another mob
-// initiate_with specifies whether to start trade with other mob as well
-void Trade::Request(uint32 mob_id)
+bool Trade::HasOffers() const
 {
+	if (pp || gp || sp || cp)
+		return true;
+	if (owner && owner->IsClient()) {
+		for (int16 slot = EQ::invslot::TRADE_BEGIN; slot <= EQ::invslot::TRADE_END; ++slot) {
+			if (owner->CastToClient()->GetInv().GetItem(slot))
+				return true;
+		}
+	}
+	return false;
+}
+
+bool Trade::CanRequest(uint32 mob_id) const
+{
+	return owner && owner->IsClient() && mob_id && mob_id != owner->GetID() &&
+		!HasOffers() && ((state == TradeNone && !with_id) || state == Requesting);
+}
+
+bool Trade::CanStart(uint32 mob_id) const
+{
+	if (!owner || !mob_id || mob_id == owner->GetID())
+		return false;
+	// NPC bookkeeping is shared by independent player handins.
+	if (!owner->IsClient())
+		return owner->IsNPC();
+	return CanRequest(mob_id) && (state == TradeNone || with_id == mob_id);
+}
+
+bool Trade::IsActiveWith(Mob* other) const
+{
+	if (!owner || !other || other == owner || with_id != other->GetID() ||
+		(state != Trading && state != TradeAccepted))
+		return false;
+	if (other->IsClient())
+		return other->trade->with_id == owner->GetID() &&
+			(other->trade->state == Trading || other->trade->state == TradeAccepted);
+	return other->IsNPC();
+}
+
+bool Trade::Request(uint32 mob_id)
+{
+	Mob* other = entity_list.GetMob(mob_id);
+	if (!other || !other->IsClient() || !CanRequest(mob_id) ||
+		!other->trade->CanStart(owner->GetID()))
+		return false;
+	if (state == Requesting && with_id != mob_id)
+		owner->CastToClient()->CancelTradeSession(owner->GetID(), false);
 	Reset();
 	state = Requesting;
 	with_id = mob_id;
+	return true;
 }
 
 // Initiate a trade with another mob
 // initiate_with specifies whether to start trade with other mob as well
-void Trade::Start(uint32 mob_id, bool initiate_with)
+bool Trade::Start(uint32 mob_id, bool initiate_with)
 {
+	Mob* other = entity_list.GetMob(mob_id);
+	if (!other || (!other->IsClient() && !other->IsNPC()) || !CanStart(mob_id) ||
+		(initiate_with && !other->trade->CanStart(owner->GetID())))
+		return false;
+	// Validate both sides before either Reset can discard an existing offer.
 	Reset();
 	state = Trading;
 	with_id = mob_id;
 
-	// Autostart on other mob?
 	if (initiate_with) {
-		Mob *with = With();
-		if (with) {
-			with->trade->Start(owner->GetID(), false);
-		}
+		other->trade->Reset();
+		other->trade->state = Trading;
+		other->trade->with_id = owner->GetID();
 	}
+	return true;
 }
 
 // Add item from a given slot to trade bucket (automatically does bag data too)
@@ -101,12 +150,9 @@ void Trade::AddEntity(uint16 trade_slot_id, uint32 stack_size) {
 		return;
 	}
 
-	// If one party accepted the trade then an item was added, their state needs to be reset
-	owner->trade->state = Trading;
 	Mob* with = With();
-	if (with) {
-		with->trade->state = Trading;
-	}
+	if (!IsActiveWith(with))
+		return;
 
 	// Item always goes into trade bucket from cursor
 	Client* client = owner->CastToClient();
@@ -158,11 +204,69 @@ void Trade::AddEntity(uint16 trade_slot_id, uint32 stack_size) {
 
 		LogTrading("[{}] added item [{}] to trade slot [{}]", owner->GetName(), inst->GetItem()->Name, trade_slot_id);
 		
-		client->PutItemInInventory(trade_slot_id, *inst);
+		if (!client->PutItemInInventory(trade_slot_id, *inst))
+			return;
 		client->DeleteItemInInventory(EQ::invslot::slotCursor);
 		
-		SendItemData(inst, trade_slot_id);
+		SendItemData(client->GetInv().GetItem(trade_slot_id), trade_slot_id);
 	}
+	// Failed item changes must not invalidate either player's acceptance.
+	state = Trading;
+	if (with->IsClient())
+		with->trade->state = Trading;
+}
+
+// check for overflow
+bool Client::CanReceiveTradeMoney(const Trade& offer) const
+{
+	const int32 wallet[] = {m_pp.copper, m_pp.silver, m_pp.gold, m_pp.platinum};
+	const int32 coins[] = {offer.cp, offer.sp, offer.gp, offer.pp};
+	for (int i = 0; i < 4; ++i) {
+		if (wallet[i] < 0 || coins[i] < 0 || int64(wallet[i]) + coins[i] > INT_MAX)
+			return false;
+	}
+	return true;
+}
+
+void Client::RefundOwnTrade()
+{
+	FinishTrade(this);
+	trade->Reset();
+}
+
+void Client::CancelPendingTradeRequests()
+{
+	// A request recipient has no local with_id until its acknowledgement.
+	// Clear requesters too when this character leaves before that handshake.
+	for (const auto& entry : entity_list.GetClientList()) {
+		Client* requester = entry.second;
+		if (requester != this && requester->trade->state == Requesting &&
+			requester->trade->GetWithID() == GetID())
+			requester->CancelTradeSession(GetID());
+	}
+}
+
+void Client::CancelTradeSession(uint16 cancelled_by_id, bool notify_self)
+{
+	if (!trade || (trade->state == TradeNone && !trade->GetWithID() && !trade->HasOffers()))
+		return;
+	Mob* with = trade->With();
+	Client* other = with && with != this && with->IsClient() ? with->CastToClient() : nullptr;
+	const bool owns_other = other && other->trade->GetWithID() == GetID();
+	const bool pending_recipient = other && trade->state == Requesting && other->trade->state == TradeNone && !other->trade->GetWithID();
+
+	EQApplicationPacket response(OP_CancelTrade, sizeof(CancelTrade_Struct));
+	auto cancel = reinterpret_cast<CancelTrade_Struct*>(response.pBuffer);
+	cancel->target = cancelled_by_id;
+	cancel->source = 0;
+	if (owns_other) {
+		other->RefundOwnTrade();
+	}
+	if (owns_other || pending_recipient)
+		other->QueuePacket(&response);
+	if (notify_self)
+		QueuePacket(&response);
+	RefundOwnTrade();
 }
 
 // Retrieve mob the owner is trading with

@@ -336,16 +336,6 @@ struct MerchantItemsPacket_Struct
 	/*002*/	struct Item_Struct	item;
 };
 
-struct TradeItemsPacket_Struct
-{
-	/*000*/	uint16 fromid;
-	/*002*/	uint16 slotid;
-	/*004*/	uint8  unknown;
-	/*005*/	struct Item_Struct	item;
-	/*000*/	uint8 unknown1[5];
-	/*000*/	
-};
-
 struct PickPocket_Struct 
 {
 // Size 18
@@ -371,21 +361,6 @@ struct MerchantItems_Struct
 {
 	/*000*/	int16		count;	
 	/*002*/	struct MerchantItemsPacket_Struct packets[0];
-};
-
-struct MoveItem_Struct
-{
-	/*000*/ uint32 from_slot; 
-	/*004*/ uint32 to_slot;
-	/*008*/ uint32 number_in_stack;
-	/*012*/	
-};
-
-struct CancelTrade_Struct 
-{ 
-	/*000*/	uint16 fromid;
-	/*002*/	uint16 action;
-	/*004*/	
 };
 
 struct Merchant_Click_Struct 

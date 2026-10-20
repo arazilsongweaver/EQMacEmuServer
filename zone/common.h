@@ -422,11 +422,15 @@ public:
 	virtual ~Trade();
 
 	void Reset();
-	void Request(uint32 mob_id);
+	bool Request(uint32 mob_id);
+	bool HasOffers() const;
+	bool CanRequest(uint32 mob_id) const;
+	bool CanStart(uint32 mob_id) const;
+	bool IsActiveWith(Mob* other) const;
 
 	// Initiate a trade with another mob
 	// Also puts other mob into trader mode with this mob
-	void Start(uint32 mob_id, bool initiate_with=true);
+	bool Start(uint32 mob_id, bool initiate_with=true);
 
 	// Mob the owner is trading with
 	Mob* With();

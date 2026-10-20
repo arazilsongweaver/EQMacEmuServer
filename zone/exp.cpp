@@ -354,13 +354,13 @@ void Client::AddEXP(uint32 in_add_exp, uint8 conlevel, Mob* killed_mob, int16 av
 		// Race modifiers apply to AA exp if AA exp is split
 		if (RuleB(AlKabor, RaceEffectsAASplit) && m_epp.perAA > 0 && m_epp.perAA < 100)
 		{
-			if (GetRace() == Race::Halfling)
+			if (GetBaseRace() == Race::Halfling)
 				race_mult = 1.05f;
-			else if (GetRace() == Race::Barbarian)
+			else if (GetBaseRace() == Race::Barbarian)
 				race_mult = 0.95f;
-			else if (GetRace() == Race::Ogre)
+			else if (GetBaseRace() == Race::Ogre)
 				race_mult = 0.85f;
-			else if (GetRace() == Race::Troll || GetRace() == Race::Iksar)
+			else if (GetBaseRace() == Race::Troll || GetBaseRace() == Race::Iksar)
 				race_mult = 0.8f;
 		}
 
@@ -1273,14 +1273,14 @@ bool Client::IsInLevelRange(uint8 maxlevel)
 	return false;
 }
 
-void Client::GetExpLoss(Mob* killerMob, uint16 spell, int &exploss, uint8 killedby)
+int Client::CalcExpLoss()
 {
 	if (GetLevel() < 2)
 	{
-		exploss = 0;
-		return;
+		return 0;
 	}
 	int last_level_xp = GetEXPForLevel(GetLevel()) - GetEXPForLevel(GetLevel() - 1);
+	int exploss;
 	if (GetLevel() >= 25)
 		exploss = last_level_xp / 4;
 	else
@@ -1295,6 +1295,13 @@ void Client::GetExpLoss(Mob* killerMob, uint16 spell, int &exploss, uint8 killed
 		exploss /= 2;					// these post-hell levels had double exp loss until March 19 2002
 
 	exploss = static_cast<int>(static_cast<float>(exploss) * RuleR(Character, EXPLossMultiplier));
+
+	return exploss;
+}
+
+void Client::GetExpLoss(Mob* killerMob, uint16 spell, int &exploss, uint8 killedby)
+{
+	exploss = CalcExpLoss();
 
 	// Death exp loss started at level 6 until March 19 2002, then it was 11
 	if( (level < RuleI(Character, DeathExpLossLevel)) || (level > RuleI(Character, DeathExpLossMaxLevel)) || IsBecomeNPC() )

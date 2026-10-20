@@ -446,23 +446,25 @@ enum ZoneChangeReason : int32
 };
 
 typedef enum {
-	FilterDamageShields = 0,	//0 is on 1 is off
-	FilterNPCSpells = 1,		//0 is on - doesn't send packet	
-	FilterPCSpells = 2,			//0 is on 1 is off 2 is group
-	FilterBardSongs = 3,		//0 is on 1 is self 2 is group 3 is off
-	FilterNone = 4,				//0 is on
-	FilterGuildChat = 5,		//0 is off 1 is on		
-	FilterSocials = 6,			//0 is off 1 is on
-	FilterGroupChat = 7,		//0 is off 1 is on	
-	FilterShouts = 8,		    //0 is off 1 is on
-	FilterAuctions = 9,		    //0 is off 1 is on
-	FilterOOC = 10,				//0 is off 1 is on
-	FilterMyMisses = 11,		//0 is off 1 is on
-	FilterOthersMiss = 12,		//0 is off 1 is on
-	FilterOthersHit = 13,		//0 is off 1 is on
-	FilterMissedMe = 14,		//0 is off 1 is on
-	FilterSpellCrits = 15,		//0 is on 1 is self 2 is off
-	FilterMeleeCrits = 16,		//0 is on 1 is self 2 is off
+	// Keep existing category IDs, including Lua's numeric API.
+	// Wire fields are decoded explicitly from UpdateFilters_Struct.
+	FilterDamageShields = 0,
+	FilterNPCSpells = 1,
+	FilterPCSpells = 2,
+	FilterBardSongs = 3,
+	FilterNone = 4, // No filtering; its array slot is unused, not server_filter.
+	FilterGuildChat = 5,
+	FilterSocials = 6,
+	FilterGroupChat = 7,
+	FilterShouts = 8,
+	FilterAuctions = 9,
+	FilterOOC = 10,
+	FilterMyMisses = 11,
+	FilterOthersMiss = 12,
+	FilterOthersHit = 13,
+	FilterMissedMe = 14,
+	FilterSpellCrits = 15,
+	FilterMeleeCrits = 16,
 	_FilterCount
 } eqFilterType;
 

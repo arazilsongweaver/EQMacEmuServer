@@ -657,19 +657,8 @@ void Client::FinishRemoval()
 {
 	CloseTraderSession();
 
-	Mob *Other = trade->With();
-	if(Other)
-	{
-		LogTradingDetail("Client disconnected during a trade. Returning their items.");
-		FinishTrade(this);
-
-		if(Other->IsClient())
-			Other->CastToClient()->FinishTrade(Other);
-
-		/* Reset both sides of the trade */
-		trade->Reset();
-		Other->trade->Reset();
-	}
+	CancelTradeSession(GetID(), false);
+	CancelPendingTradeRequests();
 
 	database.SetFirstLogon(CharacterID(), 0); //We change firstlogon status regardless of if a player logs out to zone or not, because we only want to trigger it on their first login from world.
 
@@ -1336,13 +1325,14 @@ static uint64 CoinTypeCoppers(uint32 type) {
 
 void Client::OPMoveCoin(const EQApplicationPacket* app)
 {
-	MoveCoin_Struct* mc = (MoveCoin_Struct*)app->pBuffer;
-	uint64 value = 0, amount_to_take = 0, amount_to_add = 0;
+	const auto mc = reinterpret_cast<const MoveMoney_Struct*>(app->pBuffer);
+	uint64 amount_to_take = 0, amount_to_add = 0;
 	int32 *from_bucket = 0, *to_bucket = 0;
 	Mob* trader = trade->With();
 
-	// if amount < 0, client is sending a malicious packet
-	if (mc->amount < 0)
+	// Only -1 is intentional destruction. An unknown destination must not debit.
+	if (mc->amt <= 0 || mc->from < 0 || mc->from > 2 || mc->to < -1 || mc->to > 3 ||
+		(mc->to == 3 && trade->state == TradeCompleting))
 	{
 		return;
 	}
@@ -1351,23 +1341,23 @@ void Client::OPMoveCoin(const EQApplicationPacket* app)
 	if
 	(
 		(
-			mc->cointype1 != COINTYPE_PP &&
-			mc->cointype1 != COINTYPE_GP &&
-			mc->cointype1 != COINTYPE_SP &&
-			mc->cointype1 != COINTYPE_CP
+			mc->typeFrom != COINTYPE_PP &&
+			mc->typeFrom != COINTYPE_GP &&
+			mc->typeFrom != COINTYPE_SP &&
+			mc->typeFrom != COINTYPE_CP
 		) ||
 		(
-			mc->cointype2 != COINTYPE_PP &&
-			mc->cointype2 != COINTYPE_GP &&
-			mc->cointype2 != COINTYPE_SP &&
-			mc->cointype2 != COINTYPE_CP
+			mc->typeTo != COINTYPE_PP &&
+			mc->typeTo != COINTYPE_GP &&
+			mc->typeTo != COINTYPE_SP &&
+			mc->typeTo != COINTYPE_CP
 		)
 	)
 	{
 		return;
 	}
 
-	switch(mc->from_slot)
+	switch(mc->from)
 	{
 		case -1:	// destroy
 		{
@@ -1377,7 +1367,7 @@ void Client::OPMoveCoin(const EQApplicationPacket* app)
 		}
 		case 0:	// cursor
 		{
-			switch(mc->cointype1)
+			switch(mc->typeFrom)
 			{
 				case COINTYPE_PP:
 					from_bucket = (int32 *) &m_pp.platinum_cursor; break;
@@ -1392,7 +1382,7 @@ void Client::OPMoveCoin(const EQApplicationPacket* app)
 		}
 		case 1:	// inventory
 		{
-			switch(mc->cointype1)
+			switch(mc->typeFrom)
 			{
 				case COINTYPE_PP:
 					from_bucket = (int32 *) &m_pp.platinum; break;
@@ -1420,7 +1410,7 @@ void Client::OPMoveCoin(const EQApplicationPacket* app)
 				return;
 			}
 
-			switch(mc->cointype1)
+			switch(mc->typeFrom)
 			{
 				case COINTYPE_PP:
 					from_bucket = (int32 *) &m_pp.platinum_bank; break;
@@ -1440,7 +1430,7 @@ void Client::OPMoveCoin(const EQApplicationPacket* app)
 		}
 	}
 
-	switch(mc->to_slot)
+	switch(mc->to)
 	{
 		case -1:	// destroy
 		{
@@ -1449,7 +1439,7 @@ void Client::OPMoveCoin(const EQApplicationPacket* app)
 		}
 		case 0:	// cursor
 		{
-			switch(mc->cointype2)
+			switch(mc->typeTo)
 			{
 				case COINTYPE_PP:
 					to_bucket = (int32 *) &m_pp.platinum_cursor; break;
@@ -1464,7 +1454,7 @@ void Client::OPMoveCoin(const EQApplicationPacket* app)
 		}
 		case 1:	// inventory
 		{
-			switch(mc->cointype2)
+			switch(mc->typeTo)
 			{
 				case COINTYPE_PP:
 					to_bucket = (int32 *) &m_pp.platinum; break;
@@ -1490,7 +1480,7 @@ void Client::OPMoveCoin(const EQApplicationPacket* app)
 				RecordPlayerEventLog(PlayerEvent::POSSIBLE_HACK, PlayerEvent::PossibleHackEvent{ .message = message });
 				return;
 			}
-			switch(mc->cointype2)
+			switch(mc->typeTo)
 			{
 				case COINTYPE_PP:
 					to_bucket = (int32 *) &m_pp.platinum_bank; break;
@@ -1507,7 +1497,7 @@ void Client::OPMoveCoin(const EQApplicationPacket* app)
 		{
 			// we have to move the coin, with or without a trader.  Otherwise the coin gets lost
 			// check later after coin movements done if there is a trader and cancel trade as necessary.
-			switch(mc->cointype2)
+			switch(mc->typeTo)
 				{
 					case COINTYPE_PP:
 						to_bucket = (int32 *) &trade->pp; break;
@@ -1522,83 +1512,63 @@ void Client::OPMoveCoin(const EQApplicationPacket* app)
 		}
 	}
 
-	if(!from_bucket)
+	if(!from_bucket || *from_bucket < 0 || from_bucket == to_bucket)
 	{
 		return;
 	}
 
 	// don't allow them to go into negatives (from our point of view)
-	amount_to_take = *from_bucket < mc->amount ? *from_bucket : mc->amount;
+	amount_to_take = *from_bucket < mc->amt ? *from_bucket : mc->amt;
 
 	// if you move 11 gold into a bank platinum location, the packet
 	// will say 11, but the client will have 1 left on their cursor, so we have
 	// to figure out the conversion ourselves
 	amount_to_add = amount_to_take;
-	amount_to_add *= CoinTypeCoppers(mc->cointype1);
-	amount_to_add /= CoinTypeCoppers(mc->cointype2);
+	amount_to_add *= CoinTypeCoppers(mc->typeFrom);
+	amount_to_add /= CoinTypeCoppers(mc->typeTo);
 
 	// the amount we're adding could be different than what was requested, so
 	// we have to adjust the amount we take as well
 	amount_to_take = amount_to_add;
-	amount_to_take *= CoinTypeCoppers(mc->cointype2);
-	amount_to_take /= CoinTypeCoppers(mc->cointype1);
+	amount_to_take *= CoinTypeCoppers(mc->typeTo);
+	amount_to_take /= CoinTypeCoppers(mc->typeFrom);
 	// now we should have a from_bucket, a to_bucket, an amount_to_take
 	// and an amount_to_add
 
 	if (amount_to_take > *from_bucket) {
-		// we have a chance to go negative
-		// something went wrong
-		FinishTrade(this);
-		trade->Reset();
-		auto canceltrade = new EQApplicationPacket(OP_CancelTrade, sizeof(CancelTrade_Struct));
-		CancelTrade_Struct* ct = (CancelTrade_Struct*)canceltrade->pBuffer;
-		ct->fromid = 0;
-		ct->action = 1;
-		FastQueuePacket(&canceltrade);
+		CancelTradeSession(0);
 		Kick();
 		return;
 	}
 	if (to_bucket)
 	{
 		uint64 new_total = *to_bucket + amount_to_add;
-		if (new_total > INT_MAX) {
-			// overflow - dont want this to happen either
-			FinishTrade(this);
-			trade->Reset();
-			auto canceltrade = new EQApplicationPacket(OP_CancelTrade, sizeof(CancelTrade_Struct));
-			CancelTrade_Struct* ct = (CancelTrade_Struct*)canceltrade->pBuffer;
-			ct->fromid = 0;
-			ct->action = 1;
-			FastQueuePacket(&canceltrade);
+		if (*to_bucket < 0 || new_total > INT_MAX) {
+			// The client already changed its local buckets and overflowed, we kick so they reconnect with repaired values.
+			CancelTradeSession(0);
 			Kick();
 			return;
 		}
 	}
-	// now we actually take it from the from bucket. if there's an error
-	// with the destination slot, they lose their money
-	*from_bucket -= amount_to_take;
-	// why are intentionally inducing a crash here rather than letting the code attempt to stumble on?
-	// assert(*from_bucket >= 0);
+	if (!amount_to_add)
+		return;
+	*from_bucket -= static_cast<int32>(amount_to_take);
 
 	if(to_bucket)
 	{
-		if(*to_bucket + amount_to_add > *to_bucket)	// overflow check
-			*to_bucket += amount_to_add;
+		*to_bucket += static_cast<int32>(amount_to_add);
 	}
 
-	if(mc->to_slot == 3 && !trader) {
-		// if we got here, then we have an issue with the trade
-		FinishTrade(this);
-		trade->Reset();
-		auto canceltrade = new EQApplicationPacket(OP_CancelTrade, sizeof(CancelTrade_Struct));
-		CancelTrade_Struct* ct = (CancelTrade_Struct*) canceltrade->pBuffer;
-		ct->fromid = 0;
-		ct->action = 1;
-		FastQueuePacket(&canceltrade);
+	if(mc->to == 3 && (!trade->IsActiveWith(trader) || (trader->IsNPC() && trader->IsEngaged()))) {
+		// reconcile a client side deposit racing with closure.
+		CancelTradeSession(0);
+		SaveCurrency();
+		RecalcWeight();
+		return;
 	}
 
 	// if this is a trade move, inform the person being traded with
-	if(mc->to_slot == 3 && trader && trader->IsClient())
+	if(mc->to == 3 && trader && trader->IsClient())
 	{
 
 		// If one party accepted the trade then some coin was added, their state needs to be reset
@@ -1614,11 +1584,11 @@ void Client::OPMoveCoin(const EQApplicationPacket* app)
 			trade->sp, trade->cp
 		);
 
-		auto outapp = new EQApplicationPacket(OP_TradeCoins, sizeof(TradeCoin_Struct));
-		TradeCoin_Struct* tcs = (TradeCoin_Struct*)outapp->pBuffer;
-		tcs->trader = trader->GetID();
-		tcs->slot = mc->cointype2;
-		tcs->amount = amount_to_add;
+		auto outapp = new EQApplicationPacket(OP_TradeCoins, sizeof(TradeMoney_Struct));
+		TradeMoney_Struct* tcs = (TradeMoney_Struct*)outapp->pBuffer;
+		tcs->id = trader->GetID();
+		tcs->type = mc->typeTo;
+		tcs->amt = amount_to_add;
 		recipient->QueuePacket(outapp);
 		safe_delete(outapp);
 	}

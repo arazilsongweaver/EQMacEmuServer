@@ -19,6 +19,7 @@
 #define EQ_PACKET_STRUCTS_H
 
 #include "types.h"
+#include <cstddef>
 #include <string.h>
 #include <string>
 #include <list>
@@ -380,12 +381,15 @@ struct Charm_Struct
 	/*006*/
 };
 
-struct InterruptCast_Struct
+// MSG_TOKEN_TEXT (0x4235), original client type: tokenStringMsg.
+struct TokenText_Struct
 {
-	uint16 messageid;
-	uint16 color;
-	char	message[0];
+	/*00*/ int16 string_token; // Original type: short
+	/*02*/ int16 string_color; // Chat type/color
+	/*04*/ int16 fromWorld;    // 1 selects world; otherwise zone
 };
+static_assert(sizeof(TokenText_Struct) == 6);
+static_assert(offsetof(TokenText_Struct, fromWorld) == 4);
 
 struct DeleteSpell_Struct
 {
@@ -1296,13 +1300,14 @@ struct Consume_Struct
 	/*016*/
 };
 
-struct MoveItem_Struct
-{
-/*0000*/ uint32 from_slot;
-/*0004*/ uint32 to_slot;
-/*0008*/ uint32 number_in_stack;
-/*0012*/
+// Original client moveItem layout
+struct MoveItem_Struct {
+    int32 from;
+    int32 to;
+    int32 qty;
 };
+static_assert(sizeof(MoveItem_Struct) == 12);
+static_assert(offsetof(MoveItem_Struct, qty) == 8);
 
 //
 // cointype
@@ -1316,28 +1321,40 @@ static const uint32 COINTYPE_GP = 2;
 static const uint32 COINTYPE_SP = 1;
 static const uint32 COINTYPE_CP = 0;
 
-struct MoveCoin_Struct
-{
-	int32 from_slot;
-	int32 to_slot;
-	uint32 cointype1;
-	uint32 cointype2;
-	int32	amount;
+// Original client moveMoney layout. Wire denominations: CP=0, SP=1, GP=2, PP=3.
+struct MoveMoney_Struct {
+    int32 from;
+    int32 to;
+    int32 typeFrom;
+    int32 typeTo;
+    int32 amt;
 };
+static_assert(sizeof(MoveMoney_Struct) == 20);
+static_assert(offsetof(MoveMoney_Struct, amt) == 16);
 
-struct TradeCoin_Struct
-{
-	/*000*/	uint16	trader;
-	/*002*/	uint16	slot;
-	/*004*/	int32	amount;
-	/*008*/
+// Shared by OP_TradeCoins (offer delta) and OP_TradeMoneyUpdate (wallet delta).
+// Original client type: trademoney.
+struct TradeMoney_Struct {
+    uint16 id;
+    uint8 type;
+    uint8 _padding_3;
+    int32 amt;
 };
+static_assert(sizeof(TradeMoney_Struct) == 8);
+static_assert(offsetof(TradeMoney_Struct, type) == 2);
+static_assert(offsetof(TradeMoney_Struct, amt) == 4);
 
-struct TradeMoneyUpdate_Struct{
-	uint16	trader;
-	uint16	type;
-	int32	amount;
+// Wire prefix only, item follows this header.
+// type: 0=equipment, 1=container, 2=note
+struct TradeItemHeader_Struct {
+    uint16 id;
+    int16 slot;
+    uint8 type;
+    uint8 item[0];
 };
+static_assert(sizeof(TradeItemHeader_Struct) == 5);
+static_assert(offsetof(TradeItemHeader_Struct, item) == 5);
+
 /*
 ** Surname struct
 ** Size: 100 bytes
@@ -1699,38 +1716,43 @@ struct FaceChange_Struct {
 //designs then there would be 80 barb faces
 };
 
-/*
-** Trade request from one client to another
-** Used to initiate a trade
-** Size: 8 bytes
-** Used in: OP_TradeRequest
-*/
-struct TradeRequest_Struct {
-	/*000*/	uint16 to_mob_id;
-	/*002*/	uint16 from_mob_id;
-	/*004*/
+// Original client type: beginTrade.
+// OP_TradeRequest and OP_TradeRequestAck share this
+struct BeginTrade_Struct {
+    uint16 target;
+    uint16 source;
 };
+static_assert(sizeof(BeginTrade_Struct) == 4);
+static_assert(offsetof(BeginTrade_Struct, source) == 2);
 
-/*
-** Cancel Trade struct
-** Sent when a player cancels a trade
-** Size: 8 bytes
-** Used In: OP_CancelTrade
-**
-*/
+// Original client type: canTrade.
+// C->S: target is the partner, source is the sender.
+// S->C: target selects the cancellation message; source is ignored, send zero.
 struct CancelTrade_Struct {
-	/*000*/	uint16 fromid;
-	/*002*/	uint16 action;
-	/*004*/
+    uint16 target;
+    uint16 source;
 };
+static_assert(sizeof(CancelTrade_Struct) == 4);
+static_assert(offsetof(CancelTrade_Struct, source) == 2);
 
-struct RefuseTrade_Struct {
-/*00*/	uint16 fromid;
-/*02*/	uint16 toid;
-/*04*/  uint8  type;
-/*04*/  uint8 unknown;
-/*06*/
+// Original client type: _readyTrade.
+struct ReadyTrade_Struct {
+    uint16 id;
+    uint8 flag;
+    uint8 _padding_3;
 };
+static_assert(sizeof(ReadyTrade_Struct) == 4);
+static_assert(offsetof(ReadyTrade_Struct, flag) == 2);
+
+// Original client type: refuseTrade.
+struct RefuseTrade_Struct {
+    uint16 target;
+    uint16 source;
+    uint8 reason;
+    uint8 _padding_5;
+};
+static_assert(sizeof(RefuseTrade_Struct) == 6);
+static_assert(offsetof(RefuseTrade_Struct, reason) == 4);
 
 struct PetitionUpdate_Struct {
 	uint32 petnumber;	// Petition Number
@@ -1807,12 +1829,31 @@ struct SetDataRate_Struct {
 	float newdatarate;
 };
 
-//OP_SetServerFilter
-struct SetServerFilter_Struct 
+// OP_SetServerFilter / MSG_UPDATE_FILTERS (0x41FF), original type: updateFilters.
+// These wire fields are independent of the server's eqFilterType indices.
+struct UpdateFilters_Struct
 {
-	/*000*/	uint32 filters[17];	// Comment: 
-	/*068*/	
+	/*00*/ int32 dmgshields;     // 0 On, 1 Off
+	/*04*/ int32 npcspells;      // 0 On, 1 Off
+	/*08*/ int32 pcspells;       // 0 All, 1 Off, 2 Group
+	/*12*/ int32 bardsongs;      // 0 All, 1 Me, 2 Group, 3 Off
+	/*16*/ int32 server_filter;  // 0 Off, 1 On; independent master request
+	/*20*/ int32 guild_chat;     // The following ten fields: 0 Off, 1 On
+	/*24*/ int32 socials;
+	/*28*/ int32 group_chat;
+	/*32*/ int32 shouts;
+	/*36*/ int32 auctions;
+	/*40*/ int32 oocs;
+	/*44*/ int32 my_misses;
+	/*48*/ int32 other_miss;
+	/*52*/ int32 other_hit;
+	/*56*/ int32 atk_miss_me;
+	/*60*/ int32 criticalspells; // 0 All, 1 Me, 2 Off
+	/*64*/ int32 criticalmelee;  // 0 All, 1 Me, 2 Off
 };
+static_assert(sizeof(UpdateFilters_Struct) == 68);
+static_assert(offsetof(UpdateFilters_Struct, server_filter) == 16);
+static_assert(offsetof(UpdateFilters_Struct, criticalmelee) == 64);
 
 struct GMName_Struct {
 	char oldname[64];
@@ -2351,6 +2392,14 @@ struct MoneyUpdate_Struct
 	int32 silver;
 	int32 copper;
 };
+
+// Mac-family 0x4241: the client filters this text using entity_id.
+struct SpellTextMessageStringID_Struct {
+	uint16 entity_id;
+	uint32 string_id;
+	char message[0]; // NUL-terminated substitution argument
+};
+static_assert(sizeof(SpellTextMessageStringID_Struct) == 6, "Spell text header must be six bytes");
 
 struct FormattedMessage_Struct{
 	uint16	unknown0;

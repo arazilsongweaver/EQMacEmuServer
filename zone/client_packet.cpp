@@ -821,13 +821,16 @@ void Client::Handle_Connect_OP_SetDataRate(const EQApplicationPacket *app)
 
 void Client::Handle_Connect_OP_SetServerFilter(const EQApplicationPacket *app)
 {
-	if (app->size != sizeof(SetServerFilter_Struct)) {
+	if (app->size != sizeof(UpdateFilters_Struct)) {
 		LogError("Received invalid sized OP_SetServerFilter");
 		DumpPacket(app);
 		return;
 	}
-	SetServerFilter_Struct* filter = (SetServerFilter_Struct*)app->pBuffer;
-	ServerFilter(filter);
+	UpdateFilters_Struct filters;
+	memcpy(&filters, app->pBuffer, sizeof(filters));
+	// server side filters disabled for now, even if client requests it
+	filters.server_filter = 0;
+	ServerFilter(&filters);
 	return;
 }
 
@@ -1887,7 +1890,7 @@ void Client::Handle_OP_Animation(const EQApplicationPacket *app)
 		// relay the packet but don't send it back to the client that sent it
 		// they don't expect their own anim to be echoed and they already played the animation track when sending this to us
 		// this client requested animation is used for socials and the intimidation skill
-		entity_list.QueueCloseClients(this, app, true, RuleI(Range, Anims), 0, false, eqFilterType::FilterNone);
+		entity_list.QueueCloseClients(this, app, true, RuleI(Range, Anims), 0, true, eqFilterType::FilterNone);
 	}
 }
 
@@ -2392,53 +2395,34 @@ void Client::Handle_OP_Camp(const EQApplicationPacket *app)
 
 void Client::Handle_OP_CancelTrade(const EQApplicationPacket *app)
 {
-	if (app->size != sizeof(CancelTrade_Struct)) {
-		LogError("Wrong size: OP_CancelTrade, size=[{}], expected [{}]", app->size, sizeof(CancelTrade_Struct));
+	if (app->size != sizeof(CancelTrade_Struct) || !trade || trade->state == TradeCompleting)
 		return;
-	}
-
-	if (!trade)
+	const auto msg = reinterpret_cast<const CancelTrade_Struct*>(app->pBuffer);
+	if (msg->source != GetID() || !msg->target)
 		return;
 
-	Mob* with = trade->With();
-	if (with && with->IsClient()) {
-		CancelTrade_Struct* msg = (CancelTrade_Struct*)app->pBuffer;
-
-		// Forward cancel packet to other client
-		msg->fromid = GetID();
-		//msg->action = 1;
-
-		with->CastToClient()->FinishTrade(with);
-		with->CastToClient()->trade->Reset();
-		with->CastToClient()->QueuePacket(app);
-
-		// Put trade items/cash back into inventory
-		QueuePacket(app);
-		FinishTrade(this);
-		trade->Reset();
-	}
-	else if (with){
-		CancelTrade_Struct* msg = (CancelTrade_Struct*)app->pBuffer;
-		msg->fromid = with->GetID();
-		QueuePacket(app);
-
-		auto outapp = new EQApplicationPacket(OP_TradeReset, 0);
-		QueuePacket(outapp);
-		safe_delete(outapp);
-
-		FinishTrade(this);
-		trade->Reset();
-	}
-	else
+	if (trade->GetWithID() == msg->target)
 	{
-		//EQMac sends a second CancelTrade packet. Since "with" and the trade became invalid the first time around, this handles the second which prevents the client from bugging.
-		CancelTrade_Struct* msg = (CancelTrade_Struct*)app->pBuffer;
-		msg->fromid = GetID();
-		QueuePacket(app);
-		LogDebugDetail("Cancelled second trade. from is: [{}].", msg->fromid);
+		Mob* with = trade->With();
+		if (with && with->IsNPC())
+			SendCancelTrade(with);
+		else
+			CancelTradeSession(GetID());
+		return;
 	}
 
-	return;
+	// The recipient can close its window before its acknowledgement arrives.
+	// Its own server trade is still idle, but the requester records the pair.
+	if (trade->state == TradeNone && !trade->GetWithID() && !trade->HasOffers())
+	{
+		Client* requester = entity_list.GetClientByID(msg->target);
+		if (requester && requester != this && requester->trade->state == Requesting && requester->trade->GetWithID() == GetID())
+		{
+			requester->CancelTradeSession(GetID());
+		}
+	}
+	// an already closed or unrelated session gets no reply.
+	// another close packet could close a newer client window.
 }
 
 void Client::Handle_OP_CastSpell(const EQApplicationPacket *app) 
@@ -3523,8 +3507,11 @@ void Client::Handle_OP_DeleteCharge(const EQApplicationPacket *app)
 	}
 
 	MoveItem_Struct* alc = (MoveItem_Struct*)app->pBuffer;
+	if (alc->from < 0 || !IsValidSlot(alc->from) ||
+		(alc->from >= EQ::invslot::TRADE_BEGIN && alc->from <= EQ::invslot::TRADE_END))
+		return;
 
-	const EQ::ItemInstance *inst = GetInv().GetItem(alc->from_slot);
+	const EQ::ItemInstance *inst = GetInv().GetItem(alc->from);
 	if (inst && inst->GetItem()->ItemType == EQ::item::ItemTypeAlcohol) {
 		entity_list.MessageClose_StringID(this, true, 50, 0, StringID::DRINKING_MESSAGE, GetName(), inst->GetItem()->Name);
 		CheckIncreaseSkill(EQ::skills::SkillAlcoholTolerance, nullptr, zone->skill_difficulty[EQ::skills::SkillAlcoholTolerance].difficulty[GetClass()]);
@@ -3546,7 +3533,7 @@ void Client::Handle_OP_DeleteCharge(const EQApplicationPacket *app)
 	}
 
 	if (inst) {
-		DeleteItemInInventory(alc->from_slot, 1);
+		DeleteItemInInventory(alc->from, 1);
 
 		if (PlayerEventLogs::Instance()->IsEventEnabled(PlayerEvent::ITEM_DESTROY)) {
 			auto e = PlayerEvent::DestroyItemEvent{
@@ -3727,10 +3714,11 @@ void Client::Handle_OP_Discipline(const EQApplicationPacket *app)
 		else
 		{
 			LogDiscs("No disc used and reuse time is met.");
-			auto outapp = new EQApplicationPacket(OP_InterruptCast, sizeof(InterruptCast_Struct));
-			InterruptCast_Struct* ic = (InterruptCast_Struct*)outapp->pBuffer;
-			ic->messageid = StringID::DISCIPLINE_RDY;
-			ic->color = Chat::Disciplines;
+			auto outapp = new EQApplicationPacket(OP_TokenText, sizeof(TokenText_Struct));
+			TokenText_Struct* text = (TokenText_Struct*)outapp->pBuffer;
+			text->string_token = StringID::DISCIPLINE_RDY;
+			text->string_color = Chat::Disciplines;
+			text->fromWorld = 0;
 			QueuePacket(outapp);
 			safe_delete(outapp);
 		}
@@ -5909,8 +5897,8 @@ void Client::Handle_OP_Mend(const EQApplicationPacket *app)
 
 void Client::Handle_OP_MoveCoin(const EQApplicationPacket *app)
 {
-	if (app->size != sizeof(MoveCoin_Struct)){
-		LogError("Wrong size on OP_MoveCoin. Got: [{}], Expected: [{}]", app->size, sizeof(MoveCoin_Struct));
+	if (app->size != sizeof(MoveMoney_Struct)){
+		LogError("Wrong size on OP_MoveCoin. Got: [{}], Expected: [{}]", app->size, sizeof(MoveMoney_Struct));
 		DumpPacket(app);
 		return;
 	}
@@ -5934,18 +5922,25 @@ void Client::Handle_OP_MoveItem(const EQApplicationPacket *app)
 	}
 
 	MoveItem_Struct* mi = (MoveItem_Struct*)app->pBuffer;
-	LogInventoryDetail("Moveitem from_slot: [{}], to_slot: [{}], number_in_stack: [{}]", mi->from_slot, mi->to_slot, mi->number_in_stack);
+	// Validate full width wire slots before inventory APIs convert to int16.
+	// Offered items return through cancellation, not client inventory moves.
+	if (mi->from < 0 || !IsValidSlot(mi->from) || !IsValidSlot(mi->to) ||
+		(mi->qty < 0 && mi->to != INVALID_INDEX) ||
+		(mi->from >= EQ::invslot::TRADE_BEGIN && mi->from <= EQ::invslot::TRADE_END) ||
+		(trade->state == TradeCompleting && mi->to >= EQ::invslot::TRADE_BEGIN && mi->to <= EQ::invslot::TRADE_END))
+		return;
+	LogInventoryDetail("Moveitem from_slot: [{}], to_slot: [{}], number_in_stack: [{}]", mi->from, mi->to, mi->qty);
 
-	if (spellend_timer.Enabled() && casting_spell_id && !IsBardSong(casting_spell_id) && mi->from_slot != EQ::invslot::slotCursor)
+	if (spellend_timer.Enabled() && casting_spell_id && !IsBardSong(casting_spell_id) && mi->from != EQ::invslot::slotCursor)
 	{
-		if (mi->from_slot != mi->to_slot && (mi->from_slot <= EQ::invslot::GENERAL_END || mi->from_slot > 39) && IsValidSlot(mi->from_slot) && IsValidSlot(mi->to_slot))
+		if (mi->from != mi->to && (mi->from <= EQ::invslot::GENERAL_END || mi->from > 39) && IsValidSlot(mi->from) && IsValidSlot(mi->to))
 		{
-			const EQ::ItemInstance *itm_from = GetInv().GetItem(mi->from_slot);
-			const EQ::ItemInstance *itm_to = GetInv().GetItem(mi->to_slot);
+			const EQ::ItemInstance *itm_from = GetInv().GetItem(mi->from);
+			const EQ::ItemInstance *itm_to = GetInv().GetItem(mi->to);
 			auto message = fmt::format("Player issued a move item from {} (item id {} ) to {} (item id {} ) while casting {} .",
-				mi->from_slot,
+				mi->from,
 				itm_from ? itm_from->GetID() : 0,
-				mi->to_slot,
+				mi->to,
 				itm_to ? itm_to->GetID() : 0,
 				casting_spell_id);
 			RecordPlayerEventLog(PlayerEvent::POSSIBLE_HACK, PlayerEvent::PossibleHackEvent{ .message = message });
@@ -5957,33 +5952,33 @@ void Client::Handle_OP_MoveItem(const EQApplicationPacket *app)
 	// Illegal bagslot useage checks. Currently, user only receives a message if this check is triggered.
 	bool mi_hack = false;
 
-	if (mi->from_slot >= EQ::invbag::GENERAL_BAGS_BEGIN && mi->from_slot <= EQ::invbag::CURSOR_BAG_END) {
-		if (mi->from_slot >= EQ::invbag::CURSOR_BAG_BEGIN) { mi_hack = true; }
+	if (mi->from >= EQ::invbag::GENERAL_BAGS_BEGIN && mi->from <= EQ::invbag::CURSOR_BAG_END) {
+		if (mi->from >= EQ::invbag::CURSOR_BAG_BEGIN) { mi_hack = true; }
 		else {
-			int16 from_parent = m_inv.CalcSlotId(mi->from_slot);
+			int16 from_parent = m_inv.CalcSlotId(mi->from);
 			if (!m_inv[from_parent]) { mi_hack = true; }
 			else if (!m_inv[from_parent]->IsType(EQ::item::ItemClassBag)) { mi_hack = true; }
-			else if (m_inv.CalcBagIdx(mi->from_slot) >= m_inv[from_parent]->GetItem()->BagSlots) { mi_hack = true; }
+			else if (m_inv.CalcBagIdx(mi->from) >= m_inv[from_parent]->GetItem()->BagSlots) { mi_hack = true; }
 		}
 	}
 
-	if (mi->to_slot >= EQ::invbag::GENERAL_BAGS_BEGIN && mi->to_slot <= EQ::invbag::CURSOR_BAG_END) {
-		if (mi->to_slot >= EQ::invbag::CURSOR_BAG_BEGIN) { mi_hack = true; }
+	if (mi->to >= EQ::invbag::GENERAL_BAGS_BEGIN && mi->to <= EQ::invbag::CURSOR_BAG_END) {
+		if (mi->to >= EQ::invbag::CURSOR_BAG_BEGIN) { mi_hack = true; }
 		else {
-			int16 to_parent = m_inv.CalcSlotId(mi->to_slot);
+			int16 to_parent = m_inv.CalcSlotId(mi->to);
 			if (!m_inv[to_parent]) { mi_hack = true; }
 			else if (!m_inv[to_parent]->IsType(EQ::item::ItemClassBag)) { mi_hack = true; }
-			else if (m_inv.CalcBagIdx(mi->to_slot) >= m_inv[to_parent]->GetItem()->BagSlots) { mi_hack = true; }
+			else if (m_inv.CalcBagIdx(mi->to) >= m_inv[to_parent]->GetItem()->BagSlots) { mi_hack = true; }
 		}
 	}
 
 	if (mi_hack) { Message(Chat::Yellow, "Caution: Illegal use of inaccessable bag slots!"); }
 
-	if (IsValidSlot(mi->from_slot) && IsValidSlot(mi->to_slot)) {
+	if (IsValidSlot(mi->from) && IsValidSlot(mi->to)) {
 		bool si = SwapItem(mi);
 		if (!si)
 		{
-			LogInventoryDetail("WTF Some shit failed. SwapItem: [{}], IsValidSlot (from): [{}], IsValidSlot (to): [{}]", si, IsValidSlot(mi->from_slot), IsValidSlot(mi->to_slot));
+			LogInventoryDetail("WTF Some shit failed. SwapItem: [{}], IsValidSlot (from): [{}], IsValidSlot (to): [{}]", si, IsValidSlot(mi->from), IsValidSlot(mi->to));
 			SwapItemResync(mi);
 
 			bool error = false;
@@ -7096,13 +7091,16 @@ void Client::Handle_OP_SetRunMode(const EQApplicationPacket *app)
 void Client::Handle_OP_SetServerFilter(const EQApplicationPacket *app)
 {
 
-	if (app->size != sizeof(SetServerFilter_Struct)) {
-		LogError("Received invalid sized OP_SetServerFilter: got [{}], expected [{}]", app->size, sizeof(SetServerFilter_Struct));
+	if (app->size != sizeof(UpdateFilters_Struct)) {
+		LogError("Received invalid sized OP_SetServerFilter: got [{}], expected [{}]", app->size, sizeof(UpdateFilters_Struct));
 		DumpPacket(app);
 		return;
 	}
-	SetServerFilter_Struct* filter = (SetServerFilter_Struct*)app->pBuffer;
-	ServerFilter(filter);
+	UpdateFilters_Struct filters;
+	memcpy(&filters, app->pBuffer, sizeof(filters));
+	// server side filters disabled for now, even if client requests it
+	filters.server_filter = 0;
+	ServerFilter(&filters);
 	return;
 }
 
@@ -8286,73 +8284,69 @@ void Client::Handle_OP_Track(const EQApplicationPacket *app)
 
 void Client::Handle_OP_TradeAcceptClick(const EQApplicationPacket *app)
 {
+	if (app->size != sizeof(ReadyTrade_Struct) || !trade || trade->state == TradeCompleting)
+		return;
+	const auto ready = reinterpret_cast<const ReadyTrade_Struct*>(app->pBuffer);
+	if (!ready->id || ready->id != trade->GetWithID() || ready->flag != 1)
+		return;
+
 	Mob* with = trade->With();
-	if (with && with->IsCorpse())
+	if (!trade->IsActiveWith(with))
+	{
+		if (trade->HasOffers() || with == this)
+			CancelTradeSession(GetID());
+		return;
+	}
+	if (with->IsClient())
+	{
+		Client* other = with->CastToClient();
+		if (trade->state == TradeAccepted)
+			return;
+		trade->state = TradeAccepted;
+		other->QueuePacket(app);
+		if (other->trade->state != TradeAccepted)
+			return;
+
+		// Preflight both halves before moving any item or issuing any credit.
+		if (!CanReceiveTradeMoney(*other->trade) || !other->CanReceiveTradeMoney(*trade))
+		{
+			Message(Chat::Red, "The trade would exceed a coin limit and has been cancelled.");
+			other->Message(Chat::Red, "The trade would exceed a coin limit and has been cancelled.");
+			CancelTradeSession(GetID());
+			return;
+		}
+		if (CheckTradeLoreConflict(other) || other->CheckTradeLoreConflict(this))
+		{
+			Message_StringID(Chat::Red, StringID::TRADE_CANCEL_LORE);
+			other->Message_StringID(Chat::Red, StringID::TRADE_CANCEL_LORE);
+			CancelTradeSession(GetID());
+			return;
+		}
+		trade->state = TradeCompleting;
+		other->trade->state = TradeCompleting;
+		other->PlayerTradeEventLog(other->trade, trade);
+		FinishTrade(other);
+		other->FinishTrade(this);
+		other->trade->Reset();
+		trade->Reset();
+		EQApplicationPacket finish(OP_FinishTrade, 0);
+		other->QueuePacket(&finish);
+		QueuePacket(&finish);
+		return;
+	}
+
+	if (with->IsEngaged())
 	{
 		SendCancelTrade(with);
 		return;
 	}
-
-	trade->state = TradeAccepted;
-
-	if (with && with->IsClient()) {
-		//finish trade...
-		// Have both accepted?
-		Client* other = with->CastToClient();
-		other->QueuePacket(app);
-
-		if (other->trade->state == trade->state) {
-			other->trade->state = TradeCompleting;
-			trade->state = TradeCompleting;
-
-			if (CheckTradeLoreConflict(other) || other->CheckTradeLoreConflict(this)) {
-				Message_StringID(Chat::Red, StringID::TRADE_CANCEL_LORE);
-				other->Message_StringID(Chat::Red, StringID::TRADE_CANCEL_LORE);
-				this->FinishTrade(this);
-				other->FinishTrade(other);
-				other->trade->Reset();
-				trade->Reset();
-			}
-			else  {
-				other->PlayerTradeEventLog(other->trade, trade);
-
-				FinishTrade(other);
-				other->FinishTrade(this);
-
-				other->trade->Reset();
-				trade->Reset();
-			}
-			// All done
-			auto outapp = new EQApplicationPacket(OP_FinishTrade, 0);
-			other->QueuePacket(outapp);
-			this->FastQueuePacket(&outapp);
-		}
-	}
-	// Trading with a Mob object that is not a Client.
-	else if (with) {
-
-		if(with->IsNPC() && with->IsEngaged()) {
-			SendCancelTrade(with);
-			LogTrading("Cancelled in-progress trade due to [{}] being in combat.", with->GetCleanName());
-			return;
-		}
-
-		auto outapp = new EQApplicationPacket(OP_FinishTrade, 0);
-		QueuePacket(outapp);
-		safe_delete(outapp);
-
-		outapp = new EQApplicationPacket(OP_TradeReset, 0);
-		QueuePacket(outapp);
-		safe_delete(outapp);
-
-		if (with->IsNPC()) {
-			FinishTrade(with->CastToNPC());
-		}
-		trade->Reset();
-	}
-
-
-	return;
+	trade->state = TradeCompleting;
+	EQApplicationPacket finish(OP_FinishTrade, 0);
+	QueuePacket(&finish);
+	EQApplicationPacket reset(OP_TradeReset, 0);
+	QueuePacket(&reset);
+	FinishTrade(with->CastToNPC());
+	trade->Reset();
 }
 
 void Client::Handle_OP_Trader(const EQApplicationPacket *app) 
@@ -8547,119 +8541,68 @@ void Client::Handle_OP_TraderBuy(const EQApplicationPacket *app)
 	return;
 }
 
-void Client::Handle_OP_TradeRequest(const EQApplicationPacket *app) 
+void Client::Handle_OP_TradeRequest(const EQApplicationPacket *app)
 {
-	if (app->size != sizeof(TradeRequest_Struct)) {
-		LogError("Wrong size: OP_TradeRequest, size=[{}], expected [{}]", app->size, sizeof(TradeRequest_Struct));
+	if (app->size != sizeof(BeginTrade_Struct) || !trade)
 		return;
-	}
-	// Client requesting a trade session from an npc/client
-	// Trade session not started until OP_TradeRequestAck is sent
-	if (!trade_timer.Check())
-		return;
-
-	CommonBreakInvisible(true);
-
-	// Pass trade request on to recipient
-	TradeRequest_Struct* msg = (TradeRequest_Struct*)app->pBuffer;
-
-	if (msg->from_mob_id != GetID()) {
+	const auto msg = reinterpret_cast<const BeginTrade_Struct*>(app->pBuffer);
+	if (msg->source != GetID()) {
 		// Client sent a trade request with an originator ID not matching their own ID.
-		auto message = fmt::format("Player {} ( {} ) sent OP_TradeRequest with from_mob_id of: {} ", GetCleanName(), GetID(), msg->from_mob_id);
+		auto message = fmt::format("Player {} ( {} ) sent OP_TradeRequest with from_mob_id of: {} ", GetCleanName(), GetID(), msg->source);
 		RecordPlayerEventLog(PlayerEvent::POSSIBLE_HACK, PlayerEvent::PossibleHackEvent{ .message = message });
 		return;
 	}
-
-	Mob* tradee = entity_list.GetMob(msg->to_mob_id);
-
-	if (tradee && tradee->IsClient()) 
-	{
-
+	if (!trade->CanRequest(msg->target) || !trade_timer.Check())
+		return;
+	Mob* other = entity_list.GetMob(msg->target);
+	if (!other || (!other->IsClient() && !other->IsNPC()))
+		return;
+	CommonBreakInvisible(true);
+	if (other->IsClient()) {
 		if (IsFeigned())
-		{
-			FinishTrade(this);
-			trade->Reset();
+			return;
+		if (other->CastToClient()->IsFeigned() || !other->trade->CanStart(GetID())) {
+			other->CastToClient()->Message_StringID(0, StringID::TRADE_INTERESTED, GetCleanName());
+			Message_StringID(0, StringID::TRADE_BUSY, other->GetCleanName());
 			return;
 		}
-
-		if (trade->state != TradeNone && trade->state != Requesting) {
-			// Put any trade items/cash back into inventory
-			CancelTrade_Struct* msg = (CancelTrade_Struct*) app->pBuffer;
-			msg->fromid = GetID();
-			msg->action = 1;
-			Mob* other = trade->With();
-			if (other && other->IsClient() && other->trade->GetWithID() == GetID()) {
-				// send a cancel to who we were already trading with.
-				other->CastToClient()->QueuePacket(app);
-				other->CastToClient()->FinishTrade(other);
-				other->trade->Reset();
-			}
-			QueuePacket(app);
-			FinishTrade(this);
-			trade->Reset();
-			return;
-		}
-		// Check if the other client is busy in a trade
-		if (tradee && ((tradee->CastToClient()->trade->state != TradeNone && tradee->CastToClient()->trade->GetWithID() != GetID()) 
-			|| tradee->CastToClient()->IsFeigned())) {
-			// Other client is in a trade, and its not with us.  So don't send a trade request.
-			// Let the other client know we are interested in a trade.
-			tradee->CastToClient()->Message_StringID(0, StringID::TRADE_INTERESTED,GetCleanName());
-			// Send reply to client that other client is busy
-			Message_StringID(0, StringID::TRADE_BUSY,tradee->CastToClient()->GetCleanName());
-			FinishTrade(this);
-			trade->Reset();
-			return;
-		}
-		trade->Request(msg->to_mob_id);
-		tradee->CastToClient()->QueuePacket(app);
-	}
-	else if (tradee && tradee->IsNPC()) 
-	{
-		
-		if(tradee->IsEngaged())
-		{
-			auto outapp = new EQApplicationPacket(OP_CancelTrade, sizeof(CancelTrade_Struct));
-			CancelTrade_Struct* ct = (CancelTrade_Struct*) outapp->pBuffer;
-			ct->fromid = tradee->GetID();
-			FastQueuePacket(&outapp);
-			LogTrading("Cancelled trade request due to [{}] being in combat.", tradee->GetCleanName());
-			return;
-		}
-
-		//npcs always accept
-		trade->Start(msg->to_mob_id);
-
-		auto outapp = new EQApplicationPacket(OP_TradeReset, 0);
-		FastQueuePacket(&outapp);
-
-		outapp = new EQApplicationPacket(OP_TradeRequestAck, sizeof(TradeRequest_Struct));
-		TradeRequest_Struct* acc = (TradeRequest_Struct*)outapp->pBuffer;
-		acc->from_mob_id = msg->to_mob_id;
-		acc->to_mob_id = msg->from_mob_id;
-		FastQueuePacket(&outapp);
-	}
-	// cannot find person to trade with
-	return;
-}
-
-void Client::Handle_OP_TradeRequestAck(const EQApplicationPacket *app) 
-{
-	if (app->size != sizeof(TradeRequest_Struct)) {
-		LogError("Wrong size: OP_TradeRequestAck, size=[{}], expected [{}]", app->size, sizeof(TradeRequest_Struct));
+		if (trade->Request(msg->target))
+			other->CastToClient()->QueuePacket(app);
 		return;
 	}
-	// Trade request recipient is acknowledging they are able to trade
-	// After this, the trade session has officially started
-	// Send ack on to trade initiator if client
-	TradeRequest_Struct* msg = (TradeRequest_Struct*)app->pBuffer;
-	Mob* tradee = entity_list.GetMob(msg->to_mob_id);
-
-	if (tradee && tradee->IsClient() && tradee->trade->state == Requesting && tradee->trade->GetWithID() == GetID()) {
-		trade->Start(msg->to_mob_id);
-		tradee->CastToClient()->QueuePacket(app);
+	if (other->IsEngaged()) {
+		EQApplicationPacket cancel(OP_CancelTrade, sizeof(CancelTrade_Struct));
+		auto body = reinterpret_cast<CancelTrade_Struct*>(cancel.pBuffer);
+		body->target = other->GetID();
+		QueuePacket(&cancel);
+		return;
 	}
-	return;
+	if (trade->state == Requesting && trade->GetWithID() != msg->target)
+		CancelTradeSession(GetID(), false);
+	if (!trade->Start(msg->target))
+		return;
+	EQApplicationPacket reset(OP_TradeReset, 0);
+	QueuePacket(&reset);
+	EQApplicationPacket ack(OP_TradeRequestAck, sizeof(BeginTrade_Struct));
+	auto body = reinterpret_cast<BeginTrade_Struct*>(ack.pBuffer);
+	body->source = msg->target;
+	body->target = GetID();
+	QueuePacket(&ack);
+}
+
+void Client::Handle_OP_TradeRequestAck(const EQApplicationPacket *app)
+{
+	if (app->size != sizeof(BeginTrade_Struct) || !trade)
+		return;
+	const auto msg = reinterpret_cast<const BeginTrade_Struct*>(app->pBuffer);
+	if (msg->source != GetID() || msg->target == GetID() || !trade->CanStart(msg->target))
+		return;
+	Client* requester = entity_list.GetClientByID(msg->target);
+	if (!requester || requester->trade->state != Requesting || requester->trade->GetWithID() != GetID())
+		return;
+	// Both states must be active before the initiator can send its held offer.
+	if (trade->Start(msg->target))
+		requester->QueuePacket(app);
 }
 
 void Client::Handle_OP_TraderShop(const EQApplicationPacket *app) 
@@ -9137,30 +9080,21 @@ void Client::Handle_OP_Key(const EQApplicationPacket *app)
 
 void Client::Handle_OP_TradeRefused(const EQApplicationPacket *app)
 {
-	if (app->size != sizeof(RefuseTrade_Struct)) {
-		LogError("Invalid size for OP_TradeRefused: Expected: [{}], Got: [{}]", sizeof(RefuseTrade_Struct), app->size);
+	if (app->size != sizeof(RefuseTrade_Struct))
 		return;
-	}
-
-	RefuseTrade_Struct* in = (RefuseTrade_Struct*)app->pBuffer;	
-	Client* client = entity_list.GetClientByID(in->fromid);
-
-	if(client)
-	{
-		if ((trade->state == TradeNone && client->trade->state == Requesting) || in->type == 98 || in->type == 99) {
-			client->FinishTrade(client);
-			client->trade->Reset();
-		}
-		if (in->type == 98) {
-			client->Message_StringID(Chat::White, StringID::TRADE_NOBODY, GetCleanName());
-		} else if (in->type == 99) {
-			client->Message_StringID(Chat::White, StringID::TRADE_GROUP_ONLY, GetCleanName());
-		} else {
-			client->QueuePacket(app);
-		}
-	}
-
-	return;
+	const auto msg = reinterpret_cast<const RefuseTrade_Struct*>(app->pBuffer);
+	if (msg->source != GetID() || msg->target == GetID())
+		return;
+	Client* requester = entity_list.GetClientByID(msg->target);
+	if (!requester || requester->trade->state != Requesting || requester->trade->GetWithID() != GetID())
+		return;
+	requester->RefundOwnTrade();
+	if (msg->reason == 98)
+		requester->Message_StringID(Chat::White, StringID::TRADE_NOBODY, GetCleanName());
+	else if (msg->reason == 99)
+		requester->Message_StringID(Chat::White, StringID::TRADE_GROUP_ONLY, GetCleanName());
+	else
+		requester->QueuePacket(app);
 }
 
 void Client::Handle_OP_SpellTextMessage(const EQApplicationPacket *app)

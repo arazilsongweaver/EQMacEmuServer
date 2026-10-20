@@ -2248,6 +2248,24 @@ void EntityList::MessageClose_StringID(Mob *sender, bool skipsender, float dist,
 	}
 }
 
+// Send one string argument and let the client apply its spell/bard text filter.
+void EntityList::SpellTextMessageClose_StringID(Mob *sender, bool skipsender,
+		float dist, uint32 string_id, const char *message)
+{
+	if (!sender || !message)
+		return;
+
+	const size_t message_size = strlen(message) + 1;
+	auto outapp = new EQApplicationPacket(OP_SpellTextMessageStringID,
+		sizeof(SpellTextMessageStringID_Struct) + message_size);
+	auto text = reinterpret_cast<SpellTextMessageStringID_Struct *>(outapp->pBuffer);
+	text->entity_id = sender->GetID();
+	text->string_id = string_id;
+	memcpy(text->message, message, message_size);
+	QueueCloseClients(sender, outapp, skipsender, dist, nullptr, true);
+	safe_delete(outapp);
+}
+
 void EntityList::FilteredMessageClose_StringID(Mob *sender, bool skipsender,
 		float dist, uint32 type, eqFilterType filter, uint32 string_id,
 		const char *message1, const char *message2, const char *message3,

@@ -492,9 +492,9 @@ void Client::DeleteItemInInventory(int16 slot_id, int8 quantity, bool client_upd
 		if(client_update && IsValidSlot(slot_id)) {
 			auto outapp = new EQApplicationPacket(OP_MoveItem, sizeof(MoveItem_Struct));
 			MoveItem_Struct* delitem	= (MoveItem_Struct*)outapp->pBuffer;
-			delitem->from_slot			= slot_id;
-			delitem->to_slot			= 0xFFFFFFFF;
-			delitem->number_in_stack	= 0xFFFFFFFF;
+			delitem->from			= slot_id;
+			delitem->to			= -1;
+			delitem->qty	= -1;
 			QueuePacket(outapp);
 			safe_delete(outapp);
 			
@@ -540,9 +540,9 @@ void Client::DeleteItemInInventory(int16 slot_id, int8 quantity, bool client_upd
 				// Non stackable item with charges = Item with clicky spell effect ? Delete a charge.
 				outapp = new EQApplicationPacket(OP_DeleteCharge, sizeof(MoveItem_Struct));
 				MoveItem_Struct* delitem = (MoveItem_Struct*)outapp->pBuffer;
-				delitem->from_slot			= slot_id;
-				delitem->to_slot			= 0xFFFFFFFF;
-				delitem->number_in_stack	= 0xFFFFFFFF;
+				delitem->from			= slot_id;
+				delitem->to			= -1;
+				delitem->qty	= -1;
 				QueuePacket(outapp);
 				safe_delete(outapp);
 				if(returnitem)
@@ -555,9 +555,9 @@ void Client::DeleteItemInInventory(int16 slot_id, int8 quantity, bool client_upd
 
 		outapp = new EQApplicationPacket(OP_MoveItem, sizeof(MoveItem_Struct));
 		MoveItem_Struct* delitem	= (MoveItem_Struct*)outapp->pBuffer;
-		delitem->from_slot			= slot_id;
-		delitem->to_slot			= 0xFFFFFFFF;
-		delitem->number_in_stack	= 0xFFFFFFFF;
+		delitem->from			= slot_id;
+		delitem->to			= -1;
+		delitem->qty	= -1;
 		QueuePacket(outapp);
 		safe_delete(outapp);
 
@@ -1014,27 +1014,31 @@ bool Client::IsBankSlot(uint32 slot)
 // Moves items around both internally and in the database
 // In the future, this can be optimized by pushing all changes through one database REPLACE call
 bool Client::SwapItem(MoveItem_Struct* move_in) {
+	if (move_in->from < 0 || !IsValidSlot(move_in->from) || !IsValidSlot(move_in->to) ||
+		(move_in->qty < 0 && move_in->to != INVALID_INDEX) ||
+		(move_in->from >= EQ::invslot::TRADE_BEGIN && move_in->from <= EQ::invslot::TRADE_END))
+		return false;
 
-	uint32 src_slot_check = move_in->from_slot;
-	uint32 dst_slot_check = move_in->to_slot;
-	uint32 stack_count_check = move_in->number_in_stack;
+	uint32 src_slot_check = move_in->from;
+	uint32 dst_slot_check = move_in->to;
+	uint32 stack_count_check = move_in->qty;
 
 	// This could be expounded upon at some point to let the server know that
 	// the client has moved a buffered cursor item onto the active cursor -U
-	if (move_in->from_slot == move_in->to_slot) { // Item summon, no further processing needed
+	if (move_in->from == move_in->to) { // Item summon, no further processing needed
 		return true;
 	}
 
-	if (move_in->to_slot == (uint32)INVALID_INDEX) {
-		if (move_in->from_slot == (uint32)EQ::invslot::slotCursor) {
-			LogInventoryDetail("Client destroyed item from cursor slot [{}]", move_in->from_slot);
+	if (move_in->to == INVALID_INDEX) {
+		if (move_in->from == (uint32)EQ::invslot::slotCursor) {
+			LogInventoryDetail("Client destroyed item from cursor slot [{}]", move_in->from);
 
 			EQ::ItemInstance *inst = m_inv.GetItem(EQ::invslot::slotCursor);
 			if(inst) {
 				parse->EventItem(EVENT_DESTROY_ITEM, this, inst, nullptr, "", 0);
 			}
 
-			DeleteItemInInventory(move_in->from_slot);
+			DeleteItemInInventory(move_in->from);
 
 			if (PlayerEventLogs::Instance()->IsEventEnabled(PlayerEvent::ITEM_DESTROY)) {
 				auto e = PlayerEvent::DestroyItemEvent{
@@ -1050,18 +1054,18 @@ bool Client::SwapItem(MoveItem_Struct* move_in) {
 			return true; // Item destroyed by client
 		}
 		else {
-			LogInventoryDetail("Deleted item from slot [{}] as a result of an inventory container tradeskill combine.", move_in->from_slot);
-			DeleteItemInInventory(move_in->from_slot);
+			LogInventoryDetail("Deleted item from slot [{}] as a result of an inventory container tradeskill combine.", move_in->from);
+			DeleteItemInInventory(move_in->from);
 			return true; // Item deletetion
 		}
 	}
-	if(auto_attack && (move_in->from_slot == EQ::invslot::slotPrimary || move_in->from_slot == EQ::invslot::slotSecondary || move_in->from_slot == EQ::invslot::slotRange))
+	if(auto_attack && (move_in->from == EQ::invslot::slotPrimary || move_in->from == EQ::invslot::slotSecondary || move_in->from == EQ::invslot::slotRange))
 		SetAttackTimer();
-	else if(auto_attack && (move_in->to_slot == EQ::invslot::slotPrimary || move_in->to_slot == EQ::invslot::slotSecondary || move_in->to_slot == EQ::invslot::slotRange))
+	else if(auto_attack && (move_in->to == EQ::invslot::slotPrimary || move_in->to == EQ::invslot::slotSecondary || move_in->to == EQ::invslot::slotRange))
 		SetAttackTimer();
 	// Step 1: Variables
-	int16 src_slot_id = (int16)move_in->from_slot;
-	int16 dst_slot_id = (int16)move_in->to_slot;
+	int16 src_slot_id = (int16)move_in->from;
+	int16 dst_slot_id = (int16)move_in->to;
 
 	if(IsBankSlot(src_slot_id) ||
 		IsBankSlot(dst_slot_id) ||
@@ -1098,7 +1102,7 @@ bool Client::SwapItem(MoveItem_Struct* move_in) {
 		LogInventoryDetail("Src slot [{}] has item [{}] ([{}]) with [{}] charges in it.", src_slot_id, src_inst->GetItem()->Name, src_inst->GetItem()->ID, src_inst->GetCharges());
 		srcitemid = src_inst->GetItem()->ID;
 
-		if (src_inst->GetCharges() > 0 && (src_inst->GetCharges() < (int16)move_in->number_in_stack || move_in->number_in_stack > EQMAC_STACKSIZE))
+		if (src_inst->GetCharges() > 0 && (src_inst->GetCharges() < (int16)move_in->qty || move_in->qty > EQMAC_STACKSIZE))
 		{
 			std::string error = "Insufficent number in stack.";
 			LogInventory("Insufficent number in stack.");
@@ -1146,9 +1150,9 @@ bool Client::SwapItem(MoveItem_Struct* move_in) {
 			// If there is no source item, but there is a destination item,
 			// move the slots around before deleting the invalid source slot item,
 			// which is now in the destination slot.
-			move_in->from_slot = dst_slot_check;
-			move_in->to_slot = src_slot_check;
-			move_in->number_in_stack = dst_inst->GetCharges();
+			move_in->from = dst_slot_check;
+			move_in->to = src_slot_check;
+			move_in->qty = dst_inst->GetCharges();
 			if(!SwapItem(move_in))
 			{
 				sprintf(error, "Recursive SwapItem call failed due to non-existent destination item (sourceslot: %i, destslot: %i)", src_slot_id, dst_slot_id);
@@ -1209,9 +1213,9 @@ bool Client::SwapItem(MoveItem_Struct* move_in) {
 				{
 					auto outapp = new EQApplicationPacket(OP_MoveItem, sizeof(MoveItem_Struct));
 					MoveItem_Struct* delitem = (MoveItem_Struct*)outapp->pBuffer;
-					delitem->from_slot = dst_slot_id;
-					delitem->to_slot = 0xFFFFFFFF;
-					delitem->number_in_stack = 0xFFFFFFFF;
+					delitem->from = dst_slot_id;
+					delitem->to = -1;
+					delitem->qty = -1;
 					QueuePacket(outapp);
 					safe_delete(outapp);
 
@@ -1301,13 +1305,15 @@ bool Client::SwapItem(MoveItem_Struct* move_in) {
 
 	// Step 4: Check for entity trade
 	if (dst_slot_id >= EQ::invslot::TRADE_BEGIN && dst_slot_id <= EQ::invslot::TRADE_END) {
+		if (trade->state == TradeCompleting)
+			return false;
 		if (src_slot_id != EQ::invslot::slotCursor) {
 			Kick();
 			std::string error = "Trading item not on cursor.";
 			LogInventory("Trading item not on cursor.");
 			return false;
 		}
-		if (with && trade->state != TradeNone && trade->state != Requesting) 
+		if (trade->IsActiveWith(with))
 		{
 			LogInventoryDetail("Trade item move from slot [{}] to slot [{}] (trade with [{}])", src_slot_id, dst_slot_id, with->GetName());
 			// Fill Trade list with items from cursor
@@ -1320,7 +1326,7 @@ bool Client::SwapItem(MoveItem_Struct* move_in) {
 
 			if(with->IsNPC() && with->IsEngaged())
 			{
-				trade->AddEntity(dst_slot_id, move_in->number_in_stack);
+				trade->AddEntity(dst_slot_id, move_in->qty);
 
 				SendCancelTrade(with);
 				LogTrading("Cancelled in-progress trade due to [{}] being in combat.", with->GetCleanName());
@@ -1329,68 +1335,28 @@ bool Client::SwapItem(MoveItem_Struct* move_in) {
 
 			// Add cursor item to trade bucket
 			// Also sends trade information to other client of trade session
-			trade->AddEntity(dst_slot_id, move_in->number_in_stack);
+			trade->AddEntity(dst_slot_id, move_in->qty);
 
 			return true;
 		} else {
-			if (src_inst) {
-				int new_charges = 0;
-				if (!dst_inst) {
-					// Move item on cursor to the trade slots
-					PutItemInInventory(dst_slot_id, *src_inst);
-				}
-				else
-				{
-					new_charges = (dst_inst->GetCharges()+src_inst->GetCharges());
-					if (new_charges < EQMAC_STACKSIZE)
-					{
-						dst_inst->SetCharges(new_charges);
-						new_charges = 0;
-					}
-					else
-					{
-						new_charges = src_inst->GetCharges()-(EQMAC_STACKSIZE -dst_inst->GetCharges()); //Leftover charges = charges - difference
-						dst_inst->SetCharges(EQMAC_STACKSIZE);
-					}
-
-				}
-				if (new_charges > 0)
-					GetInv().GetItem(src_slot_id)->SetCharges(new_charges);
-				else
-					DeleteItemInInventory(src_slot_id);
-			}
-
-			// now close out anything else associated with trade
-			FinishTrade(this);
-			auto canceltrade = new EQApplicationPacket(OP_CancelTrade, sizeof(CancelTrade_Struct));
-			CancelTrade_Struct* ct = (CancelTrade_Struct*) canceltrade->pBuffer;
-			ct->fromid = 0;
-			ct->action = 1;
-			if (with && with->IsClient()) {
-				with->CastToClient()->QueuePacket(canceltrade);
-				with->CastToClient()->FinishTrade(with);
-				with->CastToClient()->trade->Reset();
-			}
-			FastQueuePacket(&canceltrade);
-			trade->Reset();
-
-			// SummonItem(src_inst->GetID(), src_inst->GetCharges());
-			// DeleteItemInInventory(SlotCursor);
+			// The client has already changed its cursor but we're desynced and don't want to merge unrelated items into one stack so we kick instead.
+			CancelTradeSession(0);
+			Kick("Trade changed during item movement; reconnect to resynchronize inventory.");
 
 			return true;
 		}
 	}
 
 	// Step 5: Swap (or stack) items
-	if (move_in->number_in_stack > 0) {
+	if (move_in->qty > 0) {
 		// Determine if charged items can stack
 		if(src_inst && !src_inst->IsStackable()) {
-			sprintf(error, "Move from %d to %d with stack size %d. %s is not a stackable item. (charname: %s)", src_slot_id, dst_slot_id, move_in->number_in_stack, src_inst->GetItem()->Name, GetName());
+			sprintf(error, "Move from %d to %d with stack size %d. %s is not a stackable item. (charname: %s)", src_slot_id, dst_slot_id, move_in->qty, src_inst->GetItem()->Name, GetName());
 			LogInventory(
 				"Move from [{}] to [{}] with stack size [{}]. [{}] is not a stackable item. (charname: [{}])", 
 				src_slot_id, 
 				dst_slot_id, 
-				move_in->number_in_stack, 
+				move_in->qty,
 				src_inst->GetItem()->Name, 
 				GetName()
 			);
@@ -1399,12 +1365,12 @@ bool Client::SwapItem(MoveItem_Struct* move_in) {
 
 		if (src_inst && dst_inst) {
 			if(src_inst->GetID() != dst_inst->GetID()) {
-				sprintf(error, "Move from %d to %d with stack size %d. Incompatible item types: %d != %d", src_slot_id, dst_slot_id, move_in->number_in_stack, src_inst->GetID(), dst_inst->GetID());
+				sprintf(error, "Move from %d to %d with stack size %d. Incompatible item types: %d != %d", src_slot_id, dst_slot_id, move_in->qty, src_inst->GetID(), dst_inst->GetID());
 				LogInventory(
 					"Move from [{}] to [{}] with stack size [{}]. Incompatible item types: [{}] != [{}]", 
 					src_slot_id, 
 					dst_slot_id, 
-					move_in->number_in_stack, 
+					move_in->qty,
 					src_inst->GetID(), 
 					dst_inst->GetID()
 				);
@@ -1412,11 +1378,11 @@ bool Client::SwapItem(MoveItem_Struct* move_in) {
 			}
 			if(dst_inst->GetCharges() < EQMAC_STACKSIZE) {
 				//we have a chance of stacking.
-				LogInventoryDetail("Move from [{}] to [{}] with stack size [{}]. dest has [{}]/[{}] charges", src_slot_id, dst_slot_id, move_in->number_in_stack, dst_inst->GetCharges(), EQMAC_STACKSIZE);
+				LogInventoryDetail("Move from [{}] to [{}] with stack size [{}]. dest has [{}]/[{}] charges", src_slot_id, dst_slot_id, move_in->qty, dst_inst->GetCharges(), EQMAC_STACKSIZE);
 				// Charges can be emptied into dst
 				uint16 usedcharges = EQMAC_STACKSIZE - dst_inst->GetCharges();
-				if (usedcharges > move_in->number_in_stack)
-					usedcharges = move_in->number_in_stack;
+				if (usedcharges > move_in->qty)
+					usedcharges = move_in->qty;
 
 				dst_inst->SetCharges(dst_inst->GetCharges() + usedcharges);
 				src_inst->SetCharges(src_inst->GetCharges() - usedcharges);
@@ -1431,12 +1397,12 @@ bool Client::SwapItem(MoveItem_Struct* move_in) {
 					LogInventoryDetail("Dest ([{}]) now has [{}] charges, source ([{}]) has [{}] ([{}] moved)", dst_slot_id, dst_inst->GetCharges(), src_slot_id, src_inst->GetCharges(), usedcharges);
 				}
 			} else {
-				sprintf(error, "Move from %d to %d with stack size %d. Exceeds dest maximum stack size: %d/%d", src_slot_id, dst_slot_id, move_in->number_in_stack, (src_inst->GetCharges()+dst_inst->GetCharges()), EQMAC_STACKSIZE);
+				sprintf(error, "Move from %d to %d with stack size %d. Exceeds dest maximum stack size: %d/%d", src_slot_id, dst_slot_id, move_in->qty, (src_inst->GetCharges()+dst_inst->GetCharges()), EQMAC_STACKSIZE);
 				LogInventory(
 					"Move from [{}] to [{}] with stack size [{}]. Exceeds dest maximum stack size: [{}]/[{}]", 
 					src_slot_id, 
 					dst_slot_id, 
-					move_in->number_in_stack, 
+					move_in->qty,
 					(src_inst->GetCharges() + dst_inst->GetCharges()), 
 					EQMAC_STACKSIZE
 				);
@@ -1450,20 +1416,20 @@ bool Client::SwapItem(MoveItem_Struct* move_in) {
 		}
 		else {
 			// Nothing in destination slot: split stack into two
-			if ((int8)move_in->number_in_stack >= src_inst->GetCharges()) {
+			if ((int8)move_in->qty >= src_inst->GetCharges()) {
 				// Move entire stack
 				if(!m_inv.SwapItem(src_slot_id, dst_slot_id)) { 
-					sprintf(error, "Could not move entire stack from %d to %d with stack size %d. Dest empty.", src_slot_id, dst_slot_id, move_in->number_in_stack);
-					LogInventory("Could not move entire stack from [{}] to [{}] with stack size [{}]. Dest empty.", src_slot_id, dst_slot_id, move_in->number_in_stack);
+					sprintf(error, "Could not move entire stack from %d to %d with stack size %d. Dest empty.", src_slot_id, dst_slot_id, move_in->qty);
+					LogInventory("Could not move entire stack from [{}] to [{}] with stack size [{}]. Dest empty.", src_slot_id, dst_slot_id, move_in->qty);
 					return false; 
 				}
-				LogInventoryDetail("Move entire stack from [{}] to [{}] with stack size [{}]. Dest empty.", src_slot_id, dst_slot_id, move_in->number_in_stack);
+				LogInventoryDetail("Move entire stack from [{}] to [{}] with stack size [{}]. Dest empty.", src_slot_id, dst_slot_id, move_in->qty);
 			}
 			else {
 				// Split into two
-				src_inst->SetCharges(src_inst->GetCharges() - move_in->number_in_stack);
-				LogInventoryDetail("Split stack of [{}] ([{}]) from slot [{}] to [{}] with stack size [{}]. Src keeps [{}].", src_inst->GetItem()->Name, src_inst->GetItem()->ID, src_slot_id, dst_slot_id, move_in->number_in_stack, src_inst->GetCharges());
-				EQ::ItemInstance* inst = database.CreateItem(src_inst->GetItem(), move_in->number_in_stack);
+				src_inst->SetCharges(src_inst->GetCharges() - move_in->qty);
+				LogInventoryDetail("Split stack of [{}] ([{}]) from slot [{}] to [{}] with stack size [{}]. Src keeps [{}].", src_inst->GetItem()->Name, src_inst->GetItem()->ID, src_slot_id, dst_slot_id, move_in->qty, src_inst->GetCharges());
+				EQ::ItemInstance* inst = database.CreateItem(src_inst->GetItem(), move_in->qty);
 				m_inv.PutItem(dst_slot_id, *inst);
 				safe_delete(inst);
 			}
@@ -1581,11 +1547,11 @@ void Client::SwapItemResync(MoveItem_Struct* move_slots) {
 	// Not as effective as the full process, but less intrusive to game play -U
 
 	bool resync = false;
-	LogInventoryDetail("Inventory desynchronization. (charname: [{}], source: [{}], destination: [{}])", GetName(), move_slots->from_slot, move_slots->to_slot);
+	LogInventoryDetail("Inventory desynchronization. (charname: [{}], source: [{}], destination: [{}])", GetName(), move_slots->from, move_slots->to);
 	Message(Chat::Yellow, "Inventory Desynchronization detected: Resending slot data...");
 
-	if((move_slots->from_slot >= EQ::invslot::EQUIPMENT_BEGIN && move_slots->from_slot <= EQ::invbag::CURSOR_BAG_END)) {
-		int16 resync_slot = (EQ::InventoryProfile::CalcSlotId(move_slots->from_slot) == INVALID_INDEX) ? move_slots->from_slot : EQ::InventoryProfile::CalcSlotId(move_slots->from_slot);
+	if((move_slots->from >= EQ::invslot::EQUIPMENT_BEGIN && move_slots->from <= EQ::invbag::CURSOR_BAG_END)) {
+		int16 resync_slot = (EQ::InventoryProfile::CalcSlotId(move_slots->from) == INVALID_INDEX) ? move_slots->from : EQ::InventoryProfile::CalcSlotId(move_slots->from);
 		if (IsValidSlot(resync_slot) && resync_slot != INVALID_INDEX) {
 			// This prevents the client from crashing when closing any 'phantom' bags -U
 			const EQ::ItemData* token_struct = database.GetItem(22292); // 'Copper Coin'
@@ -1597,21 +1563,21 @@ void Client::SwapItemResync(MoveItem_Struct* move_slots) {
 			else {
 				auto outapp		= new EQApplicationPacket(OP_MoveItem, sizeof(MoveItem_Struct));
 				MoveItem_Struct* delete_slot	= (MoveItem_Struct*)outapp->pBuffer;
-				delete_slot->from_slot			= resync_slot;
-				delete_slot->to_slot			= 0xFFFFFFFF;
-				delete_slot->number_in_stack	= 0xFFFFFFFF;
+				delete_slot->from			= resync_slot;
+				delete_slot->to			= -1;
+				delete_slot->qty	= -1;
 
 				QueuePacket(outapp);
 				safe_delete(outapp);
 			}
 			safe_delete(token_inst);
-			Message(Chat::Lime, "Source slot %i resynchronized.", move_slots->from_slot);
+			Message(Chat::Lime, "Source slot %i resynchronized.", move_slots->from);
 			resync = true;
 		}
-		else { Message(Chat::Red, "Could not resynchronize source slot %i.", move_slots->from_slot); }
+		else { Message(Chat::Red, "Could not resynchronize source slot %i.", move_slots->from); }
 	}
 	else {
-		int16 resync_slot = (EQ::InventoryProfile::CalcSlotId(move_slots->from_slot) == INVALID_INDEX) ? move_slots->from_slot : EQ::InventoryProfile::CalcSlotId(move_slots->from_slot);
+		int16 resync_slot = (EQ::InventoryProfile::CalcSlotId(move_slots->from) == INVALID_INDEX) ? move_slots->from : EQ::InventoryProfile::CalcSlotId(move_slots->from);
 		if (IsValidSlot(resync_slot) && resync_slot != INVALID_INDEX) {
 			if(m_inv[resync_slot]) {
 				const EQ::ItemData* token_struct = database.GetItem(22292); // 'Copper Coin'
@@ -1621,16 +1587,16 @@ void Client::SwapItemResync(MoveItem_Struct* move_slots) {
 				SendItemPacket(resync_slot, m_inv[resync_slot], ItemPacketTrade);
 
 				safe_delete(token_inst);
-				Message(Chat::Lime, "Source slot %i resynchronized.", move_slots->from_slot);
+				Message(Chat::Lime, "Source slot %i resynchronized.", move_slots->from);
 				resync = true;
 			}
-			else { Message(Chat::Red, "Could not resynchronize source slot %i.", move_slots->from_slot); }
+			else { Message(Chat::Red, "Could not resynchronize source slot %i.", move_slots->from); }
 		}
-		else { Message(Chat::Red, "Could not resynchronize source slot %i.", move_slots->from_slot); }
+		else { Message(Chat::Red, "Could not resynchronize source slot %i.", move_slots->from); }
 	}
 
-	if((move_slots->to_slot >= EQ::invslot::EQUIPMENT_BEGIN && move_slots->to_slot <= EQ::invbag::CURSOR_BAG_END)) {
-		int16 resync_slot = (EQ::InventoryProfile::CalcSlotId(move_slots->to_slot) == INVALID_INDEX) ? move_slots->to_slot : EQ::InventoryProfile::CalcSlotId(move_slots->to_slot);
+	if((move_slots->to >= EQ::invslot::EQUIPMENT_BEGIN && move_slots->to <= EQ::invbag::CURSOR_BAG_END)) {
+		int16 resync_slot = (EQ::InventoryProfile::CalcSlotId(move_slots->to) == INVALID_INDEX) ? move_slots->to : EQ::InventoryProfile::CalcSlotId(move_slots->to);
 		if (IsValidSlot(resync_slot) && resync_slot != INVALID_INDEX) {
 			const EQ::ItemData* token_struct = database.GetItem(22292); // 'Copper Coin'
 			EQ::ItemInstance* token_inst = database.CreateItem(token_struct, 1);
@@ -1641,21 +1607,21 @@ void Client::SwapItemResync(MoveItem_Struct* move_slots) {
 			else {
 				auto outapp		= new EQApplicationPacket(OP_MoveItem, sizeof(MoveItem_Struct));
 				MoveItem_Struct* delete_slot	= (MoveItem_Struct*)outapp->pBuffer;
-				delete_slot->from_slot			= resync_slot;
-				delete_slot->to_slot			= 0xFFFFFFFF;
-				delete_slot->number_in_stack	= 0xFFFFFFFF;
+				delete_slot->from			= resync_slot;
+				delete_slot->to			= -1;
+				delete_slot->qty	= -1;
 
 				QueuePacket(outapp);
 				safe_delete(outapp);
 			}
 			safe_delete(token_inst);
-			Message(Chat::Lime, "Destination slot %i resynchronized.", move_slots->to_slot);
+			Message(Chat::Lime, "Destination slot %i resynchronized.", move_slots->to);
 			resync = true;
 		}
-		else { Message(Chat::Red, "Could not resynchronize destination slot %i.", move_slots->to_slot); }
+		else { Message(Chat::Red, "Could not resynchronize destination slot %i.", move_slots->to); }
 	}
 	else {
-		int16 resync_slot = (EQ::InventoryProfile::CalcSlotId(move_slots->to_slot) == INVALID_INDEX) ? move_slots->to_slot : EQ::InventoryProfile::CalcSlotId(move_slots->to_slot);
+		int16 resync_slot = (EQ::InventoryProfile::CalcSlotId(move_slots->to) == INVALID_INDEX) ? move_slots->to : EQ::InventoryProfile::CalcSlotId(move_slots->to);
 		if (IsValidSlot(resync_slot) && resync_slot != INVALID_INDEX) {
 			if(m_inv[resync_slot]) {
 				const EQ::ItemData* token_struct = database.GetItem(22292); // 'Copper Coin'
@@ -1665,12 +1631,12 @@ void Client::SwapItemResync(MoveItem_Struct* move_slots) {
 				SendItemPacket(resync_slot, m_inv[resync_slot], ItemPacketTrade);
 
 				safe_delete(token_inst);
-				Message(Chat::Lime, "Destination slot %i resynchronized.", move_slots->to_slot);
+				Message(Chat::Lime, "Destination slot %i resynchronized.", move_slots->to);
 				resync = true;
 			}
-			else { Message(Chat::Red, "Could not resynchronize destination slot %i.", move_slots->to_slot); }
+			else { Message(Chat::Red, "Could not resynchronize destination slot %i.", move_slots->to); }
 		}
-		else { Message(Chat::Red, "Could not resynchronize destination slot %i.", move_slots->to_slot); }
+		else { Message(Chat::Red, "Could not resynchronize destination slot %i.", move_slots->to); }
 	}
 
 	if(resync)

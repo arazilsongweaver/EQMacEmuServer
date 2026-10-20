@@ -409,7 +409,7 @@ luabind::scope lua_register_packet_opcodes() {
 			luabind::value("Stun", static_cast<int>(OP_Stun)),
 			luabind::value("BeginCast", static_cast<int>(OP_BeginCast)),
 			luabind::value("CastSpell", static_cast<int>(OP_CastSpell)),
-			luabind::value("InterruptCast", static_cast<int>(OP_InterruptCast)),
+			luabind::value("TokenText", static_cast<int>(OP_TokenText)),
 			luabind::value("Death", static_cast<int>(OP_Death)),
 			luabind::value("FeignDeath", static_cast<int>(OP_FeignDeath)),
 			luabind::value("Illusion", static_cast<int>(OP_Illusion)),

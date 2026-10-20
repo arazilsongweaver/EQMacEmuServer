@@ -810,10 +810,7 @@ int32 Client::CalcMaxMana()
 	switch (GetCasterClass()) {
 	case 'I':
 	case 'W': {
-		if ((GetClass() == Class::Ranger || GetClass() == Class::Paladin || GetClass() == Class::Beastlord) && GetLevel() < 9)
-			max_mana = 0;
-		else
-			max_mana = (CalcBaseMana() + itembonuses.Mana + spellbonuses.Mana);
+		max_mana = CalcBaseMana() + itembonuses.Mana + spellbonuses.Mana;
 		break;
 	}
 	case 'N': {
@@ -848,6 +845,18 @@ int32 Client::CalcBaseMana()
 {
 	if (GetCasterClass() == 'N')
 		return 0;
+
+	// These classes have no level/stat contribution before level 9.
+	// Item and spell mana are still added by CalcMaxMana().
+	if (GetLevel() < 9 && (
+		GetClass() == Class::Paladin || 
+		GetClass() == Class::Ranger ||
+		GetClass() == Class::ShadowKnight || 
+		GetClass() == Class::Beastlord)
+	) 
+	{
+		return 0;
+	}
 
 	int32 prime_stat_value = GetCasterClass() == 'W' ? GetWIS() : GetINT();
 	int16 level_factor = 15 * GetLevel();
